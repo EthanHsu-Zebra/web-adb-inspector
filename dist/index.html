@@ -202,6 +202,40 @@
     border-bottom: 1px solid rgba(48,54,61,0.4);
     font-family: var(--mono);
     font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .feat-type {
+    font-size: 0.6rem;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    background: rgba(88,166,255,0.15);
+    color: var(--accent);
+    font-weight: 600;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .feat-type.other {
+    background: rgba(139,148,158,0.15);
+    color: var(--muted);
+  }
+  .feat-ver, .pkg-ver {
+    color: var(--muted);
+    font-size: 0.65rem;
+    flex-shrink: 0;
+  }
+  .pkg-badge {
+    font-size: 0.6rem;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-weight: 600;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .pkg-badge.priv {
+    background: rgba(219,109,40,0.15);
+    color: var(--orange);
   }
 
   /* Shell */

@@ -16,8 +16,28 @@ const credentialStore = new AdbWebCredentialStore('web-adb-inspector');
 const connectedDevices = new Map();
 let activeSerial = null;
 
-// Cached data for export
-const dataCache = { props: [], features: [], packages: [] };
+// Cached data for export (CTS-compatible format)
+const dataCache = {
+  props: [],      // { name, value } - ro.* only
+  features: [],   // { name, type, available, version }
+  packages: [],   // { name, version_name, system_priv, min_sdk, target_sdk, ... }
+};
+
+// SDK feature prefixes for type detection
+const SDK_FEATURE_PREFIXES = [
+  'android.hardware.',
+  'android.software.',
+  'android.feature.',
+  'com.google.android.feature.',
+];
+
+function isSDKFeature(name) {
+  for (const prefix of SDK_FEATURE_PREFIXES) {
+    if (name.startsWith(prefix)) return true;
+  }
+  // Also check for well-known SDK features that don't follow the pattern
+  return false;
+}
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
@@ -122,7 +142,6 @@ async function connectDevice(usbDevice) {
     });
 
     const adb = new Adb(transport);
-
     const serial = adb.serial;
 
     let displayName = usbDevice.name || 'Android Device';
@@ -133,7 +152,6 @@ async function connectDevice(usbDevice) {
     } catch (_) {}
 
     connectedDevices.set(serial, { adb, usbDevice, transport, _displayName: displayName });
-
     renderDeviceList();
 
     if (connectedDevices.size === 1) {
@@ -204,6 +222,10 @@ function selectDevice(serial) {
 
   renderDeviceList();
 
+  // Clear shell output on device switch
+  document.getElementById('shell-output').textContent = '';
+
+  // Fetch all data
   fetchProperties();
   fetchFeatures();
   fetchPackages();
@@ -224,7 +246,11 @@ async function disconnectDevice() {
   renderDeviceList();
 }
 
-// --- Data Fetching ---
+// ============================================
+// DATA FETCHING - CTS-compatible shell commands
+// ============================================
+
+// --- Properties (ro.* only, matching CTS PropertyDeviceInfo) ---
 async function fetchProperties() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
@@ -233,8 +259,10 @@ async function fetchProperties() {
   try {
     const text = await adbShell(info.adb, 'getprop');
 
+    // CTS PropertyDeviceInfo: only collects ro.* properties
+    // Pattern: \[ro.+\]: \[(.+)\]
     const props = [];
-    const regex = /\[([^\]]+):\s*([^\]]*)\]/g;
+    const regex = /\[(ro[.\w]+)\]:\s*\[([^\]]*)\]/g;
     let m;
     while ((m = regex.exec(text)) !== null) {
       props.push({ name: m[1], value: m[2] });
@@ -253,6 +281,7 @@ async function fetchProperties() {
   showLoading('props', false);
 }
 
+// --- Features (pm list features with version parsing) ---
 async function fetchFeatures() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
@@ -265,16 +294,38 @@ async function fetchFeatures() {
     for (const line of text.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      const name = trimmed.replace(/^feature:/, '').trim();
-      if (name) features.push({ name });
+
+      let name = trimmed;
+      let version = 0;
+
+      // Parse: feature:name or feature:name ver:XX
+      const verMatch = trimmed.match(/^feature:(.+?)\s+ver:(\d+)$/);
+      if (verMatch) {
+        name = verMatch[1];
+        version = parseInt(verMatch[2], 10);
+      } else {
+        name = trimmed.replace(/^feature:/, '');
+      }
+
+      name = name.trim();
+      if (!name) continue;
+
+      features.push({
+        name,
+        type: isSDKFeature(name) ? 'sdk' : 'other',
+        available: true,
+        version,
+      });
     }
     dataCache.features = features;
 
     document.getElementById('features-count').textContent = '(' + features.length + ')';
     document.getElementById('features-output').innerHTML =
-      features.map(f =>
-        '<div class="feat-item"><span style="color:var(--green)">&#x2713;</span> ' + esc(f.name) + '</div>'
-      ).join('');
+      features.map(f => {
+        const typeBadge = f.type === 'sdk' ? '<span class="feat-type">sdk</span>' : '<span class="feat-type other">other</span>';
+        const verStr = f.version > 0 ? ' v' + f.version : '';
+        return '<div class="feat-item">' + typeBadge + ' ' + esc(f.name) + '<span class="feat-ver">' + verStr + '</span></div>';
+      }).join('');
   } catch (err) {
     document.getElementById('features-output').innerHTML =
       '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
@@ -282,32 +333,127 @@ async function fetchFeatures() {
   showLoading('features', false);
 }
 
+// --- Packages (dumpsys package for rich data) ---
 async function fetchPackages() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
 
   showLoading('packages', true);
   try {
-    const text = await adbShell(info.adb, 'pm list packages -3');
+    // Use dumpsys package to get ALL packages with version info in one call
+    const text = await adbShell(info.adb, 'dumpsys package');
 
-    const pkgs = [];
-    for (const line of text.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const name = trimmed.replace(/^package:/, '').trim();
-      if (name) pkgs.push({ name });
-    }
-    dataCache.packages = pkgs;
+    const packages = parseDumpsysPackage(text);
+    dataCache.packages = packages;
 
-    document.getElementById('packages-count').textContent = '(' + pkgs.length + ')';
+    // Count third-party only for display
+    const thirdParty = packages.filter(p => !p.system_priv && !p.dir.startsWith('/system/') && !p.dir.startsWith('/apex/'));
+
+    document.getElementById('packages-count').textContent = '(' + packages.length + ')';
     document.getElementById('packages-output').innerHTML =
-      '<div class="prop-count">Third-party packages: ' + pkgs.length + '</div>' +
-      pkgs.map(p => '<div class="pkg-item">' + esc(p.name) + '</div>').join('');
+      '<div class="prop-count">' + packages.length + ' total packages' + (thirdParty.length !== packages.length ? ' (' + thirdParty.length + ' third-party)' : '') + '</div>' +
+      packages.map(p => {
+        const privBadge = p.system_priv ? '<span class="pkg-badge priv">priv</span>' : '';
+        return '<div class="pkg-item">' + esc(p.name) + ' <span class="pkg-ver">v' + esc(p.version_name || '?') + '</span> ' + privBadge + '</div>';
+      }).join('');
   } catch (err) {
     document.getElementById('packages-output').innerHTML =
       '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
   showLoading('packages', false);
+}
+
+// Parse dumpsys package output
+function parseDumpsysPackage(text) {
+  const packages = [];
+  const lines = text.split('\n');
+  let currentPkg = null;
+  let inPermissions = false;
+  let inDeclaredPermissions = false;
+
+  for (const line of lines) {
+    // New package block: "Package: com.example.app" or "Package [com.example.app]:"
+    const pkgMatch = line.match(/^Package\s+\[?([^\]\s]+)\]?[:\s]/);
+    if (pkgMatch) {
+      // Save previous package
+      if (currentPkg) packages.push(currentPkg);
+      currentPkg = {
+        name: pkgMatch[1],
+        version_name: '',
+        system_priv: false,
+        min_sdk: 0,
+        target_sdk: 0,
+        uid: 0,
+        dir: '',
+        requested_permissions: [],
+        defined_permissions: [],
+      };
+      inPermissions = false;
+      inDeclaredPermissions = false;
+      continue;
+    }
+
+    if (!currentPkg) continue;
+
+    // Version name
+    const verNameMatch = line.match(/^\s+versionName=(.+?)\s*$/);
+    if (verNameMatch) {
+      currentPkg.version_name = verNameMatch[1].trim();
+    }
+
+    // Code path (for system_priv detection)
+    const codePathMatch = line.match(/^\s+codePath=(.+?)\s*$/);
+    if (codePathMatch) {
+      currentPkg.dir = codePathMatch[1].trim();
+      currentPkg.system_priv = currentPkg.dir.startsWith('/system/priv-app/');
+    }
+
+    // SDK versions
+    const minSdkMatch = line.match(/^\s+minSdk=(\d+)/);
+    if (minSdkMatch) currentPkg.min_sdk = parseInt(minSdkMatch[1], 10);
+    const targetSdkMatch = line.match(/^\s+targetSdk=(\d+)/);
+    if (targetSdkMatch) currentPkg.target_sdk = parseInt(targetSdkMatch[1], 10);
+
+    // UID
+    const uidMatch = line.match(/^\s+uid=(\d+)/);
+    if (uidMatch) currentPkg.uid = parseInt(uidMatch[1], 10);
+
+    // Section headers
+    if (line.includes('requested permissions:')) {
+      inPermissions = true;
+      inDeclaredPermissions = false;
+      continue;
+    }
+    if (line.includes('declared permissions:')) {
+      inDeclaredPermissions = true;
+      inPermissions = false;
+      continue;
+    }
+    if (line.includes('install permissions:')) {
+      inPermissions = false;
+      inDeclaredPermissions = false;
+      continue;
+    }
+
+    // Permission lines: "  uses-permission: android.permission.XXX" or "  permission: android.permission.XXX"
+    if (inPermissions || inDeclaredPermissions) {
+      const permMatch = line.match(/^\s+(?:uses-)?permission:\s*(\S+)/);
+      if (permMatch) {
+        const permName = permMatch[1];
+        const perm = { name: permName };
+        if (inPermissions) {
+          currentPkg.requested_permissions.push(perm);
+        } else if (inDeclaredPermissions) {
+          currentPkg.defined_permissions.push(perm);
+        }
+      }
+    }
+  }
+
+  // Don't forget the last package
+  if (currentPkg) packages.push(currentPkg);
+
+  return packages;
 }
 
 // --- Attestation ---
@@ -317,7 +463,6 @@ async function fetchAttestation() {
 
   showLoading('attestation', true);
   try {
-    // Run all checks in parallel
     const results = await Promise.allSettled([
       safeGetProp(info.adb, 'ro.boot.verifiedbootstate'),
       safeGetProp(info.adb, 'ro.boot.vbmeta.security_level'),
@@ -325,6 +470,7 @@ async function fetchAttestation() {
       safeGetProp(info.adb, 'ro.hardware.keystore'),
       safeGetProp(info.adb, 'ro.security.keystore'),
       safeGetProp(info.adb, 'ro.hardware.av'),
+      safeGetProp(info.adb, 'ro.boot.flash.locked'),
       adbShell(info.adb, 'pm list features').catch(() => ''),
     ]);
 
@@ -335,22 +481,20 @@ async function fetchAttestation() {
     const keystoreHW = vals[3].trim();
     const keystoreSec = vals[4].trim();
     const avHW = vals[5].trim();
-    const featuresText = vals[6];
+    const flashLocked = vals[6].trim();
+    const featuresText = vals[7];
 
-    // Check KeyMint / StrongBox
     const hasKeyMint = featuresText.includes('android.hardware.security.keymint');
     const hasStrongbox = featuresText.includes('strongbox');
     const strongboxDetail = hasStrongbox ? 'StrongBox' : (hasKeyMint ? 'KeyMint (TEE)' : 'Not detected');
-
-    // AV hardware (for attestation)
-    const avDetail = avHW || 'N/A';
 
     const rows = [
       ['Verified Boot State', bootStateVal || 'N/A', bootStateVal === 'orange' || bootStateVal === 'green' ? 'ok' : (bootStateVal ? 'warn' : 'unknown')],
       ['VBMeta Security Level', securityLevelVal || 'N/A', securityLevelVal === 'software' ? 'ok' : (securityLevelVal ? 'warn' : 'unknown')],
       ['DM-Verity Mode', verityVal || 'N/A', verityVal === 'enforce' ? 'ok' : (verityVal ? 'warn' : 'unknown')],
+      ['Flash Locked', flashLocked || 'N/A', flashLocked === 'true' || flashLocked === '1' ? 'ok' : (flashLocked ? 'warn' : 'unknown')],
       ['KeyMint / StrongBox', strongboxDetail, hasKeyMint ? 'ok' : 'warn'],
-      ['AV Hardware', avDetail, avHW ? 'ok' : 'warn'],
+      ['AV Hardware', avHW || 'N/A', avHW ? 'ok' : 'warn'],
       ['Keystore Hardware', keystoreHW || 'N/A', 'unknown'],
       ['Keystore Security', keystoreSec || 'N/A', 'unknown'],
     ];
@@ -370,19 +514,21 @@ async function fetchRKP() {
 
   showLoading('rkp', true);
   try {
-    // RKP checks
-    const rkpProps = await Promise.all([
+    const rkpProps = await Promise.allSettled([
       safeGetProp(info.adb, 'ro.rkp.enabled'),
       safeGetProp(info.adb, 'ro.security.rkp'),
       safeGetProp(info.adb, 'ro.boot.rkp'),
       safeGetProp(info.adb, 'ro.hardware.rkp'),
+      safeGetProp(info.adb, 'ro.hardware.nfc'),
     ]);
+
+    const rkpVals = rkpProps.map(r => r.value || '');
 
     // Check RKP-related packages
     let rkpPackages = [];
     try {
       const pkgs = await adbShell(info.adb, 'pm list packages');
-      const rkpKeywords = ['rkp', 'remotek', 'remote.key', 'nfc.rkp', 'samsung.rkp'];
+      const rkpKeywords = ['rkp', 'remotek', 'remote.key', 'nfc.rkp', 'samsung.rkp', 'remote.provisioning'];
       for (const line of pkgs.split('\n')) {
         const trimmed = line.trim();
         for (const kw of rkpKeywords) {
@@ -397,7 +543,7 @@ async function fetchRKP() {
     let rkpFeatures = [];
     try {
       const features = await adbShell(info.adb, 'pm list features');
-      const rkpFeatKeywords = ['rkp', 'remote.key', 'nfc'];
+      const rkpFeatKeywords = ['rkp', 'remote.key', 'nfc', 'remote.provisioning'];
       for (const line of features.split('\n')) {
         const trimmed = line.trim();
         for (const kw of rkpFeatKeywords) {
@@ -408,16 +554,18 @@ async function fetchRKP() {
       }
     } catch(e) {}
 
-    const rkpEnabled = rkpProps[0] === 'true' || rkpProps[0] === '1';
-    const rkpStatus = rkpEnabled ? 'ok' : (rkpProps[0] ? 'warn' : 'unknown');
+    const rkpEnabled = rkpVals[0] === 'true' || rkpVals[0] === '1';
+    const nfcHW = rkpVals[4];
 
     const rows = [
-      ['RKP Enabled', rkpProps[0] || 'Not set', rkpStatus],
-      ['RKP Security', rkpProps[1] || 'Not set', 'unknown'],
-      ['RKP Boot', rkpProps[2] || 'Not set', 'unknown'],
-      ['RKP Hardware', rkpProps[3] || 'Not set', 'unknown'],
+      ['RKP Enabled', rkpVals[0] || 'Not set', rkpEnabled ? 'ok' : (rkpVals[0] ? 'warn' : 'unknown')],
+      ['RKP Security', rkpVals[1] || 'Not set', 'unknown'],
+      ['RKP Boot', rkpVals[2] || 'Not set', 'unknown'],
+      ['RKP Hardware', rkpVals[3] || 'Not set', 'unknown'],
+      ['NFC Hardware', nfcHW || 'Not set', nfcHW ? 'ok' : 'warn'],
       ['RKP Packages', rkpPackages.length > 0 ? rkpPackages.join(', ') : 'None detected', rkpPackages.length > 0 ? 'ok' : 'warn'],
       ['RKP Features', rkpFeatures.length > 0 ? rkpFeatures.join(', ') : 'None detected', rkpFeatures.length > 0 ? 'ok' : 'warn'],
+      ['Validation', 'Local properties only (no Google server)', 'warn'],
     ];
 
     document.getElementById('rkp-output').innerHTML = renderStatusTable(rows);
@@ -476,9 +624,9 @@ function runCmd(cmd) {
   runShell();
 }
 
-// --- Export JSON ---
+// --- Export JSON (CTS-compatible format) ---
 function exportJSON(type) {
-  let data, filename, json;
+  let json, filename;
 
   switch(type) {
     case 'props':
@@ -486,11 +634,28 @@ function exportJSON(type) {
       filename = 'PropertyDeviceInfo.deviceinfo.json';
       break;
     case 'features':
-      json = { feature: dataCache.features.map(f => ({ name: f.name })) };
+      json = { feature: dataCache.features.map(f => ({ name: f.name, type: f.type, available: f.available, version: f.version })) };
       filename = 'FeatureDeviceInfo.deviceinfo.json';
       break;
     case 'packages':
-      json = { package: dataCache.packages.map(p => ({ name: p.name })) };
+      json = { package: dataCache.packages.map(p => {
+        const obj = {
+          name: p.name,
+          version_name: p.version_name || '',
+          dir: p.dir || '',
+          system_priv: p.system_priv,
+          min_sdk: p.min_sdk || 0,
+          target_sdk: p.target_sdk || 0,
+          uid: p.uid || 0,
+          requested_permissions: (p.requested_permissions || []).map(rp => ({
+            name: rp.name,
+          })),
+          defined_permissions: (p.defined_permissions || []).map(dp => ({
+            name: dp.name,
+          })),
+        };
+        return obj;
+      })};
       filename = 'PackageDeviceInfo.deviceinfo.json';
       break;
     default:
