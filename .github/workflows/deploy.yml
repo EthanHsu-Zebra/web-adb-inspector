@@ -1,0 +1,39 @@
+name: Build and deploy to Ethanhsu.github.io
+
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout web-adb-tool
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install & build
+        run: |
+          npm ci
+          node build.mjs
+
+      - name: Deploy to Ethanhsu.github.io
+        run: |
+          gh auth setup-git
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git clone git@github.com:Ethanhsu/Ethanhsu.github.io.git deploy
+          cd deploy
+          rm -rf ./*
+          cp -f ../dist/* .
+          git add -A
+          git status --short | grep -q . && git commit -m "auto-deploy: web-adb-tool ${{ github.sha }}" || echo "no changes"
+          git push
