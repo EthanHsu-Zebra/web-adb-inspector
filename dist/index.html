@@ -14,6 +14,8 @@
     --accent: #58a6ff;
     --green: #3fb950;
     --red: #ff5252;
+    --yellow: #d29922;
+    --orange: #db6d28;
     --mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
   }
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -47,6 +49,7 @@
   }
   .badge.ok { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge.err { background: rgba(255,82,82,0.15); color: var(--red); }
+  .badge.warn { background: rgba(210,153,34,0.15); color: var(--yellow); }
   .btn {
     background: var(--accent);
     color: #000;
@@ -64,6 +67,13 @@
     color: var(--text);
     padding: 0.2rem 0.5rem;
     font-size: 0.7rem;
+  }
+  .btn-export {
+    background: var(--green);
+    color: #000;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.75rem;
+    font-weight: 600;
   }
 
   /* Main layout */
@@ -127,6 +137,7 @@
     gap: 0;
     border-bottom: 1px solid var(--border);
     margin-bottom: 1rem;
+    flex-wrap: wrap;
   }
   .tab {
     padding: 0.5rem 1rem;
@@ -156,24 +167,41 @@
   }
   .panel-header h3 { font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 
-  /* Property list */
-  .props-output, .features-output, .packages-output {
+  /* Property list - value pair format */
+  .props-output {
     font-family: var(--mono);
     font-size: 0.75rem;
-    max-height: 50vh;
+    max-height: 60vh;
     overflow-y: auto;
   }
-  .kv-key { color: var(--accent); }
-  .kv-val { color: var(--text); }
-  .props-output div {
+  .prop-row {
     display: flex;
+    padding: 0.2rem 0;
+    border-bottom: 1px solid rgba(48,54,61,0.4);
     gap: 0.5rem;
-    padding: 0.15rem 0;
-    border-bottom: 1px solid rgba(48,54,61,0.5);
   }
-  .feat-item {
+  .prop-key {
+    color: var(--accent);
+    min-width: 320px;
+    word-break: break-all;
+  }
+  .prop-val {
+    color: var(--text);
+    word-break: break-all;
+    flex: 1;
+  }
+  .prop-count {
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+
+  /* Features & Packages */
+  .feat-item, .pkg-item {
     padding: 0.15rem 0;
-    border-bottom: 1px solid rgba(48,54,61,0.5);
+    border-bottom: 1px solid rgba(48,54,61,0.4);
+    font-family: var(--mono);
+    font-size: 0.75rem;
   }
 
   /* Shell */
@@ -212,6 +240,29 @@
     margin-bottom: 0.5rem;
   }
 
+  /* Status table for attestation/RKP */
+  .status-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .status-table th, .status-table td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .status-table th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .status-ok { color: var(--green); font-weight: 600; }
+  .status-fail { color: var(--red); font-weight: 600; }
+  .status-warn { color: var(--yellow); font-weight: 600; }
+  .status-unknown { color: var(--muted); }
+
   /* Loading */
   .loading {
     display: inline-block;
@@ -229,6 +280,7 @@
     .main { flex-direction: column; }
     .sidebar { width: 100%; min-width: auto; max-height: 200px; border-right: none; border-bottom: 1px solid var(--border); }
     .content { max-height: none; }
+    .prop-key { min-width: 180px; }
   }
 </style>
 </head>
@@ -263,39 +315,76 @@
         <div class="tab active" onclick="switchTab(this, 'tab-props')">Properties</div>
         <div class="tab" onclick="switchTab(this, 'tab-features')">Features</div>
         <div class="tab" onclick="switchTab(this, 'tab-packages')">Packages</div>
+        <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
+        <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
         <div class="tab" onclick="switchTab(this, 'tab-shell')">Shell</div>
       </div>
 
+      <!-- Properties Tab -->
       <div id="tab-props" class="tab-content active">
         <div class="panel">
           <div class="panel-header">
-            <h3>System Properties</h3>
-            <div><span id="props-loading" class="loading hidden"></span></div>
+            <h3>System Properties <span id="props-count" style="color:var(--accent)"></span></h3>
+            <div style="display:flex;gap:0.3rem;align-items:center;">
+              <span id="props-loading" class="loading hidden"></span>
+              <button class="btn btn-sm btn-export" onclick="exportJSON('props')">Export JSON</button>
+            </div>
           </div>
           <div id="props-output" class="props-output"></div>
         </div>
       </div>
 
+      <!-- Features Tab -->
       <div id="tab-features" class="tab-content">
         <div class="panel">
           <div class="panel-header">
-            <h3>Package Manager Features</h3>
-            <div><span id="features-loading" class="loading hidden"></span></div>
+            <h3>Package Manager Features <span id="features-count" style="color:var(--accent)"></span></h3>
+            <div style="display:flex;gap:0.3rem;align-items:center;">
+              <span id="features-loading" class="loading hidden"></span>
+              <button class="btn btn-sm btn-export" onclick="exportJSON('features')">Export JSON</button>
+            </div>
           </div>
           <div id="features-output" class="features-output"></div>
         </div>
       </div>
 
+      <!-- Packages Tab -->
       <div id="tab-packages" class="tab-content">
         <div class="panel">
           <div class="panel-header">
-            <h3>Third-Party Packages</h3>
-            <div><span id="packages-loading" class="loading hidden"></span></div>
+            <h3>Third-Party Packages <span id="packages-count" style="color:var(--accent)"></span></h3>
+            <div style="display:flex;gap:0.3rem;align-items:center;">
+              <span id="packages-loading" class="loading hidden"></span>
+              <button class="btn btn-sm btn-export" onclick="exportJSON('packages')">Export JSON</button>
+            </div>
           </div>
           <div id="packages-output" class="packages-output"></div>
         </div>
       </div>
 
+      <!-- Attestation Tab -->
+      <div id="tab-attestation" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Key Attestation Status</h3>
+            <div><span id="attestation-loading" class="loading hidden"></span></div>
+          </div>
+          <div id="attestation-output"></div>
+        </div>
+      </div>
+
+      <!-- RKP Tab -->
+      <div id="tab-rkp" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Remote Key Provisioning Status</h3>
+            <div><span id="rkp-loading" class="loading hidden"></span></div>
+          </div>
+          <div id="rkp-output"></div>
+        </div>
+      </div>
+
+      <!-- Shell Tab -->
       <div id="tab-shell" class="tab-content">
         <div class="panel">
           <div class="panel-header">
