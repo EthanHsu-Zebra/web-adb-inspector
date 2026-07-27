@@ -1,4 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
+const APP_VERSION = '1.0.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -27,6 +28,9 @@ document.addEventListener('DOMContentLoaded', () => {
   checkWebUSB();
   credentialStore.iterateKeys().catch(() => credentialStore.generateKey());
   applyFontSize();
+  // Show version in footer
+  const verEl = document.getElementById('footer-version');
+  if (verEl) verEl.textContent = 'v' + APP_VERSION;
 });
 
 function checkWebUSB() {

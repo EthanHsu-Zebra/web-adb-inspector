@@ -369,6 +369,22 @@
     .content { max-height: none; }
     .prop-row { grid-template-columns: 180px 1fr; }
   }
+
+  /* Footer */
+  .app-footer {
+    text-align: center;
+    padding: 0.6rem;
+    font-size: calc(0.7rem * var(--font-scale));
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .app-footer code {
+    font-family: var(--mono);
+    background: var(--bg);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+  }
 </style>
 </head>
 <body>
@@ -503,6 +519,11 @@
       </div>
     </div>
   </div>
+</div>
+
+<!-- Footer -->
+<div id="app-footer" class="app-footer">
+  <span id="footer-version">v0.0.0</span> &middot; Web ADB Inspector
 </div>
 
 <script type="module" src="bundle.js"></script>
