@@ -425,7 +425,6 @@
         <div class="tab" onclick="switchTab(this, 'tab-packages')">Packages</div>
         <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
         <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
-        <div class="tab" onclick="switchTab(this, 'tab-shell')">Shell</div>
       </div>
 
       <!-- Properties Tab -->
@@ -495,26 +494,6 @@
         </div>
       </div>
 
-      <!-- Shell Tab -->
-      <div id="tab-shell" class="tab-content">
-        <div class="panel">
-          <div class="panel-header">
-            <h3>ADB Shell</h3>
-          </div>
-          <div class="quick-btns">
-            <button class="btn btn-sm" onclick="runCmd('getprop ro.build.version.release')">Android Ver</button>
-            <button class="btn btn-sm" onclick="runCmd('getprop ro.product.model')">Model</button>
-            <button class="btn btn-sm" onclick="runCmd('getprop ro.hardware')">Hardware</button>
-            <button class="btn btn-sm" onclick="runCmd('dumpsys battery')">Battery</button>
-            <button class="btn btn-sm" onclick="runCmd('dumpsys display')">Display</button>
-            <button class="btn btn-sm" onclick="runCmd('dumpsys wifi')">WiFi</button>
-          </div>
-          <div class="shell-bar">
-            <input id="shell-input" type="text" placeholder="adb shell command..." onkeydown="if(event.key==='Enter')runShell()">
-            <button class="btn" onclick="runShell()">Run</button>
-          </div>
-          <div id="shell-output" class="shell-output"></div>
-        </div>
       </div>
     </div>
   </div>

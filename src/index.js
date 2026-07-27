@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.0.3';
+const APP_VERSION = '1.0.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -151,7 +151,8 @@ function selectDevice(serial) {
   document.getElementById('selected-device-name').textContent =
     (info._displayName || serial) + (nick ? ' ("' + nick + '")' : '') + ' (' + serial + ')';
   renderDeviceList();
-  document.getElementById('shell-output').textContent = '';
+  const shellEl = document.getElementById('shell-output');
+  if (shellEl) shellEl.textContent = '';
   document.getElementById('search-props').value = '';
   document.getElementById('search-features').value = '';
   document.getElementById('search-packages').value = '';
@@ -392,8 +393,8 @@ function parseDumpsysPackage(text) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('-----')) continue;
 
-    // Package header: "Package [com.example.name]:"
-    const pkgMatch = line.match(/^Package\s+\[([^\]]+)\]:/);
+    // Package header: "Package [com.example.name]:" or "Package [com.example.name] (12345):"
+    const pkgMatch = line.match(/^Package\s+\[([^\]]+)\]/);
     if (pkgMatch) {
       if (current) packages.push(finalize(current));
       current = {
@@ -473,14 +474,19 @@ function parseDumpsysPackage(text) {
 
     // ---- Package-level field parsing ----
     // CRITICAL: Android 14 packs multiple KV on one line
-    // e.g. "    versionCode=12345 minSdkVersion=21 targetSdkVersion=34"
-    // So we extract ALL key=value pairs from the line
-    const kvPairs = trimmed.match(/(\w+)\s*=\s*("[^"]*"|[^\s]+)/g);
-    if (kvPairs) {
-      for (const pair of kvPairs) {
-        const eqIdx = pair.indexOf('=');
-        const key = pair.substring(0, eqIdx);
-        let val = pair.substring(eqIdx + 1).trim().replace(/^"|"$/g, '');
+    // Values can contain spaces/parens: versionName=4.3.3.26 (48e035de9de)
+    // Strategy: find all key= positions, each value extends to next key= or end of line
+    const kvRe = /(\w+)\s*=/g;
+    let kvMatch;
+    const kvList = [];
+    while ((kvMatch = kvRe.exec(trimmed)) !== null) {
+      kvList.push({ key: kvMatch[1], valStart: kvMatch.index + kvMatch[0].length, index: kvMatch.index });
+    }
+    if (kvList.length > 0) {
+      for (let k = 0; k < kvList.length; k++) {
+        const key = kvList[k].key;
+        const valEnd = (k + 1 < kvList.length) ? kvList[k + 1].index : trimmed.length;
+        let val = trimmed.substring(kvList[k].valStart, valEnd).trim().replace(/^"|"$/g, '');
         assignPkgField(current, key, val);
       }
       continue;
@@ -544,16 +550,20 @@ function parseDumpsysPackage(text) {
 
   function finalize(pkg) {
     finalizePerm();
+    const system_uids = [0, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010];
     return {
       name: pkg.name,
       version_name: pkg.version_name || '',
-      version_code: pkg.version_code || 0,
       dir: pkg.dir || '',
-      system: pkg.system || false,
-      system_priv: pkg.system_priv || false,
+      system_priv: pkg.system_priv,
       min_sdk: pkg.min_sdk || 0,
       target_sdk: pkg.target_sdk || 0,
+      has_system_uid: system_uids.includes(pkg.uid),
+      shares_install_packages_permission: false, // checked from permissions if needed
       uid: pkg.uid || 0,
+      has_default_notification_access: false,
+      is_active_admin: false,
+      is_default_accessibility_service: false,
       sha256_cert: pkg.sha256_cert || '',
       sha256_file: pkg.sha256_file || '',
       requested_permissions: pkg.requested_permissions.map(p => ({
@@ -830,6 +840,13 @@ function exportJSON(type) {
     json = { feature: dataCache.features.map(f => ({ name: f.name, type: f.type, available: f.available, version: f.version })) };
     fn = 'FeatureDeviceInfo.deviceinfo.json';
   } else if (type === 'packages') {
+    // Format sha256_cert with colons: AABBCC... -> AA:BB:CC:DD...
+    function formatCert(cert) {
+      if (!cert) return '';
+      const hex = cert.replace(/[:\s]/g, '').toUpperCase();
+      return hex.match(/.{1,2}/g)?.join(':') || hex;
+    }
+
     json = { package: dataCache.packages.map(p => ({
       name: p.name,
       version_name: p.version_name || '',
@@ -837,9 +854,14 @@ function exportJSON(type) {
       system_priv: p.system_priv,
       min_sdk: p.min_sdk || 0,
       target_sdk: p.target_sdk || 0,
+      has_system_uid: p.has_system_uid || false,
+      shares_install_packages_permission: p.shares_install_packages_permission || false,
       uid: p.uid || 0,
-      sha256_cert: p.sha256_cert || '',
-      sha256_file: p.sha256_file || '',
+      has_default_notification_access: p.has_default_notification_access || false,
+      is_active_admin: p.is_active_admin || false,
+      is_default_accessibility_service: p.is_default_accessibility_service || false,
+      sha256_cert: formatCert(p.sha256_cert),
+      sha256_file: (p.sha256_file || '').toLowerCase(),
       requested_permissions: (p.requested_permissions || []).map(r => ({
         name: r.name, flags: r.flags || 0, permission_group: r.permission_group || '',
         protection_level: r.protection_level || 0, protection_level_flags: r.protection_level_flags || 0,
@@ -880,6 +902,7 @@ function copyPanel(id) { navigator.clipboard.writeText(document.getElementById(i
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 // Expose to window (HTML onclick/oninput needs globals)
+window.dataCache = dataCache;
 window.scanDevices = scanDevices;
 window.disconnectDevice = disconnectDevice;
 window.switchTab = switchTab;
