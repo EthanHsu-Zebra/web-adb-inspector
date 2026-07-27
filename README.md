@@ -1,51 +1,51 @@
 # Web ADB Inspector
 
-Browser-based ADB device inspector using WebUSB. Runs entirely client-side — no server, no proxy, no wireless ADB.
+Browser-based Android device inspector using WebUSB. Connect your Android device via USB and inspect system properties, features, installed packages, attestation status, and RKP (Remote Key Provisioning) — all from the browser.
 
-Inspired by the Google GTS EdiHost module for inspecting Android device properties and features.
+**Demo:** https://ethanhsu.github.io/
 
 ## Features
 
-- **Properties** — full `getprop` output, formatted as key-value pairs
-- **Features** — `pm list features` output, like GTS EdiHost
-- **Packages** — third-party installed packages (`pm list packages -3`)
-- **Shell** — interactive ADB shell with quick-access buttons
+- **Zero server** — runs 100% client-side using WebUSB + ADB protocol
+- **System Properties** — full `getprop` output with search and JSON export
+- **Package Manager Features** — all hardware/software features with SDK classification
+- **Installed Packages** — full dumpsys package data: version, SDK, UID, certs, permissions (with grant status)
+- **Key Attestation** — Verified Boot, VBMeta, DM-Verity, Flash Lock, KeyMint, StrongBox
+- **RKP Status** — KeyMint provider, attestation, GMS, Play Integrity, vendor RKP flags (with hover tooltips)
+- **ADB Shell** — custom commands with quick-access buttons
+- **JSON Export** — matches CTS `DeviceInfo.deviceinfo.json` schema exactly
+- **Device Nicknames** — persistent nicknames for your devices
+- **Font Size Control** — adjustable text scaling
 
 ## Requirements
 
-- Chrome or Edge (WebUSB support)
+- Browser with WebUSB support (Chrome, Edge, Chromium-based)
 - Android device with USB debugging enabled
-- USB cable
-
-## Usage
-
-1. Open the page (hosted on GitHub Pages or locally)
-2. Connect your Android device via USB
-3. Click **Connect Device** and grant USB permission in the browser dialog
-4. Select the device from the sidebar to view its details
-
-## Architecture
-
-| Layer | Technology |
-|-------|------------|
-| USB transport | WebUSB API (browser-native) |
-| ADB protocol | @yume-chan/adb (Tango ADB) |
-| Auth | @yume-chan/adb-credential-web (IndexedDB + WebCrypto) |
-| Build | esbuild (IIFE bundle) |
-| Hosting | GitHub Pages (fully static) |
-
-Everything runs in the browser. No Node.js server, no Python proxy, no wireless ADB.
+- ADB not running on the host (WebUSB needs exclusive device access)
 
 ## Build
 
 ```bash
 npm install
-node build.mjs
-# Output: dist/bundle.js (minified, ~20 KB)
+npm run build
 ```
 
-The `dist/` directory is ready for GitHub Pages deployment.
+Output: `dist/bundle.js` + `dist/index.html`
 
-## License
+## Deployment
 
-MIT
+This project is deployed to GitHub Pages via CI/CD pipeline:
+
+1. Source repo: `Ethanhsu/web-adb-inspector` (public)
+2. Deploy repo: `Ethanhsu.github.io` (clones source, builds, pushes `dist/` to Pages)
+3. Branch: `master`
+
+## Technology
+
+- `@yume-chan/adb` — ADB protocol over WebUSB transport
+- `@yume-chan/adb-daemon-webusb` — WebUSB device manager
+- esbuild — single-file bundle (~97 KB)
+
+## Version
+
+**Current:** 1.0.0
