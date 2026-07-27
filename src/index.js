@@ -333,28 +333,38 @@ async function fetchFeatures() {
   showLoading('features', false);
 }
 
-// --- Packages (dumpsys package for rich data) ---
+// --- Packages (pm list packages -f -u for reliable output) ---
 async function fetchPackages() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
 
   showLoading('packages', true);
   try {
-    // Use dumpsys package to get ALL packages with version info in one call
-    const text = await adbShell(info.adb, 'dumpsys package');
+    // pm list packages -f -u gives one line per package with path info
+    // Format: package:/path/to/apk com.example.name
+    // -f = show file path, -u = include uninstalled
+    const text = await adbShell(info.adb, 'pm list packages -f -u');
 
-    const packages = parseDumpsysPackage(text);
+    const packages = parsePmListPackages(text);
     dataCache.packages = packages;
 
-    // Count third-party only for display
-    const thirdParty = packages.filter(p => !p.system_priv && !p.dir.startsWith('/system/') && !p.dir.startsWith('/apex/'));
+    // Classify packages
+    const system = packages.filter(p => p.system);
+    const thirdParty = packages.filter(p => !p.system && p.system_priv);
+    const user = packages.filter(p => !p.system && !p.system_priv);
 
     document.getElementById('packages-count').textContent = '(' + packages.length + ')';
     document.getElementById('packages-output').innerHTML =
-      '<div class="prop-count">' + packages.length + ' total packages' + (thirdParty.length !== packages.length ? ' (' + thirdParty.length + ' third-party)' : '') + '</div>' +
+      '<div class="prop-count">' + packages.length + ' total' +
+      (system.length ? ' <span style="color:var(--muted)">' + system.length + ' system</span>' : '') +
+      (thirdParty.length ? ' <span style="color:var(--orange)">' + thirdParty.length + ' priv-app</span>' : '') +
+      (user.length ? ' <span style="color:var(--green)">' + user.length + ' user</span>' : '') +
+      '</div>' +
       packages.map(p => {
-        const privBadge = p.system_priv ? '<span class="pkg-badge priv">priv</span>' : '';
-        return '<div class="pkg-item">' + esc(p.name) + ' <span class="pkg-ver">v' + esc(p.version_name || '?') + '</span> ' + privBadge + '</div>';
+        let badges = '';
+        if (p.system_priv) badges += '<span class="pkg-badge priv">priv</span> ';
+        if (p.system && !p.system_priv) badges += '<span class="pkg-badge sys">sys</span> ';
+        return '<div class="pkg-item">' + esc(p.name) + ' ' + badges + '</div>';
       }).join('');
   } catch (err) {
     document.getElementById('packages-output').innerHTML =
@@ -363,96 +373,38 @@ async function fetchPackages() {
   showLoading('packages', false);
 }
 
-// Parse dumpsys package output
-function parseDumpsysPackage(text) {
+// Parse "pm list packages -f -u" output
+function parsePmListPackages(text) {
   const packages = [];
-  const lines = text.split('\n');
-  let currentPkg = null;
-  let inPermissions = false;
-  let inDeclaredPermissions = false;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith('package:')) continue;
 
-  for (const line of lines) {
-    // New package block: "Package: com.example.app" or "Package [com.example.app]:"
-    const pkgMatch = line.match(/^Package\s+\[?([^\]\s]+)\]?[:\s]/);
-    if (pkgMatch) {
-      // Save previous package
-      if (currentPkg) packages.push(currentPkg);
-      currentPkg = {
-        name: pkgMatch[1],
-        version_name: '',
-        system_priv: false,
-        min_sdk: 0,
-        target_sdk: 0,
-        uid: 0,
-        dir: '',
-        requested_permissions: [],
-        defined_permissions: [],
-      };
-      inPermissions = false;
-      inDeclaredPermissions = false;
-      continue;
-    }
+    // Format: package:/path/to/apk=com.example.name
+    // The separator is '=' not space!
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
 
-    if (!currentPkg) continue;
+    const pathPart = trimmed.substring(9, eqIdx); // strip "package:" prefix
+    const name = trimmed.substring(eqIdx + 1);
+    if (!name) continue;
 
-    // Version name
-    const verNameMatch = line.match(/^\s+versionName=(.+?)\s*$/);
-    if (verNameMatch) {
-      currentPkg.version_name = verNameMatch[1].trim();
-    }
+    const system = pathPart.startsWith('/system/') || pathPart.startsWith('/product/') || pathPart.startsWith('/vendor/') || pathPart.startsWith('/apex/') || pathPart.startsWith('/oem/');
+    const system_priv = pathPart.startsWith('/system/priv-app/') || pathPart.startsWith('/product/priv-app/') || pathPart.startsWith('/vendor/priv-app/');
 
-    // Code path (for system_priv detection)
-    const codePathMatch = line.match(/^\s+codePath=(.+?)\s*$/);
-    if (codePathMatch) {
-      currentPkg.dir = codePathMatch[1].trim();
-      currentPkg.system_priv = currentPkg.dir.startsWith('/system/priv-app/');
-    }
-
-    // SDK versions
-    const minSdkMatch = line.match(/^\s+minSdk=(\d+)/);
-    if (minSdkMatch) currentPkg.min_sdk = parseInt(minSdkMatch[1], 10);
-    const targetSdkMatch = line.match(/^\s+targetSdk=(\d+)/);
-    if (targetSdkMatch) currentPkg.target_sdk = parseInt(targetSdkMatch[1], 10);
-
-    // UID
-    const uidMatch = line.match(/^\s+uid=(\d+)/);
-    if (uidMatch) currentPkg.uid = parseInt(uidMatch[1], 10);
-
-    // Section headers
-    if (line.includes('requested permissions:')) {
-      inPermissions = true;
-      inDeclaredPermissions = false;
-      continue;
-    }
-    if (line.includes('declared permissions:')) {
-      inDeclaredPermissions = true;
-      inPermissions = false;
-      continue;
-    }
-    if (line.includes('install permissions:')) {
-      inPermissions = false;
-      inDeclaredPermissions = false;
-      continue;
-    }
-
-    // Permission lines: "  uses-permission: android.permission.XXX" or "  permission: android.permission.XXX"
-    if (inPermissions || inDeclaredPermissions) {
-      const permMatch = line.match(/^\s+(?:uses-)?permission:\s*(\S+)/);
-      if (permMatch) {
-        const permName = permMatch[1];
-        const perm = { name: permName };
-        if (inPermissions) {
-          currentPkg.requested_permissions.push(perm);
-        } else if (inDeclaredPermissions) {
-          currentPkg.defined_permissions.push(perm);
-        }
-      }
-    }
+    packages.push({
+      name,
+      version_name: '',
+      dir: pathPart,
+      system,
+      system_priv,
+      min_sdk: 0,
+      target_sdk: 0,
+      uid: 0,
+      requested_permissions: [],
+      defined_permissions: [],
+    });
   }
-
-  // Don't forget the last package
-  if (currentPkg) packages.push(currentPkg);
-
   return packages;
 }
 

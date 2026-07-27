@@ -237,6 +237,10 @@
     background: rgba(219,109,40,0.15);
     color: var(--orange);
   }
+  .pkg-badge.sys {
+    background: rgba(139,148,158,0.15);
+    color: var(--muted);
+  }
 
   /* Shell */
   .shell-bar {
@@ -386,7 +390,7 @@
       <div id="tab-packages" class="tab-content">
         <div class="panel">
           <div class="panel-header">
-            <h3>Third-Party Packages <span id="packages-count" style="color:var(--accent)"></span></h3>
+            <h3>Packages <span id="packages-count" style="color:var(--accent)"></span></h3>
             <div style="display:flex;gap:0.3rem;align-items:center;">
               <span id="packages-loading" class="loading hidden"></span>
               <button class="btn btn-sm btn-export" onclick="exportJSON('packages')">Export JSON</button>
