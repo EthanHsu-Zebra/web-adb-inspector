@@ -319,3 +319,11 @@ function esc(str) {
   div.textContent = str;
   return div.innerHTML;
 }
+
+// Expose UI functions to window for inline onclick handlers
+window.scanDevices = scanDevices;
+window.disconnectDevice = disconnectDevice;
+window.switchTab = switchTab;
+window.runShell = runShell;
+window.runCmd = runCmd;
+window.copyPanel = copyPanel;
