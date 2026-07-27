@@ -1,0 +1,40 @@
+{
+  "name": "@yume-chan/adb-credential-web",
+  "version": "2.1.0",
+  "description": "Credential Store for `@yume-chan/adb` using WebCrypto and IndexedDB APIs.",
+  "keywords": [
+    "adb"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Simon Chan",
+    "email": "cnsimonchan@live.com",
+    "url": "https://chensi.moe/blog"
+  },
+  "homepage": "https://github.com/yume-chan/ya-webadb/tree/main/libraries/adb-credential-web#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yume-chan/ya-webadb.git",
+    "directory": "libraries/adb-credential-web"
+  },
+  "bugs": {
+    "url": "https://github.com/yume-chan/ya-webadb/issues"
+  },
+  "type": "module",
+  "main": "esm/index.js",
+  "types": "esm/index.d.ts",
+  "sideEffects": false,
+  "dependencies": {
+    "@yume-chan/adb": "^2.1.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3",
+    "@yume-chan/eslint-config": "^1.0.0",
+    "@yume-chan/tsconfig": "^1.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json",
+    "lint": "run-eslint && prettier src/**/*.ts --write --tab-width 4"
+  }
+}
