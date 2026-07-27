@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.0.2';
+const APP_VERSION = '1.0.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -28,8 +28,8 @@ document.addEventListener('DOMContentLoaded', () => {
   checkWebUSB();
   credentialStore.iterateKeys().catch(() => credentialStore.generateKey());
   applyFontSize();
-  // Show version in footer
-  const verEl = document.getElementById('footer-version');
+  // Show version in header
+  const verEl = document.getElementById('header-version');
   if (verEl) verEl.textContent = 'v' + APP_VERSION;
 });
 
@@ -378,7 +378,7 @@ window.togglePkgDetail = function(idx) {
   }
 };
 
-// Parse dumpsys package output - flexible parser for Android 10-14+
+// Parse dumpsys package output - handles Android 10-14+ with multi-KV lines
 function parseDumpsysPackage(text) {
   const packages = [];
   const lines = text.split('\n');
@@ -393,7 +393,6 @@ function parseDumpsysPackage(text) {
     if (!trimmed || trimmed.startsWith('-----')) continue;
 
     // Package header: "Package [com.example.name]:"
-    // Also handle: "Package [com.example.name] (12345):" or "Package [com.example.name]:\n    ..."
     const pkgMatch = line.match(/^Package\s+\[([^\]]+)\]:/);
     if (pkgMatch) {
       if (current) packages.push(finalize(current));
@@ -418,27 +417,29 @@ function parseDumpsysPackage(text) {
     if (trimmed === 'Declared permissions:') {
       finalizePerm(); section = 'declared'; currentPerm = null; continue;
     }
-    // Certs section markers
     if (trimmed === 'primaryCerts:' || trimmed === 'certs:') {
       finalizePerm(); section = 'certs'; currentPerm = null; continue;
     }
 
     // ---- Inside certs section ----
     if (section === 'certs') {
-      // "  0: AB:CD:EF:..." or "  1: SHA256:..."
-      const certMatch = trimmed.match(/^\d+:\s+([0-9A-Fa-f:]{16,})$/);
-      if (certMatch) {
-        current.sha256_cert = certMatch[1].toUpperCase();
+      // "  0: AB:CD:EF:..." or "  0: ABCDEF0123..." or "  0: SHA256=ABC..."
+      const certColon = trimmed.match(/^\d+\s*:\s+([0-9A-Fa-f:]{16,})$/);
+      const certRaw = trimmed.match(/^\d+\s*:\s+([0-9A-Fa-f]{40,})$/);
+      const certSha = trimmed.match(/^\d+\s*:\s+SHA256\s*=\s*([0-9A-Fa-f:]{16,})$/);
+      if (certSha) {
+        current.sha256_cert = certSha[1].toUpperCase().replace(/:/g, '');
         continue;
       }
-      // Not a cert line anymore
+      if (certColon || certRaw) {
+        current.sha256_cert = (certColon || certRaw)[1].toUpperCase().replace(/:/g, '');
+        continue;
+      }
       section = null;
     }
 
     // ---- Inside permissions section ----
     if (section === 'requested' || section === 'declared') {
-      // Permission name: starts with "android.permission." or "com." or "org."
-      // Not an attribute line (those start with granted=, flags=, etc.)
       const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|name|maxTargetSdk|label)\s*=/);
       const isPermName = trimmed.match(/^(android\.permission\.|com\.|org\.)/) && !isPermAttr;
 
@@ -452,41 +453,18 @@ function parseDumpsysPackage(text) {
         continue;
       }
 
-      // Permission attribute
       if (currentPerm) {
-        const attrM = trimmed.match(/^(\w+)\s*=\s*(.+)/);
-        if (attrM) {
-          const key = attrM[1];
-          const val = attrM[2];
-          switch (key) {
-            case 'granted': currentPerm.is_granted = val === 'true'; break;
-            case 'flags':
-              // Handle hex: "0x40000000" or decimal
-              if (val.startsWith('0x') || val.startsWith('0X')) {
-                currentPerm.flags = parseInt(val, 16) || 0;
-              } else {
-                currentPerm.flags = parseInt(val, 10) || 0;
-              }
-              break;
-            case 'protectionLevel':
-            case 'protection_level': {
-              const plMap = {
-                'signature|privileged': 2, 'privileged|signature': 2,
-                'signature': 2, 'dangerous': 1, 'normal': 0, 'privileged': 2,
-              };
-              currentPerm.protection_level = plMap[val] !== undefined ? plMap[val] : (parseInt(val, 10) || 0);
-              break;
-            }
-            case 'protection_level_flags': currentPerm.protection_level_flags = parseInt(val, 10) || 0; break;
-            case 'type': currentPerm.type = parseInt(val, 10) || 1; break;
-            case 'group': currentPerm.permission_group = val; break;
-            case 'maxTargetSdk': currentPerm.maxTargetSdk = parseInt(val, 10) || 0; break;
+        // Handle multi-KV on one line: "flags=0x40000000 type=1"
+        const kvPairs = trimmed.match(/(\w+)\s*=\s*([^\s,]+)/g);
+        if (kvPairs) {
+          for (const pair of kvPairs) {
+            const [key, val] = pair.split('=').map(s => s.trim());
+            assignPermAttr(currentPerm, key, val);
           }
+          continue;
         }
-        continue;
       }
 
-      // If we get here, we've left the permissions section (e.g., new top-level section)
       if (trimmed.length > 0 && !trimmed.match(/^\s/)) {
         finalizePerm(); section = null;
       }
@@ -494,46 +472,67 @@ function parseDumpsysPackage(text) {
     }
 
     // ---- Package-level field parsing ----
-    // Match "key = value" or "key=value" (both formats exist in dumpsys)
-    const kv = trimmed.match(/^(\w+)\s*=\s*(.+)/);
-    if (kv) {
-      const key = kv[1];
-      const val = kv[2];
-      switch (key) {
-        case 'versionName': current.version_name = val; break;
-        case 'versionCode':
-          // Can be "123" or "123 (123)" or "0x123"
-          current.version_code = parseInt(val, 10) || 0;
-          break;
-        case 'codePath':
-        case 'base':
-          current.dir = val;
-          current.system = ['/system/', '/product/', '/vendor/', '/apex/', '/oem/', '/data/app/'].some(p => val.startsWith(p));
-          current.system_priv = ['/system/priv-app/', '/product/priv-app/', '/vendor/priv-app/'].some(p => val.startsWith(p));
-          break;
-        case 'resourcePath': break; // Skip
-        case 'minSdk': current.min_sdk = parseInt(val, 10) || 0; break;
-        case 'targetSdk': current.target_sdk = parseInt(val, 10) || 0; break;
-        case 'userId':
-        case 'uid': {
-          // Can be "10100" or "u0a100" or "uid=10100"
-          const uidMatch = val.match(/(\d+)/);
-          current.uid = uidMatch ? parseInt(uidMatch[1], 10) : 0;
-          break;
-        }
-        case 'package': break; // Already have name from header
-        case 'splitName': break; // Skip split APKs
-        case 'splitRevisionCode': break; // Skip
-        case 'primaryCertsRevision': break; // Skip
-        case 'isPrivApp':
-        case 'privateFlags': break; // Skip
+    // CRITICAL: Android 14 packs multiple KV on one line
+    // e.g. "    versionCode=12345 minSdkVersion=21 targetSdkVersion=34"
+    // So we extract ALL key=value pairs from the line
+    const kvPairs = trimmed.match(/(\w+)\s*=\s*("[^"]*"|[^\s]+)/g);
+    if (kvPairs) {
+      for (const pair of kvPairs) {
+        const eqIdx = pair.indexOf('=');
+        const key = pair.substring(0, eqIdx);
+        let val = pair.substring(eqIdx + 1).trim().replace(/^"|"$/g, '');
+        assignPkgField(current, key, val);
       }
+      continue;
     }
   }
 
-  // Finalize last package
   if (current) packages.push(finalize(current));
   return packages;
+
+  // --- Helpers for multi-KV parsing ---
+  function assignPermAttr(p, key, val) {
+    switch (key) {
+      case 'granted': p.is_granted = val === 'true'; break;
+      case 'flags':
+        p.flags = (val.startsWith('0x') || val.startsWith('0X')) ? parseInt(val, 16) || 0 : parseInt(val, 10) || 0;
+        break;
+      case 'protectionLevel': case 'protection_level': {
+        const map = {'signature|privileged':2,'privileged|signature':2,signature:2,dangerous:1,normal:0,privileged:2};
+        p.protection_level = map[val] !== undefined ? map[val] : (parseInt(val, 10) || 0);
+        break;
+      }
+      case 'protection_level_flags': p.protection_level_flags = parseInt(val, 10) || 0; break;
+      case 'type': p.type = parseInt(val, 10) || 1; break;
+      case 'group': p.permission_group = val; break;
+      case 'maxTargetSdk': p.maxTargetSdk = parseInt(val, 10) || 0; break;
+    }
+  }
+
+  function assignPkgField(pkg, key, val) {
+    switch (key) {
+      case 'versionName': pkg.version_name = val; break;
+      case 'versionCode':
+        // "123", "123 (123)", "0x123" → just the number
+        pkg.version_code = parseInt(val, 10) || 0;
+        break;
+      case 'codePath': case 'base':
+        pkg.dir = val;
+        pkg.system = ['/system/','/product/','/vendor/','/apex/','/oem/','/data/app/'].some(p => val.startsWith(p));
+        pkg.system_priv = ['/system/priv-app/','/product/priv-app/','/vendor/priv-app/'].some(p => val.startsWith(p));
+        break;
+      case 'resourcePath': break;
+      case 'minSdk': case 'minSdkVersion': pkg.min_sdk = parseInt(val, 10) || 0; break;
+      case 'targetSdk': case 'targetSdkVersion': pkg.target_sdk = parseInt(val, 10) || 0; break;
+      case 'userId': case 'uid': {
+        const m = val.match(/(\d+)/);
+        pkg.uid = m ? parseInt(m[1], 10) : 0;
+        break;
+      }
+      case 'package': case 'splitName': case 'splitRevisionCode': case 'primaryCertsRevision':
+      case 'isPrivApp': case 'privateFlags': break; // skip
+    }
+  }
 
   function finalizePerm() {
     if (currentPerm) {

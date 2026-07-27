@@ -213,15 +213,14 @@
   }
   .prop-row {
     display: grid;
-    grid-template-columns: 400px 1fr;
+    grid-template-columns: auto 1fr;
     gap: 0.5rem;
     padding: 0.2rem 0;
     border-bottom: 1px solid rgba(48,54,61,0.4);
   }
   .prop-key {
     color: var(--accent);
-    word-break: break-all;
-    overflow-wrap: break-word;
+    white-space: nowrap;
   }
   .prop-val {
     color: var(--text);
@@ -390,7 +389,7 @@
 <body>
 
 <div class="header">
-  <h1><span>Web</span> ADB Inspector</h1>
+  <h1><span>Web</span> ADB Inspector <span id="header-version" style="color:var(--muted);font-weight:400;font-size:calc(0.8rem * var(--font-scale))"></span></h1>
   <div class="header-controls">
     <span id="webusb-status" class="badge">Checking...</span>
     <button class="font-btn" onclick="changeFontSize(-1)" title="Decrease font size">A-</button>
@@ -521,9 +520,9 @@
   </div>
 </div>
 
-<!-- Footer -->
+<!-- Footer (version moved to header) -->
 <div id="app-footer" class="app-footer">
-  <span id="footer-version"></span> &middot; Web ADB Inspector
+  Web ADB Inspector
 </div>
 
 <script type="module" src="bundle.js"></script>
