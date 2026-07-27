@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -283,6 +283,7 @@ async function fetchPackages() {
     if (packages.length > 0) {
       dataCache.packages = packages;
       renderPackages(packages, false, 'dumpsys');
+      showLoading('packages', false);
       return;
     }
     console.warn('dumpsys parsed 0 packages from', text.length, 'chars');
@@ -298,6 +299,7 @@ async function fetchPackages() {
     if (packages.length > 0) {
       dataCache.packages = packages;
       renderPackages(packages, true, 'pm-list');
+      showLoading('packages', false);
       return;
     }
   } catch (e2) {
@@ -696,11 +698,6 @@ async function fetchRKP() {
     ]);
     const rv = props.map(r => r.value || '');
 
-    // Samsung RKP (if applicable)
-    let samsungRkp = '';
-    try { samsungRkp = await adbShell(info.adb, 'pm list packages com.samsung.android.samsungpass'); } catch(e) {}
-    const hasSamsungPass = samsungRkp.includes('com.samsung.android.samsungpass');
-
     // Keymint feature version
     let keymintVer = '';
     try {
@@ -736,11 +733,6 @@ async function fetchRKP() {
        piVer !== 'Not installed' ? 'ok' : 'warn',
        'pm list packages com.google.android.gms.integrity',
        'Play Integrity API replaces SafetyNet. Used by banking/payment apps for device integrity checks.'],
-      ['Samsung Pass',
-       hasSamsungPass ? 'Installed' : 'Not found',
-       hasSamsungPass ? 'ok' : 'unknown',
-       'pm list packages com.samsung.android.samsungpass',
-       'Samsung Pass uses RKP for Samsung Pay. Only relevant on Samsung devices.'],
     ];
 
     // Add RKP vendor properties - only show ones that have values
