@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.0.4';
+const APP_VERSION = '1.0.5';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -151,8 +151,7 @@ function selectDevice(serial) {
   document.getElementById('selected-device-name').textContent =
     (info._displayName || serial) + (nick ? ' ("' + nick + '")' : '') + ' (' + serial + ')';
   renderDeviceList();
-  const shellEl = document.getElementById('shell-output');
-  if (shellEl) shellEl.textContent = '';
+  document.getElementById('shell-output').textContent = '';
   document.getElementById('search-props').value = '';
   document.getElementById('search-features').value = '';
   document.getElementById('search-packages').value = '';
@@ -380,21 +379,26 @@ window.togglePkgDetail = function(idx) {
 };
 
 // Parse dumpsys package output - handles Android 10-14+ with multi-KV lines
+// CRITICAL FIX: dumpsys output has LEADING SPACES on ALL lines
+// "  Package [com.example] (12345):"
+// "    versionName=4.3.3.26"
+// Must use trimmed, NOT line, for regex anchors
 function parseDumpsysPackage(text) {
   const packages = [];
-  const lines = text.split('\n');
+  const allLines = text.split('\n');
 
   let current = null;
   let section = null; // null, 'requested', 'declared', 'certs'
   let currentPerm = null;
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
+  for (let i = 0; i < allLines.length; i++) {
+    const rawLine = allLines[i];
+    const trimmed = rawLine.trim();
     if (!trimmed || trimmed.startsWith('-----')) continue;
 
-    // Package header: "Package [com.example.name]:" or "Package [com.example.name] (12345):"
-    const pkgMatch = line.match(/^Package\s+\[([^\]]+)\]/);
+    // Package header: CRITICAL - use trimmed, not rawLine
+    // "  Package [com.example.name]:" or "  Package [com.example.name] (12345):"
+    const pkgMatch = trimmed.match(/^Package\s+\[([^\]]+)\]/);
     if (pkgMatch) {
       if (current) packages.push(finalize(current));
       current = {
@@ -411,14 +415,15 @@ function parseDumpsysPackage(text) {
 
     if (!current) continue;
 
-    // ---- Section detection ----
-    if (trimmed === 'Requested permissions:') {
+    // ---- Section detection (case insensitive) ----
+    const lower = trimmed.toLowerCase().replace(/\s*:\s*$/, '');
+    if (lower === 'requested permissions') {
       finalizePerm(); section = 'requested'; currentPerm = null; continue;
     }
-    if (trimmed === 'Declared permissions:') {
+    if (lower === 'declared permissions') {
       finalizePerm(); section = 'declared'; currentPerm = null; continue;
     }
-    if (trimmed === 'primaryCerts:' || trimmed === 'certs:') {
+    if (lower === 'primarycerts' || lower === 'certs') {
       finalizePerm(); section = 'certs'; currentPerm = null; continue;
     }
 
@@ -436,40 +441,78 @@ function parseDumpsysPackage(text) {
         current.sha256_cert = (certColon || certRaw)[1].toUpperCase().replace(/:/g, '');
         continue;
       }
+      // No cert match - end of certs section
       section = null;
     }
 
     // ---- Inside permissions section ----
     if (section === 'requested' || section === 'declared') {
-      const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|name|maxTargetSdk|label)\s*=/);
-      const isPermName = trimmed.match(/^(android\.permission\.|com\.|org\.)/) && !isPermAttr;
+      // dumpsys format for permissions is EITHER:
+      // Format A (newer):
+      //   android.permission.X
+      //   granted=true
+      //   android.permission.Y
+      //   granted=false
+      // Format B (older, with full details):
+      //   Permission: android.permission.X
+      //     uid=1000 gids=...
+      //     name=android.permission.X
+      //     flags=0x40000000
+      //     type=1
+      //     protectionLevel=signature|privileged
+      //     protectionLevelFlags=0x00400000
 
-      if (isPermName) {
+      // Check for "Permission:" block format
+      const permBlock = trimmed.match(/^Permission:\s*(.+)$/);
+      if (permBlock) {
         finalizePerm();
         currentPerm = {
-          name: trimmed, is_granted: undefined, flags: 0,
+          name: permBlock[1].trim(), is_granted: undefined, flags: 0,
           permission_group: '', protection_level: 0,
           protection_level_flags: 0, type: 1, maxTargetSdk: 0,
         };
         continue;
       }
 
-      if (currentPerm) {
-        // Handle multi-KV on one line: "flags=0x40000000 type=1"
+      // Check for attribute lines (granted=, flags=, etc.)
+      const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|name|maxTargetSdk|uid|label)\s*=/);
+      if (currentPerm && isPermAttr) {
         const kvPairs = trimmed.match(/(\w+)\s*=\s*([^\s,]+)/g);
         if (kvPairs) {
           for (const pair of kvPairs) {
-            const [key, val] = pair.split('=').map(s => s.trim());
+            const eqIdx = pair.indexOf('=');
+            const key = pair.substring(0, eqIdx).trim();
+            const val = pair.substring(eqIdx + 1).trim();
             assignPermAttr(currentPerm, key, val);
           }
-          continue;
         }
+        continue;
       }
 
-      if (trimmed.length > 0 && !trimmed.match(/^\s/)) {
-        finalizePerm(); section = null;
+      // Check for bare permission name (Format A)
+      const isBarePerm = trimmed.match(/^(android\.permission\.|com\.|org\.)/);
+      // But NOT if it's something like "sharedLibrary=false"
+      if (isBarePerm && !trimmed.includes('=')) {
+        finalizePerm();
+        currentPerm = {
+          name: trimmed, is_granted: undefined, flags: 0,
+          permission_group: '', protection_level: 0,
+          protection_level_flags: 0, type: 1,
+        };
+        continue;
       }
-      continue;
+
+      // Check if line looks like it's outside permissions
+      // (new non-indented section or package-level data)
+      const rawIndent = rawLine.match(/^(\s*)/)[1].length;
+      if (rawIndent < 4) {
+        // Likely left the permissions section
+        finalizePerm();
+        section = null;
+        // Fall through to package-level parsing
+      } else {
+        continue;
+      }
     }
 
     // ---- Package-level field parsing ----

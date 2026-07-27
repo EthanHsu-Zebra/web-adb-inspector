@@ -369,21 +369,6 @@
     .prop-row { grid-template-columns: 180px 1fr; }
   }
 
-  /* Footer */
-  .app-footer {
-    text-align: center;
-    padding: 0.6rem;
-    font-size: calc(0.7rem * var(--font-scale));
-    color: var(--muted);
-    border-top: 1px solid var(--border);
-    background: var(--surface);
-  }
-  .app-footer code {
-    font-family: var(--mono);
-    background: var(--bg);
-    padding: 0.1rem 0.3rem;
-    border-radius: 3px;
-  }
 </style>
 </head>
 <body>
@@ -425,6 +410,7 @@
         <div class="tab" onclick="switchTab(this, 'tab-packages')">Packages</div>
         <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
         <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
+        <div class="tab" onclick="switchTab(this, 'tab-shell')">Shell</div>
       </div>
 
       <!-- Properties Tab -->
@@ -494,14 +480,29 @@
         </div>
       </div>
 
+      <!-- Shell Tab -->
+      <div id="tab-shell" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>ADB Shell</h3>
+          </div>
+          <div class="quick-btns">
+            <button class="btn btn-sm" onclick="runCmd('getprop ro.build.version.release')">Android Ver</button>
+            <button class="btn btn-sm" onclick="runCmd('getprop ro.product.model')">Model</button>
+            <button class="btn btn-sm" onclick="runCmd('getprop ro.hardware')">Hardware</button>
+            <button class="btn btn-sm" onclick="runCmd('dumpsys battery')">Battery</button>
+            <button class="btn btn-sm" onclick="runCmd('dumpsys display')">Display</button>
+            <button class="btn btn-sm" onclick="runCmd('dumpsys wifi')">WiFi</button>
+          </div>
+          <div class="shell-bar">
+            <input id="shell-input" type="text" placeholder="adb shell command..." onkeydown="if(event.key==='Enter')runShell()">
+            <button class="btn" onclick="runShell()">Run</button>
+          </div>
+          <div id="shell-output" class="shell-output"></div>
+        </div>
       </div>
     </div>
   </div>
-</div>
-
-<!-- Footer (version moved to header) -->
-<div id="app-footer" class="app-footer">
-  Web ADB Inspector
 </div>
 
 <script type="module" src="bundle.js"></script>
