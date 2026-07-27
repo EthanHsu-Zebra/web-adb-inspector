@@ -13,7 +13,7 @@ import AdbWebCredentialStore from '@yume-chan/adb-credential-web';
 
 // --- Global State ---
 const credentialStore = new AdbWebCredentialStore('web-adb-inspector');
-const connectedDevices = new Map(); // serial -> { adb, usbDevice, transport }
+const connectedDevices = new Map();
 let activeSerial = null;
 
 // --- Init ---
@@ -35,6 +35,52 @@ function checkWebUSB() {
   badge.className = 'badge ok';
 }
 
+// --- OS detection for ADB release help ---
+function getADBReleaseHelp() {
+  const ua = navigator.userAgent;
+  if (/Windows/.test(ua)) return 'windows';
+  if (/Mac/.test(ua)) return 'mac';
+  if (/Linux/.test(ua)) return 'linux';
+  return 'unknown';
+}
+
+function showADBReleaseDialog() {
+  const os = getADBReleaseHelp();
+  let title, body;
+  switch (os) {
+    case 'windows':
+      title = 'Release ADB access on Windows';
+      body = `Your Windows adb.exe is holding the USB device.\n\n` +
+             `1. Open Command Prompt or PowerShell\n` +
+             `2. Run: adb kill-server\n` +
+             `3. Or kill the process: taskkill /F /IM adb.exe\n\n` +
+             `Then refresh this page and connect again.`;
+      break;
+    case 'mac':
+      title = 'Release ADB access on macOS';
+      body = `Your macOS ADB daemon is holding the USB device.\n\n` +
+             `1. Open Terminal\n` +
+             `2. Run: adb kill-server\n` +
+             `3. If that fails:\n` +
+             `   pkill -f adb\n` +
+             `   sudo killall -9 ADB\\ Monitor\n\n` +
+             `Then refresh this page and connect again.`;
+      break;
+    case 'linux':
+      title = 'Release ADB access on Linux';
+      body = `Linux kernel android_usb driver is holding the device.\n\n` +
+             `1. Find your device: lsusb | grep -i android\n` +
+             `2. Unbind: echo "BUS-DEV" | sudo tee /sys/bus/usb/drivers/android_usb/unbind\n\n` +
+             `Example: echo "1-1.3" | sudo tee /sys/bus/usb/drivers/android_usb/unbind\n\n` +
+             `To restore later: echo "1-1.3" | sudo tee /sys/bus/usb/drivers/android_usb/bind`;
+      break;
+    default:
+      title = 'Release ADB access';
+      body = 'Close any ADB server or process holding the device, then try again.';
+  }
+  alert(title + '\n\n' + body);
+}
+
 // --- Device Discovery ---
 async function scanDevices() {
   const manager = AdbDaemonWebUsbDeviceManager.BROWSER;
@@ -49,7 +95,12 @@ async function scanDevices() {
     await connectDevice(device);
   } catch (err) {
     console.error('Scan failed:', err);
-    alert('Failed to connect: ' + err.message);
+    const msg = err.message || String(err);
+    if (msg.includes('already in use')) {
+      showADBReleaseDialog();
+    } else {
+      alert('Failed to connect: ' + msg);
+    }
   }
 }
 
@@ -73,7 +124,6 @@ async function connectDevice(usbDevice) {
     const adb = new Adb(transport);
 
     const serial = adb.serial;
-    connectedDevices.set(serial, { adb, usbDevice, transport });
 
     // Load device name from properties
     let displayName = usbDevice.name || 'Android Device';
@@ -82,6 +132,8 @@ async function connectDevice(usbDevice) {
       const brand = await adb.getProp('ro.product.brand');
       displayName = brand + ' ' + model;
     } catch (_) { /* fallback */ }
+
+    connectedDevices.set(serial, { adb, usbDevice, transport, _displayName: displayName });
 
     renderDeviceList();
 
@@ -93,8 +145,22 @@ async function connectDevice(usbDevice) {
     setStatus('Connected', 'ok');
   } catch (err) {
     console.error('Connection failed:', err);
-    setStatus('Connection failed: ' + err.message, 'err');
+    const msg = err.message || String(err);
+    if (msg.includes('already in use')) {
+      showADBReleaseDialog();
+    }
+    setStatus('Connection failed: ' + msg, 'err');
   }
+}
+
+// --- Shell helper ---
+async function adbShell(adb, cmd) {
+  const sp = adb.subprocess.shellProtocol;
+  if (sp && sp.isSupported) {
+    const result = await sp.spawnWaitText(cmd);
+    return result.stdout;
+  }
+  throw new Error('Shell protocol not supported on this device (Android version may be too old or too new)');
 }
 
 // --- UI Rendering ---
@@ -166,9 +232,7 @@ async function fetchProperties() {
 
   showLoading('props', true);
   try {
-    // Use shell command to get all properties
-    const proc = await info.adb.subprocess.shell('getprop');
-    const text = await readStream(proc.readable);
+    const text = await adbShell(info.adb, 'getprop');
 
     const props = [];
     const regex = /\[([^\]]+):\s*([^\]]*)\]/g;
@@ -179,11 +243,11 @@ async function fetchProperties() {
 
     document.getElementById('props-output').innerHTML =
       props.map(([k, v]) =>
-        '<span class="kv-key">' + esc(k) + '</span><span class="kv-val">' + esc(v) + '</span>'
+        '<div><span class="kv-key">' + esc(k) + '</span><span class="kv-val">' + esc(v) + '</span></div>'
       ).join('');
   } catch (err) {
     document.getElementById('props-output').innerHTML =
-      '<span style="color:#ff5252">Error: ' + esc(err.message) + '</span>';
+      '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
   showLoading('props', false);
 }
@@ -194,18 +258,17 @@ async function fetchFeatures() {
 
   showLoading('features', true);
   try {
-    const proc = await info.adb.subprocess.shell('pm list features');
-    const text = await readStream(proc.readable);
+    const text = await adbShell(info.adb, 'pm list features');
 
     const features = text.split('\n').filter(l => l.trim()).map(l => l.replace(/^feature:/, '').trim());
 
     document.getElementById('features-output').innerHTML =
       features.map(f =>
-        '<div class="feat-item"><span style="color:var(--green)">✓</span> ' + esc(f) + '</div>'
+        '<div class="feat-item"><span style="color:var(--green)">&#x2713;</span> ' + esc(f) + '</div>'
       ).join('');
   } catch (err) {
     document.getElementById('features-output').innerHTML =
-      '<span style="color:#ff5252">Error: ' + esc(err.message) + '</span>';
+      '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
   showLoading('features', false);
 }
@@ -216,8 +279,7 @@ async function fetchPackages() {
 
   showLoading('packages', true);
   try {
-    const proc = await info.adb.subprocess.shell('pm list packages -3');
-    const text = await readStream(proc.readable);
+    const text = await adbShell(info.adb, 'pm list packages -3');
 
     const pkgs = text.split('\n').filter(l => l.trim()).map(l => l.replace(/^package:/, '').trim());
 
@@ -226,7 +288,7 @@ async function fetchPackages() {
       pkgs.map(p => '<div class="feat-item">' + esc(p) + '</div>').join('');
   } catch (err) {
     document.getElementById('packages-output').innerHTML =
-      '<span style="color:#ff5252">Error: ' + esc(err.message) + '</span>';
+      '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
   showLoading('packages', false);
 }
@@ -245,11 +307,10 @@ async function runShell() {
   output.textContent += '$ ' + cmd + '\n';
 
   try {
-    const proc = await info.adb.subprocess.shell(cmd);
-    const text = await readStream(proc.readable);
+    const text = await adbShell(info.adb, cmd);
     output.textContent += text + '\n';
   } catch (err) {
-    output.textContent += 'Error: ' + err.message + '\n';
+    output.textContent += 'Error: ' + String(err.message || err) + '\n';
   }
 
   output.scrollTop = output.scrollHeight;
@@ -261,25 +322,6 @@ function runCmd(cmd) {
 }
 
 // --- Utilities ---
-function readStream(readable) {
-  return new Promise((resolve, reject) => {
-    const decoder = new TextDecoder();
-    const reader = readable.getReader();
-    const chunks = [];
-    function read() {
-      reader.read().then(({ done, value }) => {
-        if (done) {
-          resolve(chunks.join(''));
-          return;
-        }
-        chunks.push(decoder.decode(value, { stream: true }));
-        read();
-      }).catch(reject);
-    }
-    read();
-  });
-}
-
 function showLoading(section, show) {
   const el = document.getElementById(section + '-loading');
   if (show) el.classList.remove('hidden');
@@ -327,3 +369,4 @@ window.switchTab = switchTab;
 window.runShell = runShell;
 window.runCmd = runCmd;
 window.copyPanel = copyPanel;
+window.showADBReleaseDialog = showADBReleaseDialog;
