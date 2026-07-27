@@ -269,45 +269,62 @@ async function fetchPackages() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
   showLoading('packages', true);
+  const tmpPath = '/data/local/tmp/webadb_dumpsys.txt';
+  let method = 'fallback';
   try {
-    const tmpPath = '/data/local/tmp/webadb_dumpsys.txt';
     await adbShell(info.adb, 'dumpsys package > ' + tmpPath + ' 2>&1');
     const text = await readDeviceFile(info.adb, tmpPath);
     try { await adbShell(info.adb, 'rm -f ' + tmpPath); } catch(e) {}
     const packages = parseDumpsysPackage(text);
-    dataCache.packages = packages;
-    renderPackages(packages);
-  } catch (err) {
-    console.warn('dumpsys+sync failed, falling back:', err);
-    try {
-      const text = await adbShell(info.adb, 'pm list packages -f -u');
-      const packages = parsePmListPackagesFallback(text);
+    if (packages.length > 0) {
       dataCache.packages = packages;
-      renderPackages(packages, true);
-    } catch (e2) {
-      document.getElementById('packages-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
+      renderPackages(packages, false, 'dumpsys');
+      return;
     }
+    console.warn('dumpsys parsed 0 packages from', text.length, 'chars');
+  } catch (err) {
+    console.warn('dumpsys+sync failed:', err.message || err);
+    try { await adbShell(info.adb, 'rm -f ' + tmpPath); } catch(e) {}
   }
+
+  // Fallback 1: pm list packages -f -u
+  try {
+    const text = await adbShell(info.adb, 'pm list packages -f -u');
+    const packages = parsePmListPackagesFallback(text);
+    if (packages.length > 0) {
+      dataCache.packages = packages;
+      renderPackages(packages, true, 'pm-list');
+      return;
+    }
+  } catch (e2) {
+    console.warn('pm list fallback failed:', e2.message || e2);
+  }
+
+  document.getElementById('packages-output').innerHTML = '<span style="color:#ff5252">Failed to fetch package data. Check console for details.</span>';
   showLoading('packages', false);
 }
 
-function renderPackages(packages, fallback) {
+function renderPackages(packages, fallback, method) {
   const q = (document.getElementById('search-packages')?.value || '').toLowerCase();
   const filtered = q ? packages.filter(p => p.name.toLowerCase().includes(q)) : packages;
   const sys = packages.filter(p => p.system).length;
   const priv = packages.filter(p => p.system_priv).length;
   const user = packages.filter(p => !p.system).length;
+  const hasDetails = packages.filter(p => p.version_name || p.requested_permissions.length).length;
 
   let html = '<div class="prop-count">' + packages.length + ' total' +
     (sys ? ' <span style="color:var(--muted)">' + sys + ' sys</span>' : '') +
     (user ? ' <span style="color:var(--green)">' + user + ' user</span>' : '') +
     (priv ? ' <span style="color:var(--orange)">' + priv + ' priv</span>' : '') +
+    (hasDetails > 0 ? ' <span style="color:var(--green)">' + hasDetails + ' with details</span>' : '') +
     (fallback ? ' <span style="color:var(--yellow)">[limited data]</span>' : '') +
     (q ? ' <span style="color:var(--accent)">filtered: ' + filtered.length + '</span>' : '') +
     '</div>';
+  if (fallback || hasDetails === 0) {
+    html += '<div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);padding:0.3rem 0">Source: ' + (method || 'unknown') + '. Click package name to expand details.</div>';
+  }
 
   html += filtered.map((p, idx) => {
-    // Find the real index in full array for the detail toggle
     const realIdx = packages.indexOf(p);
     let badges = '';
     if (p.system_priv) badges += '<span class="pkg-badge priv">priv</span> ';
@@ -355,23 +372,23 @@ window.togglePkgDetail = function(idx) {
   }
 };
 
-// Parse dumpsys package output - matches actual Android dumpsys format
+// Parse dumpsys package output - flexible parser for Android 10-14+
 function parseDumpsysPackage(text) {
   const packages = [];
   const lines = text.split('\n');
 
-  // State tracking
   let current = null;
-  let section = null; // null, 'requested', 'declared'
+  let section = null; // null, 'requested', 'declared', 'certs'
   let currentPerm = null;
-  let inCerts = false;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('-----')) continue;
 
     // Package header: "Package [com.example.name]:"
-    const pkgMatch = line.match(/^Package\s+\[([^\]]+)\]:\s*$/);
+    // Also handle: "Package [com.example.name] (12345):" or "Package [com.example.name]:\n    ..."
+    const pkgMatch = line.match(/^Package\s+\[([^\]]+)\]:/);
     if (pkgMatch) {
       if (current) packages.push(finalize(current));
       current = {
@@ -383,95 +400,127 @@ function parseDumpsysPackage(text) {
       };
       section = null;
       currentPerm = null;
-      inCerts = false;
       continue;
     }
 
     if (!current) continue;
 
-    // Section transitions
-    if (trimmed === 'Requested permissions:') { finalizePerm(); section = 'requested'; inCerts = false; continue; }
-    if (trimmed === 'Declared permissions:') { finalizePerm(); section = 'declared'; inCerts = false; continue; }
-
-    // Certs section: "primaryCerts:" or "certs:["
-    if (trimmed === 'primaryCerts:' || trimmed.match(/^certs?[\[:]/)) {
-      finalizePerm();
-      section = null;
-      inCerts = true;
-      continue;
+    // ---- Section detection ----
+    if (trimmed === 'Requested permissions:') {
+      finalizePerm(); section = 'requested'; currentPerm = null; continue;
+    }
+    if (trimmed === 'Declared permissions:') {
+      finalizePerm(); section = 'declared'; currentPerm = null; continue;
+    }
+    // Certs section markers
+    if (trimmed === 'primaryCerts:' || trimmed === 'certs:') {
+      finalizePerm(); section = 'certs'; currentPerm = null; continue;
     }
 
-    // Parse cert lines inside certs section: "  0: AB:CD:EF:..."
-    if (inCerts) {
-      const certMatch = trimmed.match(/^\d+:\s+([A-Fa-f0-9:]+)$/);
-      if (certMatch && certMatch[1].split(':').length >= 8) {
+    // ---- Inside certs section ----
+    if (section === 'certs') {
+      // "  0: AB:CD:EF:..." or "  1: SHA256:..."
+      const certMatch = trimmed.match(/^\d+:\s+([0-9A-Fa-f:]{16,})$/);
+      if (certMatch) {
         current.sha256_cert = certMatch[1].toUpperCase();
         continue;
       }
-      // End of certs section
-      inCerts = false;
+      // Not a cert line anymore
+      section = null;
     }
 
-    // Permission name line (indented, starts with android.permission. or com.)
-    if (section && line.match(/^\s{2,6}/) && trimmed.match(/^(android\.permission\.|com\.|org\.)/) && !trimmed.match(/^(granted|flags|protectionLevel|type|group|name)\s*=/)) {
-      finalizePerm();
-      currentPerm = {
-        name: trimmed,
-        is_granted: undefined,
-        flags: 0,
-        permission_group: '',
-        protection_level: 0,
-        protection_level_flags: 0,
-        type: 1,
-      };
-      continue;
-    }
+    // ---- Inside permissions section ----
+    if (section === 'requested' || section === 'declared') {
+      // Permission name: starts with "android.permission." or "com." or "org."
+      // Not an attribute line (those start with granted=, flags=, etc.)
+      const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|name|maxTargetSdk|label)\s*=/);
+      const isPermName = trimmed.match(/^(android\.permission\.|com\.|org\.)/) && !isPermAttr;
 
-    // Permission attributes (more indented)
-    if (section && currentPerm && line.match(/^\s{6,10}/)) {
-      const attrM = trimmed.match(/^(\w+)\s*=\s*(.+)/);
-      if (attrM) {
-        const key = attrM[1];
-        const val = attrM[2];
-        if (key === 'granted') currentPerm.is_granted = val === 'true';
-        else if (key === 'flags') {
-          // Flags can be hex: 0x40000000 or decimal
-          currentPerm.flags = parseInt(val.replace(/^0x/, '').replace(/^0X/, ''), 16) || 0;
+      if (isPermName) {
+        finalizePerm();
+        currentPerm = {
+          name: trimmed, is_granted: undefined, flags: 0,
+          permission_group: '', protection_level: 0,
+          protection_level_flags: 0, type: 1, maxTargetSdk: 0,
+        };
+        continue;
+      }
+
+      // Permission attribute
+      if (currentPerm) {
+        const attrM = trimmed.match(/^(\w+)\s*=\s*(.+)/);
+        if (attrM) {
+          const key = attrM[1];
+          const val = attrM[2];
+          switch (key) {
+            case 'granted': currentPerm.is_granted = val === 'true'; break;
+            case 'flags':
+              // Handle hex: "0x40000000" or decimal
+              if (val.startsWith('0x') || val.startsWith('0X')) {
+                currentPerm.flags = parseInt(val, 16) || 0;
+              } else {
+                currentPerm.flags = parseInt(val, 10) || 0;
+              }
+              break;
+            case 'protectionLevel':
+            case 'protection_level': {
+              const plMap = {
+                'signature|privileged': 2, 'privileged|signature': 2,
+                'signature': 2, 'dangerous': 1, 'normal': 0, 'privileged': 2,
+              };
+              currentPerm.protection_level = plMap[val] !== undefined ? plMap[val] : (parseInt(val, 10) || 0);
+              break;
+            }
+            case 'protection_level_flags': currentPerm.protection_level_flags = parseInt(val, 10) || 0; break;
+            case 'type': currentPerm.type = parseInt(val, 10) || 1; break;
+            case 'group': currentPerm.permission_group = val; break;
+            case 'maxTargetSdk': currentPerm.maxTargetSdk = parseInt(val, 10) || 0; break;
+          }
         }
-        else if (key === 'protectionLevel' || key === 'protection_level') {
-          // protectionLevel can be: 0, 1, 2, or "dangerous", "signature", etc.
-          const plMap = { 'signature|privileged': 2, 'signature': 2, 'dangerous': 1, 'normal': 0, 'privileged': 2 };
-          if (plMap[val]) currentPerm.protection_level = plMap[val];
-          else currentPerm.protection_level = parseInt(val, 10) || 0;
-        }
-        else if (key === 'protection_level_flags') currentPerm.protection_level_flags = parseInt(val, 10) || 0;
-        else if (key === 'type') currentPerm.type = parseInt(val, 10) || 1;
-        else if (key === 'group') currentPerm.permission_group = val;
+        continue;
+      }
+
+      // If we get here, we've left the permissions section (e.g., new top-level section)
+      if (trimmed.length > 0 && !trimmed.match(/^\s/)) {
+        finalizePerm(); section = null;
       }
       continue;
     }
 
-    // Package field parsing - indented key=value lines
-    if (line.match(/^\s{2,4}/) && !section && !inCerts) {
-      const kv = trimmed.match(/^(\w+)\s*=\s*(.+)/);
-      if (kv) {
-        const key = kv[1];
-        const val = kv[2];
-        switch (key) {
-          case 'versionName': current.version_name = val; break;
-          case 'versionCode': current.version_code = parseInt(val, 10) || 0; break;
-          case 'codePath':
-            current.dir = val;
-            current.system = ['/system/', '/product/', '/vendor/', '/apex/', '/oem/'].some(p => val.startsWith(p));
-            current.system_priv = ['/system/priv-app/', '/product/priv-app/', '/vendor/priv-app/'].some(p => val.startsWith(p));
-            break;
-          case 'minSdk': current.min_sdk = parseInt(val, 10) || 0; break;
-          case 'targetSdk': current.target_sdk = parseInt(val, 10) || 0; break;
-          case 'userId':
-          case 'uid': current.uid = parseInt(val, 10) || 0; break;
-          case 'base': current.dir = val; break;
-          case 'apk': current.dir = val; break;
+    // ---- Package-level field parsing ----
+    // Match "key = value" or "key=value" (both formats exist in dumpsys)
+    const kv = trimmed.match(/^(\w+)\s*=\s*(.+)/);
+    if (kv) {
+      const key = kv[1];
+      const val = kv[2];
+      switch (key) {
+        case 'versionName': current.version_name = val; break;
+        case 'versionCode':
+          // Can be "123" or "123 (123)" or "0x123"
+          current.version_code = parseInt(val, 10) || 0;
+          break;
+        case 'codePath':
+        case 'base':
+          current.dir = val;
+          current.system = ['/system/', '/product/', '/vendor/', '/apex/', '/oem/', '/data/app/'].some(p => val.startsWith(p));
+          current.system_priv = ['/system/priv-app/', '/product/priv-app/', '/vendor/priv-app/'].some(p => val.startsWith(p));
+          break;
+        case 'resourcePath': break; // Skip
+        case 'minSdk': current.min_sdk = parseInt(val, 10) || 0; break;
+        case 'targetSdk': current.target_sdk = parseInt(val, 10) || 0; break;
+        case 'userId':
+        case 'uid': {
+          // Can be "10100" or "u0a100" or "uid=10100"
+          const uidMatch = val.match(/(\d+)/);
+          current.uid = uidMatch ? parseInt(uidMatch[1], 10) : 0;
+          break;
         }
+        case 'package': break; // Already have name from header
+        case 'splitName': break; // Skip split APKs
+        case 'splitRevisionCode': break; // Skip
+        case 'primaryCertsRevision': break; // Skip
+        case 'isPrivApp':
+        case 'privateFlags': break; // Skip
       }
     }
   }
@@ -490,7 +539,6 @@ function parseDumpsysPackage(text) {
 
   function finalize(pkg) {
     finalizePerm();
-    // Clean up undefined values
     return {
       name: pkg.name,
       version_name: pkg.version_name || '',
@@ -583,7 +631,7 @@ async function fetchAttestation() {
   showLoading('attestation', false);
 }
 
-// --- RKP: Real checks with tooltips ---
+// --- RKP: Comprehensive checks with source info and tooltips ---
 async function fetchRKP() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
@@ -606,51 +654,124 @@ async function fetchRKP() {
     } catch(e) {}
 
     // GMS check
-    let gms = 'Not installed';
+    let gmsVer = 'Not installed';
     try {
       const g = await adbShell(info.adb, 'pm list packages com.google.android.gms');
-      if (g.includes('com.google.android.gms')) gms = 'Installed';
+      if (g.includes('com.google.android.gms')) {
+        gmsVer = await adbShell(info.adb, 'dumpsys package com.google.android.gms | grep versionName');
+        gmsVer = gmsVer.match(/versionName\s*=\s*(.+)/)?.[1] || 'Installed';
+      }
     } catch(e) {}
 
     // Play Integrity
-    let pi = 'Not installed';
+    let piVer = 'Not installed';
     try {
       const p = await adbShell(info.adb, 'pm list packages com.google.android.gms.integrity');
-      if (p.includes('com.google.android.gms.integrity')) pi = 'Installed';
+      if (p.includes('com.google.android.gms.integrity')) piVer = 'Installed';
     } catch(e) {}
 
-    // RKP properties
+    // Broad property scan
     const props = await Promise.allSettled([
       safeGetProp(info.adb, 'ro.vendor.qti.security.rkp.enabled'),
       safeGetProp(info.adb, 'ro.hardware.nfc'),
       safeGetProp(info.adb, 'ro.rkp.enabled'),
       safeGetProp(info.adb, 'ro.boot.flash.locked'),
+      safeGetProp(info.adb, 'ro.boot.verifiedbootstate'),
+      safeGetProp(info.adb, 'ro.boot.vbmeta.verify_state'),
+      safeGetProp(info.adb, 'ro.boot.vbmeta.device_state'),
+      safeGetProp(info.adb, 'ro.boot.veritymode'),
+      safeGetProp(info.adb, 'ro.boot.warranty_bit'),
+      safeGetProp(info.adb, 'ro.warranty.void'),
+      safeGetProp(info.adb, 'ro.vendor.security.nfc.rkp.enabled'),
+      safeGetProp(info.adb, 'persist.vendor.rkp.enabled'),
+      safeGetProp(info.adb, 'ro.security.rkp.enabled'),
+      safeGetProp(info.adb, 'ro.hardware.keystore'),
+      safeGetProp(info.adb, 'ro.hardware.keystore2'),
+      safeGetProp(info.adb, 'ro.hardware.strongbox'),
+      safeGetProp(info.adb, 'ro.vendor.qti.hardware.aee.mode'),
     ]);
     const rv = props.map(r => r.value || '');
 
+    // Samsung RKP (if applicable)
+    let samsungRkp = '';
+    try { samsungRkp = await adbShell(info.adb, 'pm list packages com.samsung.android.samsungpass'); } catch(e) {}
+    const hasSamsungPass = samsungRkp.includes('com.samsung.android.samsungpass');
+
+    // Keymint feature version
+    let keymintVer = '';
+    try {
+      const ft = await adbShell(info.adb, 'pm list features');
+      const kmLine = ft.split('\n').find(l => l.includes('android.hardware.security.keymint'));
+      if (kmLine) keymintVer = kmLine.replace(/feature:/, '').trim();
+    } catch(e) {}
+
+    // Build the rows: [Check, Value, Status, Source/Command, Tooltip]
     const rows = [
       ['KeyMint Provider',
-       kMint ? 'Active (hardware-backed)' : (ksOut || 'Not found').substring(0, 80),
+       kMint ? 'Active (hardware-backed)' : ksOut.substring(0, 60) || 'Not found',
        kMint ? 'ok' : 'warn',
-       'KeyMint is the modern Android key management API. Active means hardware-backed key storage is functional.'],
+       'cmd keystore',
+       'KeyMint is the Android 12+ key management HAL. Active means hardware-backed keys work. Command: cmd keystore'],
       ['Key Attestation',
-       attestOk ? 'Operational' : (attestOut || 'Not available').substring(0, 80),
+       attestOk ? 'Operational' : attestOut.substring(0, 60) || 'Not available',
        attestOk ? 'ok' : 'warn',
-       'Key Attestation lets apps verify that keys are hardware-backed. "Operational" means the device can generate attestation certificates.'],
-      ['GMS Core', gms, gms === 'Installed' ? 'ok' : 'warn',
-       'Google Play Services. Required for Google SafetyNet and Play Integrity checks.'],
-      ['Play Integrity', pi, pi === 'Installed' ? 'ok' : 'warn',
-       'Play Integrity API replaces SafetyNet. Used by apps like banking to verify device integrity.'],
-      ['RKP Vendor Enabled', rv[0] || 'Not set', rv[0] === 'true' ? 'ok' : 'unknown',
-       'Vendor-specific RKP (Remote Key Provisioning) enable flag. Used by Samsung and other OEMs for NFC payment key provisioning.'],
-      ['NFC Hardware', rv[1] || 'Not set', rv[1] ? 'ok' : 'warn',
-       'NFC chip identifier. Required for contactless payments and RKP provisioning workflows.'],
-      ['RKP Enabled', rv[2] || 'Not set', rv[2] === 'true' ? 'ok' : 'unknown',
-       'System-level RKP enable flag. When true, the device supports remote key provisioning for payment systems.'],
-      ['Flash Locked', rv[3] || 'Not set', rv[3] === 'true' || rv[3] === '1' ? 'ok' : 'warn',
-       'Bootloader lock status. Locked flash means the bootloader has not been unlocked, required for verified boot and attestation.'],
+       'cmd key_attestation',
+       'Key Attestation proves keys are hardware-backed. Operational = device generates attestation certs. Command: cmd key_attestation'],
+      ['KeyMint Feature',
+       keymintVer || 'Not reported',
+       keymintVer ? 'ok' : 'warn',
+       'pm list features',
+       'Reports the KeyMint feature version from pm list features. Shows HAL version and API level.'],
+      ['GMS Core (Play Services)',
+       gmsVer,
+       gmsVer !== 'Not installed' ? 'ok' : 'warn',
+       'pm list packages + dumpsys package',
+       'Google Play Services version. Required for SafetyNet/Play Integrity. Checked via package dumpsys.'],
+      ['Play Integrity API',
+       piVer,
+       piVer !== 'Not installed' ? 'ok' : 'warn',
+       'pm list packages com.google.android.gms.integrity',
+       'Play Integrity API replaces SafetyNet. Used by banking/payment apps for device integrity checks.'],
+      ['Samsung Pass',
+       hasSamsungPass ? 'Installed' : 'Not found',
+       hasSamsungPass ? 'ok' : 'unknown',
+       'pm list packages com.samsung.android.samsungpass',
+       'Samsung Pass uses RKP for Samsung Pay. Only relevant on Samsung devices.'],
     ];
-    document.getElementById('rkp-output').innerHTML = renderStatusTable(rows);
+
+    // Add RKP vendor properties - only show ones that have values
+    const rkpProps = [
+      ['ro.vendor.qti.security.rkp.enabled', rv[0], 'Qualcomm RKP vendor flag', 'Qualcomm-specific. When "true", device supports Qualcomm RKP for NFC payment key provisioning.'],
+      ['ro.vendor.security.nfc.rkp.enabled', rv[10], 'NFC RKP vendor flag', 'Generic NFC RKP flag used by some OEMs for SE (Secure Element) provisioning.'],
+      ['persist.vendor.rkp.enabled', rv[11], 'Persistent RKP flag', 'Persistent vendor property. Survives OTA updates. Indicates RKP capability at hardware level.'],
+      ['ro.security.rkp.enabled', rv[12], 'System RKP flag', 'System-level RKP enable. Used by some non-Qualcomm OEMs.'],
+    ];
+    for (const [name, val, desc, tip] of rkpProps) {
+      if (val) {
+        rows.push([name, val === 'true' ? 'Enabled' : val, val === 'true' ? 'ok' : 'unknown', 'getprop ' + name, tip]);
+      }
+    }
+
+    // Hardware properties
+    const hwProps = [
+      ['NFC Hardware', rv[1] || 'Not set', rv[1] ? 'ok' : 'warn', 'getprop ro.hardware.nfc', 'NFC chip identifier. Required for contactless payments.'],
+      ['Keystore Hardware', rv[13] || rv[14] || 'Not set', rv[13] || rv[14] ? 'ok' : 'warn', 'getprop ro.hardware.keystore[2]', 'Keystore HAL identifier. Reports which keystore implementation is active.'],
+      ['StrongBox Hardware', rv[15] || 'Not set', rv[15] ? 'ok' : 'warn', 'getprop ro.hardware.strongbox', 'StrongBox separate secure element. Dedicated hardware TEE for key operations.'],
+    ];
+    for (const [name, val, status, source, tip] of hwProps) {
+      rows.push([name, val, status, source, tip]);
+    }
+
+    // Boot security
+    rows.push(['Flash Locked', rv[3] || 'Not set', rv[3] === 'true' || rv[3] === '1' ? 'ok' : (rv[3] ? 'warn' : 'unknown'), 'getprop ro.boot.flash.locked', 'Bootloader lock. "true" = locked (required for verified boot).']);
+    rows.push(['Verified Boot State', rv[4] || 'Not set', rv[4] === 'green' ? 'ok' : (rv[4] === 'orange' ? 'warn' : 'unknown'), 'getprop ro.boot.verifiedbootstate', 'Android Verified Boot state. green=full, orange=partial, red=none.']);
+    rows.push(['VBMeta Verify State', rv[5] || 'Not set', rv[5] === 'green' || rv[5] === 'unverified' ? 'ok' : (rv[5] ? 'warn' : 'unknown'), 'getprop ro.boot.vbmeta.verify_state', 'Verification state of vbmeta partition. green=verified.']);
+    rows.push(['VBMeta Device State', rv[6] || 'Not set', rv[6] === 'locked' ? 'ok' : (rv[6] === 'unlocked' ? 'warn' : 'unknown'), 'getprop ro.boot.vbmeta.device_state', 'Device lock state for vbmeta. locked=not unlocked, unlocked=bootloader unlocked.']);
+    rows.push(['DM-Verity Mode', rv[7] || 'Not set', rv[7] === 'enforce' ? 'ok' : (rv[7] ? 'warn' : 'unknown'), 'getprop ro.boot.veritymode', 'DM-Verity enforcement mode. enforce=active, log=degraded.']);
+    rows.push(['Warranty Bit', rv[8] === '1' ? 'VOID' : (rv[8] ? rv[8] : 'Not set'), rv[8] === '1' ? 'fail' : 'ok', 'getprop ro.boot.warranty_bit', 'Warranty void bit. Set to "1" when bootloader unlocked.']);
+    rows.push(['Warranty Void', rv[9] === '1' ? 'VOID' : (rv[9] ? rv[9] : 'Not set'), rv[9] === '1' ? 'fail' : 'ok', 'getprop ro.warranty.void', 'User-space warranty void indicator. Set by OEM on unlock.']);
+
+    document.getElementById('rkp-output').innerHTML = renderRKPTable(rows);
   } catch (err) {
     document.getElementById('rkp-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
@@ -668,6 +789,23 @@ function renderStatusTable(rows) {
       const sl = status === 'ok' ? 'PASS' : status === 'warn' ? 'WARN' : status === 'fail' ? 'FAIL' : 'N/A';
       const tooltip = tip ? ' title="' + esc(tip) + '"' : '';
       return '<tr><td>' + esc(check) + '</td><td' + tooltip + '>' + esc(value || 'N/A') + '</td><td class="' + sc + '">' + sl + '</td></tr>';
+    }).join('') + '</tbody></table>';
+}
+
+// RKP table: 5 columns with collapsible source/tooltip
+function renderRKPTable(rows) {
+  return '<table class="status-table rkp-table"><thead><tr><th>Check</th><th>Value</th><th>Status</th><th>Source</th></tr></thead><tbody>' +
+    rows.map(([check, value, status, source, tip]) => {
+      const sc = 'status-' + status;
+      const sl = status === 'ok' ? 'PASS' : status === 'warn' ? 'WARN' : status === 'fail' ? 'FAIL' : 'N/A';
+      const tooltip = tip ? ' title="' + esc(tip) + '"' : '';
+      const sourceStr = source ? esc(source) : '-';
+      return '<tr>' +
+        '<td>' + esc(check) + '</td>' +
+        '<td' + tooltip + '>' + esc(value || 'N/A') + '</td>' +
+        '<td class="' + sc + '">' + sl + '</td>' +
+        '<td class="rkp-source"><code>' + sourceStr + '</code></td>' +
+        '</tr>';
     }).join('') + '</tbody></table>';
 }
 
