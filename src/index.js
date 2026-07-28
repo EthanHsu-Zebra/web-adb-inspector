@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.0.5';
+const APP_VERSION = '1.0.6';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -280,6 +280,7 @@ async function fetchPackages() {
     const text = await readDeviceFile(info.adb, tmpPath);
     try { await adbShell(info.adb, 'rm -f ' + tmpPath); } catch(e) {}
     const packages = parseDumpsysPackage(text);
+    document.getElementById('packages-count').textContent = '(' + packages.length + ')';
     if (packages.length > 0) {
       dataCache.packages = packages;
       renderPackages(packages, false, 'dumpsys');
@@ -296,6 +297,7 @@ async function fetchPackages() {
   try {
     const text = await adbShell(info.adb, 'pm list packages -f -u');
     const packages = parsePmListPackagesFallback(text);
+    document.getElementById('packages-count').textContent = '(' + packages.length + ')';
     if (packages.length > 0) {
       dataCache.packages = packages;
       renderPackages(packages, true, 'pm-list');
@@ -336,11 +338,14 @@ function renderPackages(packages, fallback, method) {
     if (p.system_priv) badges += '<span class="pkg-badge priv">priv</span> ';
     else if (p.system) badges += '<span class="pkg-badge sys">sys</span> ';
     const verStr = p.version_name ? ' ' + esc(p.version_name) : '';
-    const hasDetail = p.version_name || (p.requested_permissions && p.requested_permissions.length > 0);
-    return '<div class="pkg-item" onclick="togglePkgDetail(' + realIdx + ')">' +
+    // Always allow expansion if package has any detail-worthy data.
+    // Previously: only expanded if version_name OR permissions present —
+    // but if version_name failed to parse, the user couldn't see permissions.
+    const hasDetail = true;
+    return '<div class="pkg-item" data-pkg-idx="' + realIdx + '" onclick="togglePkgDetail(' + realIdx + ')">' +
       esc(p.name) + ' <span class="pkg-ver">' + verStr + '</span> ' + badges +
-      (hasDetail ? ' <span class="pkg-toggle">[+]</span>' : '') + '</div>' +
-      (hasDetail ? '<div id="pkg-d-' + realIdx + '" class="pkg-detail hidden">' + renderPackageDetail(p) + '</div>' : '');
+      ' <span class="pkg-toggle">[+]</span></div>' +
+      '<div id="pkg-d-' + realIdx + '" class="pkg-detail hidden">' + renderPackageDetail(p) + '</div>';
   }).join('');
 
   document.getElementById('packages-output').innerHTML = html;
@@ -370,8 +375,9 @@ window.togglePkgDetail = function(idx) {
   if (!el) return;
   const isHidden = el.classList.contains('hidden');
   el.classList.toggle('hidden');
-  // Update toggle button in the package row
-  const pkgRow = el.previousElementSibling;
+  // Update toggle button in the package row (find by data-attr, not sibling
+  // — sibling lookup can break if browsers insert text nodes between elements)
+  const pkgRow = document.querySelector('.pkg-item[data-pkg-idx="' + idx + '"]');
   if (pkgRow) {
     const toggle = pkgRow.querySelector('.pkg-toggle');
     if (toggle) toggle.textContent = isHidden ? '[-]' : '[+]';
@@ -475,7 +481,9 @@ function parseDumpsysPackage(text) {
       }
 
       // Check for attribute lines (granted=, flags=, etc.)
-      const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|name|maxTargetSdk|uid|label)\s*=/);
+      // CRITICAL: only match ATTRIBUTE-level keywords that are unambiguous
+      // (NOT 'name' — versionName= would false-positive; NOT 'uid' — userId= would)
+      const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|maxTargetSdk|label)\s*=/);
       if (currentPerm && isPermAttr) {
         const kvPairs = trimmed.match(/(\w+)\s*=\s*([^\s,]+)/g);
         if (kvPairs) {
@@ -502,15 +510,18 @@ function parseDumpsysPackage(text) {
         continue;
       }
 
-      // Check if line looks like it's outside permissions
-      // (new non-indented section or package-level data)
-      const rawIndent = rawLine.match(/^(\s*)/)[1].length;
-      if (rawIndent < 4) {
-        // Likely left the permissions section
+      // Check if line looks like it's outside permissions.
+      // CRITICAL: Android 14 permissions section can end without a clear
+      // indent transition (the indentation varies). Use KNOWN package-level
+      // keys as a section terminator instead of relying on indent depth.
+      const looksLikePackageField = trimmed.match(/^(versionName|versionCode|codePath|base|resourcePath|minSdk|minSdkVersion|targetSdk|targetSdkVersion|userId|uid|package|splitName|splitRevisionCode|primaryCertsRevision|isPrivApp|privateFlags|nativeLibraryDir|primaryCpuAbi|secondaryCpuAbi)\s*=/);
+      if (looksLikePackageField) {
         finalizePerm();
         section = null;
-        // Fall through to package-level parsing
+        // Fall through to package-level parsing below
       } else {
+        // Still inside permissions — could be a bare continuation line we
+        // don't recognize. Skip rather than corrupting currentPerm.
         continue;
       }
     }
@@ -689,145 +700,36 @@ async function fetchAttestation() {
   showLoading('attestation', false);
 }
 
-// --- RKP: Comprehensive checks with source info and tooltips ---
-async function fetchRKP() {
-  const info = connectedDevices.get(activeSerial);
-  if (!info) return;
-  showLoading('rkp', true);
-  try {
-    // Real keystore check
-    let ksOut = '';
-    let kMint = false;
-    try {
-      ksOut = await adbShell(info.adb, 'cmd keystore');
-      kMint = ksOut.toLowerCase().includes('keymint');
-    } catch(e) {}
-
-    // Real attestation check
-    let attestOut = '';
-    let attestOk = false;
-    try {
-      attestOut = await adbShell(info.adb, 'cmd key_attestation');
-      attestOk = !attestOut.toLowerCase().includes('error') && !attestOut.toLowerCase().includes('not found');
-    } catch(e) {}
-
-    // GMS check
-    let gmsVer = 'Not installed';
-    try {
-      const g = await adbShell(info.adb, 'pm list packages com.google.android.gms');
-      if (g.includes('com.google.android.gms')) {
-        gmsVer = await adbShell(info.adb, 'dumpsys package com.google.android.gms | grep versionName');
-        gmsVer = gmsVer.match(/versionName\s*=\s*(.+)/)?.[1] || 'Installed';
-      }
-    } catch(e) {}
-
-    // Play Integrity
-    let piVer = 'Not installed';
-    try {
-      const p = await adbShell(info.adb, 'pm list packages com.google.android.gms.integrity');
-      if (p.includes('com.google.android.gms.integrity')) piVer = 'Installed';
-    } catch(e) {}
-
-    // Broad property scan
-    const props = await Promise.allSettled([
-      safeGetProp(info.adb, 'ro.vendor.qti.security.rkp.enabled'),
-      safeGetProp(info.adb, 'ro.hardware.nfc'),
-      safeGetProp(info.adb, 'ro.rkp.enabled'),
-      safeGetProp(info.adb, 'ro.boot.flash.locked'),
-      safeGetProp(info.adb, 'ro.boot.verifiedbootstate'),
-      safeGetProp(info.adb, 'ro.boot.vbmeta.verify_state'),
-      safeGetProp(info.adb, 'ro.boot.vbmeta.device_state'),
-      safeGetProp(info.adb, 'ro.boot.veritymode'),
-      safeGetProp(info.adb, 'ro.boot.warranty_bit'),
-      safeGetProp(info.adb, 'ro.warranty.void'),
-      safeGetProp(info.adb, 'ro.vendor.security.nfc.rkp.enabled'),
-      safeGetProp(info.adb, 'persist.vendor.rkp.enabled'),
-      safeGetProp(info.adb, 'ro.security.rkp.enabled'),
-      safeGetProp(info.adb, 'ro.hardware.keystore'),
-      safeGetProp(info.adb, 'ro.hardware.keystore2'),
-      safeGetProp(info.adb, 'ro.hardware.strongbox'),
-      safeGetProp(info.adb, 'ro.vendor.qti.hardware.aee.mode'),
-    ]);
-    const rv = props.map(r => r.value || '');
-
-    // Keymint feature version
-    let keymintVer = '';
-    try {
-      const ft = await adbShell(info.adb, 'pm list features');
-      const kmLine = ft.split('\n').find(l => l.includes('android.hardware.security.keymint'));
-      if (kmLine) keymintVer = kmLine.replace(/feature:/, '').trim();
-    } catch(e) {}
-
-    // Build the rows: [Check, Value, Status, Source/Command, Tooltip]
-    const rows = [
-      ['KeyMint Provider',
-       kMint ? 'Active (hardware-backed)' : ksOut.substring(0, 60) || 'Not found',
-       kMint ? 'ok' : 'warn',
-       'cmd keystore',
-       'KeyMint is the Android 12+ key management HAL. Active means hardware-backed keys work. Command: cmd keystore'],
-      ['Key Attestation',
-       attestOk ? 'Operational' : attestOut.substring(0, 60) || 'Not available',
-       attestOk ? 'ok' : 'warn',
-       'cmd key_attestation',
-       'Key Attestation proves keys are hardware-backed. Operational = device generates attestation certs. Command: cmd key_attestation'],
-      ['KeyMint Feature',
-       keymintVer || 'Not reported',
-       keymintVer ? 'ok' : 'warn',
-       'pm list features',
-       'Reports the KeyMint feature version from pm list features. Shows HAL version and API level.'],
-      ['GMS Core (Play Services)',
-       gmsVer,
-       gmsVer !== 'Not installed' ? 'ok' : 'warn',
-       'pm list packages + dumpsys package',
-       'Google Play Services version. Required for SafetyNet/Play Integrity. Checked via package dumpsys.'],
-      ['Play Integrity API',
-       piVer,
-       piVer !== 'Not installed' ? 'ok' : 'warn',
-       'pm list packages com.google.android.gms.integrity',
-       'Play Integrity API replaces SafetyNet. Used by banking/payment apps for device integrity checks.'],
-    ];
-
-    // Add RKP vendor properties - only show ones that have values
-    const rkpProps = [
-      ['ro.vendor.qti.security.rkp.enabled', rv[0], 'Qualcomm RKP vendor flag', 'Qualcomm-specific. When "true", device supports Qualcomm RKP for NFC payment key provisioning.'],
-      ['ro.vendor.security.nfc.rkp.enabled', rv[10], 'NFC RKP vendor flag', 'Generic NFC RKP flag used by some OEMs for SE (Secure Element) provisioning.'],
-      ['persist.vendor.rkp.enabled', rv[11], 'Persistent RKP flag', 'Persistent vendor property. Survives OTA updates. Indicates RKP capability at hardware level.'],
-      ['ro.security.rkp.enabled', rv[12], 'System RKP flag', 'System-level RKP enable. Used by some non-Qualcomm OEMs.'],
-    ];
-    for (const [name, val, desc, tip] of rkpProps) {
-      if (val) {
-        rows.push([name, val === 'true' ? 'Enabled' : val, val === 'true' ? 'ok' : 'unknown', 'getprop ' + name, tip]);
-      }
-    }
-
-    // Hardware properties
-    const hwProps = [
-      ['NFC Hardware', rv[1] || 'Not set', rv[1] ? 'ok' : 'warn', 'getprop ro.hardware.nfc', 'NFC chip identifier. Required for contactless payments.'],
-      ['Keystore Hardware', rv[13] || rv[14] || 'Not set', rv[13] || rv[14] ? 'ok' : 'warn', 'getprop ro.hardware.keystore[2]', 'Keystore HAL identifier. Reports which keystore implementation is active.'],
-      ['StrongBox Hardware', rv[15] || 'Not set', rv[15] ? 'ok' : 'warn', 'getprop ro.hardware.strongbox', 'StrongBox separate secure element. Dedicated hardware TEE for key operations.'],
-    ];
-    for (const [name, val, status, source, tip] of hwProps) {
-      rows.push([name, val, status, source, tip]);
-    }
-
-    // Boot security
-    rows.push(['Flash Locked', rv[3] || 'Not set', rv[3] === 'true' || rv[3] === '1' ? 'ok' : (rv[3] ? 'warn' : 'unknown'), 'getprop ro.boot.flash.locked', 'Bootloader lock. "true" = locked (required for verified boot).']);
-    rows.push(['Verified Boot State', rv[4] || 'Not set', rv[4] === 'green' ? 'ok' : (rv[4] === 'orange' ? 'warn' : 'unknown'), 'getprop ro.boot.verifiedbootstate', 'Android Verified Boot state. green=full, orange=partial, red=none.']);
-    rows.push(['VBMeta Verify State', rv[5] || 'Not set', rv[5] === 'green' || rv[5] === 'unverified' ? 'ok' : (rv[5] ? 'warn' : 'unknown'), 'getprop ro.boot.vbmeta.verify_state', 'Verification state of vbmeta partition. green=verified.']);
-    rows.push(['VBMeta Device State', rv[6] || 'Not set', rv[6] === 'locked' ? 'ok' : (rv[6] === 'unlocked' ? 'warn' : 'unknown'), 'getprop ro.boot.vbmeta.device_state', 'Device lock state for vbmeta. locked=not unlocked, unlocked=bootloader unlocked.']);
-    rows.push(['DM-Verity Mode', rv[7] || 'Not set', rv[7] === 'enforce' ? 'ok' : (rv[7] ? 'warn' : 'unknown'), 'getprop ro.boot.veritymode', 'DM-Verity enforcement mode. enforce=active, log=degraded.']);
-    rows.push(['Warranty Bit', rv[8] === '1' ? 'VOID' : (rv[8] ? rv[8] : 'Not set'), rv[8] === '1' ? 'fail' : 'ok', 'getprop ro.boot.warranty_bit', 'Warranty void bit. Set to "1" when bootloader unlocked.']);
-    rows.push(['Warranty Void', rv[9] === '1' ? 'VOID' : (rv[9] ? rv[9] : 'Not set'), rv[9] === '1' ? 'fail' : 'ok', 'getprop ro.warranty.void', 'User-space warranty void indicator. Set by OEM on unlock.']);
-
-    document.getElementById('rkp-output').innerHTML = renderRKPTable(rows);
-  } catch (err) {
-    document.getElementById('rkp-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
-  }
-  showLoading('rkp', false);
-}
 
 async function safeGetProp(adb, prop) {
   try { return (await adb.getProp(prop)).trim(); } catch(e) { return ''; }
+}
+
+// Android 15 generic HAL detection via service list (not vendor ro.hardware.* props).
+// Returns true if the HAL service is registered, false otherwise.
+async function checkHalService(adb, halName) {
+  try {
+    const out = await adbShell(adb, 'service list | grep -F ' + halName);
+    return out.trim().length > 0;
+  } catch(e) { return false; }
+}
+
+// RKP: test actual Google server reachability from the device.
+// play.googleapis.com is the Play Integrity / attestation endpoint.
+async function checkGoogleConnectivity(adb) {
+  try {
+    const out = await adbShell(adb,
+      'ping -c 1 -W 2 play.googleapis.com 2>&1; echo "PING_EXIT:$?"');
+    const exitMatch = out.match(/PING_EXIT:(\d+)/);
+    const exitCode = exitMatch ? exitMatch[1] : '1';
+    // PASS: 0 received OR >=1 bytes from
+    const received = out.match(/(\d+)\s+received/);
+    const ok = exitCode === '0' && (!received || parseInt(received[1], 10) > 0)
+      && /bytes from/.test(out);
+    return { ok, exitCode, raw: out.trim().split('\n').slice(0, 3).join(' | ') };
+  } catch(e) {
+    return { ok: false, exitCode: 'ERR', raw: String(e.message || e) };
+  }
 }
 
 function renderStatusTable(rows) {
@@ -960,3 +862,156 @@ window.changeFontSize = changeFontSize;
 window.renderProperties = renderProperties;
 window.renderFeatures = renderFeatures;
 window.renderPackages = renderPackages;
+
+// --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
+async function fetchRKP() {
+  const info = connectedDevices.get(activeSerial);
+  if (!info) return;
+  showLoading('rkp', true);
+  try {
+    // 1) Google server connectivity (replaces vendor ro.hardware.* / ro.vendor.* checks)
+    const ping = await checkGoogleConnectivity(info.adb);
+
+    // 2) KeyMint / attestation (real HAL commands)
+    let kMint = false, ksOut = '';
+    try {
+      ksOut = await adbShell(info.adb, 'cmd keystore');
+      kMint = ksOut.toLowerCase().includes('keymint');
+    } catch(e) {}
+
+    let attestOk = false, attestOut = '';
+    try {
+      attestOut = await adbShell(info.adb, 'cmd key_attestation');
+      const low = attestOut.toLowerCase();
+      attestOk = low.includes('attestation') && !low.includes('not found') && !low.startsWith('error');
+    } catch(e) {}
+
+    let keymintVer = '';
+    try {
+      const ft = await adbShell(info.adb, 'pm list features');
+      const kmLine = ft.split('\n').find(l => l.includes('android.hardware.security.keymint'));
+      if (kmLine) keymintVer = kmLine.replace(/^feature:/, '').trim();
+    } catch(e) {}
+
+    // 3) GMS Core + Play Integrity
+    let gmsVer = 'Not installed';
+    try {
+      const g = await adbShell(info.adb, 'pm list packages com.google.android.gms');
+      if (g.includes('com.google.android.gms')) {
+        const v = await adbShell(info.adb, 'dumpsys package com.google.android.gms | grep -m1 versionName');
+        gmsVer = v.match(/versionName\s*=\s*(.+)/)?.[1]?.trim() || 'Installed';
+      }
+    } catch(e) {}
+
+    let piInstalled = false;
+    try {
+      const p = await adbShell(info.adb, 'pm list packages com.google.android.gms.integrity');
+      piInstalled = p.includes('com.google.android.gms.integrity');
+    } catch(e) {}
+
+    // 4) Android 15 generic HAL detection via service list (NOT ro.hardware.*)
+    const [nfcHal, keystoreHal, strongboxHal, keymintHal, biometricFaceHal, biometricFpHal] = await Promise.all([
+      checkHalService(info.adb, 'android.hardware.nfc'),
+      checkHalService(info.adb, 'android.hardware.security.keystore'),
+      checkHalService(info.adb, 'android.hardware.security.strongbox'),
+      checkHalService(info.adb, 'android.hardware.security.keymint'),
+      checkHalService(info.adb, 'android.hardware.biometrics.face'),
+      checkHalService(info.adb, 'android.hardware.biometrics.fingerprint'),
+    ]);
+
+    // 5) Boot security (standard AOSP props — work on ALL Android 12+ devices)
+    const props = await Promise.allSettled([
+      safeGetProp(info.adb, 'ro.boot.flash.locked'),
+      safeGetProp(info.adb, 'ro.boot.verifiedbootstate'),
+      safeGetProp(info.adb, 'ro.boot.vbmeta.verify_state'),
+      safeGetProp(info.adb, 'ro.boot.vbmeta.device_state'),
+      safeGetProp(info.adb, 'ro.boot.veritymode'),
+      safeGetProp(info.adb, 'ro.boot.warranty_bit'),
+      safeGetProp(info.adb, 'ro.warranty.void'),
+    ]);
+    const [flashLocked, vbState, vbVerify, vbDevice, verity, wBit, wVoid] = props.map(r => r.value || '');
+
+    // Build rows: [Check, Value, Status, Source, Tooltip]
+    const rows = [];
+
+    // Connectivity
+    rows.push([
+      'Google Connectivity',
+      ping.ok ? 'Reachable (play.googleapis.com)' : 'Unreachable',
+      ping.ok ? 'ok' : 'fail',
+      'ping -c 1 -W 2 play.googleapis.com',
+      'Tests actual Google server reachability from the device. play.googleapis.com is the Play Integrity / attestation endpoint. RKP attestation flow requires this network path.'
+    ]);
+
+    // KeyMint
+    rows.push(['KeyMint Provider', kMint ? 'Active' : (ksOut.substring(0, 60) || 'Not found'),
+      kMint ? 'ok' : 'warn', 'cmd keystore',
+      'KeyMint is the Android 12+ key management HAL. Active = hardware-backed keys work.']);
+    rows.push(['Key Attestation', attestOk ? 'Operational' : (attestOut.substring(0, 60) || 'Not available'),
+      attestOk ? 'ok' : 'warn', 'cmd key_attestation',
+      'Proves keys are hardware-backed. Operational = device generates attestation certs.']);
+    rows.push(['KeyMint Feature', keymintVer || 'Not reported',
+      keymintVer ? 'ok' : 'warn', 'pm list features | grep keymint',
+      'HAL version from pm list features.']);
+    rows.push(['GMS Core', gmsVer, gmsVer !== 'Not installed' ? 'ok' : 'warn',
+      'pm list packages + dumpsys package com.google.android.gms',
+      'Google Play Services version. Required for Play Integrity API.']);
+    rows.push(['Play Integrity API', piInstalled ? 'Installed' : 'Not installed',
+      piInstalled ? 'ok' : 'warn',
+      'pm list packages com.google.android.gms.integrity',
+      'Play Integrity API replaces SafetyNet. Used by banking/payment apps.']);
+
+    // Hardware (Android 15 generic via service list, NOT ro.hardware.*)
+    rows.push(['NFC HAL', nfcHal ? 'Registered' : 'Not registered',
+      nfcHal ? 'ok' : 'warn', 'service list | grep android.hardware.nfc',
+      'NFC controller HAL. Detected via Android 15 HAL service list (vendor-independent).']);
+    rows.push(['Keystore HAL', keystoreHal ? 'Registered' : 'Not registered',
+      keystoreHal ? 'ok' : 'warn', 'service list | grep android.hardware.security.keystore',
+      'Keystore HAL service. Generic detection across all OEMs.']);
+    rows.push(['StrongBox HAL', strongboxHal ? 'Registered' : 'Not registered',
+      strongboxHal ? 'ok' : 'warn', 'service list | grep android.hardware.security.strongbox',
+      'StrongBox dedicated secure element HAL. Generic detection.']);
+    rows.push(['KeyMint HAL', keymintHal ? 'Registered' : 'Not registered',
+      keymintHal ? 'ok' : 'warn', 'service list | grep android.hardware.security.keymint',
+      'KeyMint HAL service registration (Android 12+ hardware-backed keys).']);
+    rows.push(['Face Biometric HAL', biometricFaceHal ? 'Registered' : 'Not registered',
+      biometricFaceHal ? 'ok' : 'unknown', 'service list | grep android.hardware.biometrics.face',
+      'Face biometric HAL. Vendor-neutral detection.']);
+    rows.push(['Fingerprint HAL', biometricFpHal ? 'Registered' : 'Not registered',
+      biometricFpHal ? 'ok' : 'unknown', 'service list | grep android.hardware.biometrics.fingerprint',
+      'Fingerprint biometric HAL. Vendor-neutral detection.']);
+
+    // Boot security (standard AOSP props)
+    rows.push(['Flash Locked', flashLocked || 'Not set',
+      flashLocked === 'true' || flashLocked === '1' ? 'ok' : (flashLocked ? 'warn' : 'unknown'),
+      'getprop ro.boot.flash.locked',
+      'Bootloader lock. true/1 = locked (required for verified boot).']);
+    rows.push(['Verified Boot State', vbState || 'Not set',
+      vbState === 'green' ? 'ok' : (vbState === 'orange' || vbState === 'yellow' ? 'warn' : (vbState === 'red' ? 'fail' : 'unknown')),
+      'getprop ro.boot.verifiedbootstate',
+      'AVB state. green=full, orange/yellow=partial, red=none.']);
+    rows.push(['VBMeta Verify', vbVerify || 'Not set',
+      vbVerify === 'green' ? 'ok' : (vbVerify === 'unverified' ? 'warn' : 'unknown'),
+      'getprop ro.boot.vbmeta.verify_state',
+      'VBMeta partition verify state. green=verified, unverified=warning.']);
+    rows.push(['VBMeta Device State', vbDevice || 'Not set',
+      vbDevice === 'locked' ? 'ok' : (vbDevice === 'unlocked' ? 'fail' : 'unknown'),
+      'getprop ro.boot.vbmeta.device_state',
+      'Device lock state. locked=not unlocked, unlocked=bootloader unlocked.']);
+    rows.push(['DM-Verity Mode', verity || 'Not set',
+      verity === 'enforce' ? 'ok' : (verity === 'logging' || verity === 'log' ? 'warn' : 'unknown'),
+      'getprop ro.boot.veritymode',
+      'DM-Verity mode. enforce=active protection, logging=degraded.']);
+    rows.push(['Warranty Bit (boot)', wBit === '1' ? 'VOID' : (wBit || 'Not set'),
+      wBit === '1' ? 'fail' : 'ok', 'getprop ro.boot.warranty_bit',
+      'Bootloader warranty void bit. 1=bootloader unlocked, void warranty.']);
+    rows.push(['Warranty Void (user)', wVoid === '1' ? 'VOID' : (wVoid || 'Not set'),
+      wVoid === '1' ? 'fail' : 'ok', 'getprop ro.warranty.void',
+      'User-space warranty void indicator set by OEM on unlock.']);
+
+    document.getElementById('rkp-output').innerHTML = renderRKPTable(rows);
+  } catch (err) {
+    document.getElementById('rkp-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
+  }
+  showLoading('rkp', false);
+}

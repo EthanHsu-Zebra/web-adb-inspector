@@ -11,7 +11,7 @@ Browser-based Android device inspector using WebUSB. Connect your Android device
 - **Package Manager Features** — all hardware/software features with SDK classification
 - **Installed Packages** — full dumpsys package data: version, SDK, UID, certs, permissions (with grant status)
 - **Key Attestation** — Verified Boot, VBMeta, DM-Verity, Flash Lock, KeyMint, StrongBox
-- **RKP Status** — KeyMint provider, attestation, GMS, Play Integrity, vendor RKP flags (with hover tooltips)
+- **RKP Status** — Google server connectivity (`ping play.googleapis.com`), KeyMint provider, attestation, GMS, Play Integrity, Android 15 HAL-based hardware detection (NFC / Keystore / StrongBox / KeyMint / Biometrics via `service list`), standard AOSP boot security properties (with hover tooltips)
 - **ADB Shell** — custom commands with quick-access buttons
 - **JSON Export** — matches CTS `DeviceInfo.deviceinfo.json` schema exactly
 - **Device Nicknames** — persistent nicknames for your devices
@@ -44,8 +44,16 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 - `@yume-chan/adb` — ADB protocol over WebUSB transport
 - `@yume-chan/adb-daemon-webusb` — WebUSB device manager
-- esbuild — single-file bundle (~97 KB)
+- esbuild — single-file bundle (~104 KB)
 
 ## Version
 
-**Current:** 1.0.0
+**Current:** 1.0.6
+
+### Changelog
+
+- **1.0.6** — RKP rewritten for Android 15: Google server connectivity (`ping play.googleapis.com`), HAL-based hardware detection via `service list` (no more vendor `ro.hardware.*`), standard AOSP boot security props. Package parser: fixed `version_name` parsing on Android 14 multi-KV lines. Package toggle: fixed `togglePkgDetail` selector. Header: version display.
+- **1.0.5** — Parser fixes (trimmed not line), Shell tab, footer removal
+- **1.0.4** — Search/dataCache expose, dumpsys parser fixes, EDI schema fields, cert colon format
+- **1.0.3** — Multi-KV parser, version in header, prop column auto-width, RKP Operational
+- **1.0.2** — Packages spinner fix, wider prop column, version from bundle
