@@ -24,14 +24,22 @@ const SDK_PREFIXES = ['android.hardware.', 'android.software.', 'android.feature
 function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
 
 // --- Init ---
-document.addEventListener('DOMContentLoaded', () => {
+// Module scripts are deferred — they execute AFTER DOMContentLoaded fires.
+// Wrapping init in DOMContentLoaded would mean it never runs.
+// Use IIFE that runs immediately + a fallback for non-deferred contexts.
+(function init() {
+  // DOM should already be ready since module scripts defer until after parsing
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+    return;
+  }
   checkWebUSB();
   credentialStore.iterateKeys().catch(() => credentialStore.generateKey());
   applyFontSize();
   // Show version in header
   const verEl = document.getElementById('header-version');
   if (verEl) verEl.textContent = 'v' + APP_VERSION;
-});
+})();
 
 function checkWebUSB() {
   const b = document.getElementById('webusb-status');
