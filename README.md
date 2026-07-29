@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.6
+**Current:** 1.1.7
 
 ### Changelog
+
+- **1.1.7** — Attestation Probe: rewrote `BootActivity.onCreate` to touch the output file as its very first action, before any helper calls. With v1.1.6 the file never appeared on device even though `am start` returned `Status: ok`, which means BootActivity's onCreate either never ran or threw before any code could execute. The 0-byte touch from onCreate is the most reliable signal that the activity was actually instantiated and reached user code — if the touch succeeds but the full JSON doesn't, we know Probe.run threw partway. Probe.run's internal touch was removed to avoid confusion (it ran from within the same activity and could mask whether onCreate itself fired). Bumped APP_VERSION 1.1.6 → 1.1.7.
 
 - **1.1.6** — Attestation Probe: added an inline debug console below the Run button. Per-step timestamps for fetch, push, pm install, pm path, am start, plus immediate `ls -la` and `stat` of the output file after launch. Buttons for fetching device logcat (filtered to WebAdbProbe/WebAdbBoot/AndroidRuntime) and copying the entire debug log to clipboard. BootActivity now logs entry/exit and any exception via `Log.i / Log.e` (tags `WebAdbBoot` and `WebAdbProbe`) so we can see on logcat whether the activity actually ran and whether Probe.run threw. Bumped APP_VERSION 1.1.5 → 1.1.6.
 

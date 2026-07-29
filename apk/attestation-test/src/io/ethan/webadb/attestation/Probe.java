@@ -30,13 +30,10 @@ public final class Probe {
     public static final String OUT_PATH = "/data/local/tmp/webadb_attestation.json";
     private static final String TAG = "WebAdbProbe";
 
-    private Probe() {}
-
     public static void run(Context ctx) {
-        // Touch the output file immediately so the host can detect that
-        // we were invoked (even if a later step throws).
-        try { new FileOutputStream(OUT_PATH).close(); } catch (Throwable ignored) {}
-
+        // Probe helper. Note: BootActivity.onCreate already touches the
+        // output file before calling us, so if you see a 0-byte file
+        // after a run, Probe.run was never called.
         try {
             Map<String, Object> out = new LinkedHashMap<>();
 
