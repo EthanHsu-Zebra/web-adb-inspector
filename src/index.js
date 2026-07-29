@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.16';
+const APP_VERSION = '1.1.17';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -119,13 +119,14 @@ async function connectDevice(usbDevice) {
     // Use global navigator.usb.ondisconnect (reliable across browsers)
     if (!_usbDisconnectHandler) {
       _usbDisconnectHandler = (e) => {
-        const disconnectedDevice = e.device;
-        // Find matching serial in connectedDevices
+        const dev = e.device;
+        // Match by serial — USBDevice object identity changes after disconnect
         for (const [serial, info] of connectedDevices) {
-          if (info.usbDevice === disconnectedDevice || info.usbDevice.serial === disconnectedDevice.serial) {
+          const infoSerial = info.usbDevice?.serial;
+          const devSerial = dev?.serial;
+          if (infoSerial && infoSerial === devSerial) {
             setStatus('Device disconnected: ' + serial, 'warn');
             try { info.transport.close(); } catch(ex) {}
-            try { info.usbDevice.close(); } catch(ex) {}
             connectedDevices.delete(serial);
             if (activeSerial === serial) {
               activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
@@ -200,21 +201,31 @@ function selectDevice(serial) {
     (info._displayName || serial) + (nick ? ' ("' + nick + '")' : '') + ' (' + serial + ')';
   renderDeviceList();
 
-  // Clear all cached outputs for the new device
-  ['shell-output', 'shell-output-androidver', 'shell-output-model', 'shell-output-hardware', 'shell-output-battery', 'shell-output-display', 'shell-output-wifi'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = '';
-  });
+  // Clear shell output
+  const el = document.getElementById('shell-output');
+  if (el) el.textContent = '';
   document.getElementById('search-props').value = '';
   document.getElementById('search-features').value = '';
   document.getElementById('search-packages').value = '';
 
-  // Clear tab-specific outputs
-  const clearIds = ['hwtrust-output', 'rkp-output', 'apk-verify-output', 'apk-verify-debug', 'attestation-output'];
-  clearIds.forEach(id => {
+  // Clear live-tab outputs (these refresh on each switch)
+  ['hwtrust-output', 'rkp-output', 'attestation-output'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = '';
   });
+
+  // Restore persisted probe results if cached (don't clear probe!)
+  const probeCache = dataCache.probeBySerial?.[serial];
+  const probeOut = document.getElementById('apk-verify-output');
+  const probeDebug = document.getElementById('apk-verify-debug');
+  if (probeCache && probeOut) {
+    probeOut.innerHTML = probeCache.output;
+  } else if (probeOut) {
+    probeOut.innerHTML = '';
+  }
+  if (probeDebug) {
+    probeDebug.textContent = dataCache.probeDebugBySerial?.[serial] || '';
+  }
 
   // Reset HW trust count badge
   const countEl = document.getElementById('hwtrust-count');
@@ -988,31 +999,7 @@ async function runShell() {
   catch (err) { output.textContent += 'Error: ' + String(err.message || err) + '\n'; }
   output.scrollTop = output.scrollHeight;
 }
-async function runCmd(cmd) {
-  const info = connectedDevices.get(activeSerial);
-  if (!info) return;
-
-  const cmdOutputs = {
-    'getprop ro.build.version.release': 'shell-output-androidver',
-    'getprop ro.product.model': 'shell-output-model',
-    'getprop ro.hardware': 'shell-output-hardware',
-    'dumpsys battery': 'shell-output-battery',
-    'dumpsys display': 'shell-output-display',
-    'dumpsys wifi': 'shell-output-wifi',
-  };
-
-  const containerId = cmdOutputs[cmd];
-  const el = containerId ? document.getElementById(containerId) : null;
-  if (el) el.textContent = 'Loading...';
-
-  document.getElementById('shell-input').value = cmd;
-  try {
-    const out = await adbShell(info.adb, cmd + ' 2>&1');
-    if (el) el.textContent = out || '(empty output)';
-  } catch (err) {
-    if (el) el.textContent = 'Error: ' + (err.message || err);
-  }
-}
+function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runShell(); }
 
 // --- Export JSON ---
 function exportJSON(type) {
@@ -1116,7 +1103,7 @@ window.scanDevices = scanDevices;
 window.disconnectDevice = disconnectDevice;
 window.switchTab = switchTab;
 window.runShell = runShell;
-window.runCmd = runCmd; // async
+
 window.copyPanel = copyPanel;
 window.showADBReleaseDialog = showADBReleaseDialog;
 window.exportJSON = exportJSON;
@@ -1626,6 +1613,12 @@ async function runAttestationProbe() {
     out.innerHTML = html;
 
     dataCache.attestationProbe = parsed;
+    // Persist probe results per device so they survive device switches
+    if (!dataCache.probeBySerial) dataCache.probeBySerial = {};
+    dataCache.probeBySerial[activeSerial] = { output: out.innerHTML };
+    if (!dataCache.probeDebugBySerial) dataCache.probeDebugBySerial = {};
+    const dbg = document.getElementById('apk-verify-debug');
+    if (dbg) dataCache.probeDebugBySerial[activeSerial] = dbg.textContent;
     setStatus('Attestation probe complete', 'ok');
 
     // Cleanup
@@ -1638,11 +1631,8 @@ async function runAttestationProbe() {
 }
 
 function clearShell() {
-  const ids = ['shell-output', 'shell-output-androidver', 'shell-output-model', 'shell-output-hardware', 'shell-output-battery', 'shell-output-display', 'shell-output-wifi'];
-  for (const id of ids) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = '';
-  }
+  const el = document.getElementById('shell-output');
+  if (el) el.textContent = '';
 }
 
 // --- Debug console helpers ---

@@ -527,33 +527,12 @@
       <div id="tab-shell" class="tab-content">
         <div class="panel">
           <div class="panel-header">
-            <h3>Quick Checks</h3>
-          </div>
-          <div class="quick-btns">
-            <button class="btn btn-sm" onclick="runCmd('getprop ro.build.version.release')">Android Ver</button>
-            <button class="btn btn-sm" onclick="runCmd('getprop ro.product.model')">Model</button>
-            <button class="btn btn-sm" onclick="runCmd('getprop ro.hardware')">Hardware</button>
-            <button class="btn btn-sm" onclick="runCmd('dumpsys battery')">Battery</button>
-            <button class="btn btn-sm" onclick="runCmd('dumpsys display')">Display</button>
-            <button class="btn btn-sm" onclick="runCmd('dumpsys wifi')">WiFi</button>
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:0.5rem;margin-top:0.5rem">
-            <div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--accent);margin-bottom:0.2rem">Android Version</div><div id="shell-output-androidver" class="shell-output" style="min-height:40px;max-height:80px"></div></div>
-            <div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--accent);margin-bottom:0.2rem">Model</div><div id="shell-output-model" class="shell-output" style="min-height:40px;max-height:80px"></div></div>
-            <div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--accent);margin-bottom:0.2rem">Hardware</div><div id="shell-output-hardware" class="shell-output" style="min-height:40px;max-height:80px"></div></div>
-            <div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--accent);margin-bottom:0.2rem">Battery</div><div id="shell-output-battery" class="shell-output" style="min-height:40px;max-height:160px"></div></div>
-            <div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--accent);margin-bottom:0.2rem">Display</div><div id="shell-output-display" class="shell-output" style="min-height:40px;max-height:160px"></div></div>
-            <div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--accent);margin-bottom:0.2rem">WiFi</div><div id="shell-output-wifi" class="shell-output" style="min-height:40px;max-height:160px"></div></div>
-          </div>
-        </div>
-        <div class="panel" style="margin-top:0.75rem">
-          <div class="panel-header">
             <h3>ADB Shell</h3>
           </div>
           <div class="shell-bar">
             <input id="shell-input" type="text" placeholder="adb shell command..." onkeydown="if(event.key==='Enter')runShell()">
             <button class="btn" onclick="runShell()">Run</button>
-            <button class="btn btn-sm" onclick="clearShell()">Clear All</button>
+            <button class="btn btn-sm" onclick="clearShell()">Clear</button>
           </div>
           <div id="shell-output" class="shell-output"></div>
         </div>
