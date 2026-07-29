@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -132,13 +132,11 @@ async function adbShell(adb, cmd) {
 
 // --- ADB Sync: read large files from device ---
 async function readDeviceFile(adb, path) {
-  const stream = adb.syncProtocol.recv(path);
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  const buf = new Uint8Array(chunks.reduce((s, c) => s + c.length, 0));
-  let off = 0;
-  for (const c of chunks) { buf.set(c, off); off += c.length; }
-  return new TextDecoder().decode(buf);
+  // Use shell 'cat' rather than the documented adb.sync() — it works
+  // for any path adb shell can read (/data/local/tmp/, /sdcard/, etc.) and
+  // doesn't need the user to wire up a sync protocol wrapper. Suitable
+  // for small text files (dumpsys output, probe JSON, etc.).
+  return (await adbShell(adb, 'cat ' + path)).trim();
 }
 
 // --- UI ---
@@ -292,12 +290,10 @@ async function fetchPackages() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
   showLoading('packages', true);
-  const tmpPath = '/data/local/tmp/webadb_dumpsys.txt';
   let method = 'fallback';
   try {
-    await adbShell(info.adb, 'dumpsys package > ' + tmpPath + ' 2>&1');
-    const text = await readDeviceFile(info.adb, tmpPath);
-    try { await adbShell(info.adb, 'rm -f ' + tmpPath); } catch(e) {}
+    // Stream dumpsys output directly via shell protocol — no temp file needed.
+    const text = await adbShell(info.adb, 'dumpsys package 2>&1');
     const packages = parseDumpsysPackage(text);
     document.getElementById('packages-count').textContent = '(' + packages.length + ')';
     if (packages.length > 0) {
@@ -1282,7 +1278,7 @@ function copyCSR(slot) {
 // app signing cert, certificate chain).
 const PROBE_PKG = 'io.ethan.webadb.attestation';
 const PROBE_REMOTE_APK = '/data/local/tmp/webadb-attestation-test.apk';
-const PROBE_REMOTE_OUT = '/sdcard/Download/webadb_attestation.json';
+const PROBE_REMOTE_OUT = '/data/local/tmp/webadb_attestation.json';
 const PROBE_BROADCAST = 'io.ethan.webadb.PROBE';
 
 async function runAttestationProbe() {

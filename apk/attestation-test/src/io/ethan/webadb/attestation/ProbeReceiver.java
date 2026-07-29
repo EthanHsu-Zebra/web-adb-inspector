@@ -40,6 +40,7 @@ import java.util.Map;
 public class ProbeReceiver extends BroadcastReceiver {
     private static final String TAG = "WebAdbProbe";
     private static final String OUT_FILE = "webadb_attestation.json";
+    private static final String PROBE_OUT_PATH = "/data/local/tmp/webadb_attestation.json";
 
     @Override
     public void onReceive(Context ctx, Intent intent) {
@@ -142,14 +143,17 @@ public class ProbeReceiver extends BroadcastReceiver {
                 out.put("keystore", ks_out);
             }
 
-            // 6) Write JSON to public Downloads (world-readable on Android < 11,
-            //    scoped storage 11+ but still pullable via adb sync on debuggable).
-            File downloads = Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS);
-            File outFile = new File(downloads, OUT_FILE);
+            // 6) Write JSON to /data/local/tmp/ so the host inspector can
+            //    pull it via adb sync (avoids scoped-storage restrictions
+            //    on /sdcard/Download/ for unprivileged apps on Android 11+).
+            File outFile = new File(PROBE_OUT_PATH);
             try (FileOutputStream fos = new FileOutputStream(outFile)) {
                 fos.write(JsonWriter.toJson(out).getBytes("UTF-8"));
             }
+            // Best-effort chmod 644 so the shell user can read it.
+            try {
+                Runtime.getRuntime().exec("chmod 644 " + PROBE_OUT_PATH).waitFor();
+            } catch (Throwable ignored) {}
             Log.i(TAG, "Wrote " + outFile.getAbsolutePath() + " (" + outFile.length() + " bytes)");
         } catch (Throwable t) {
             Log.e(TAG, "Probe failed", t);

@@ -50,10 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.1
+**Current:** 1.1.2
 
 ### Changelog
 
+- **1.1.2** — Fix Attestation Probe failure: APK was writing its output to `/sdcard/Download/` which is blocked by Android 11+ scoped storage for unprivileged apps; now writes to `/data/local/tmp/webadb_attestation.json` with chmod 644. Fix `readDeviceFile`: was calling `adb.syncProtocol.recv()` which isn't wired up in `@yume-chan/adb`'s `Adb` class (dead code path — packages were silently falling back to the `pm list` fallback that has no version/cert/sha fields). Replaced with `adbShell(info.adb, 'cat ' + path)`. Also simplified `fetchPackages` to dump directly via shell protocol instead of writing a temp file first. Bumped APP_VERSION 1.1.1 → 1.1.2.
 - **1.1.1** — Fix HW Trust / Attestation Probe buttons not firing (new functions weren't registered on `window`, so esbuild minified names made `onclick` handlers resolve to undefined). Fix dumpsys parser: `codePath` was truncated at embedded `==` (e.g. `/data/app/~~abc==/pkg-XYZ` → `/data/app/~~abc=`); requested/declared permissions in `name: attr=value` format weren't captured. Empty fields in Packages export JSON now show `(not parsed)` instead of empty strings. Raw dumpsys text cached as `dataCache.lastDumpsysText` for debugging.
 - **1.1.0** — New HW Trust tab: KeyMint CSR retrieval via `cmd identity get_csr` (default / strongbox / TEE slots) with DER SHA-256 fingerprinting and PEM copy. New Attestation Probe: ships bundled `attestation-test.apk` to device → install → broadcast → pull JSON (Build.*, AndroidKeyStore probe, signing cert, key attestation chain). RKP: removed both `Warranty Bit (boot)` and `Warranty Void (user)` rows (OEM-specific, redundant). Bumped APP_VERSION 1.0.8 → 1.1.0.
 - **1.0.8** — Fix init TypeError that silently killed header-version display
