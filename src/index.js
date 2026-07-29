@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.17';
+const APP_VERSION = '1.1.18';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -117,14 +117,23 @@ async function connectDevice(usbDevice) {
     } catch (_) {}
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
+    // Store USB identifiers at connect time for reliable disconnect matching
+    const usbId = {
+      serial: usbDevice.serial,
+      vendorId: usbDevice.vendorId,
+      productId: usbDevice.productId,
+    };
+
     if (!_usbDisconnectHandler) {
       _usbDisconnectHandler = (e) => {
         const dev = e.device;
-        // Match by serial — USBDevice object identity changes after disconnect
+        // Match by vendorId+productId (always present) or serial (may be null after disconnect)
         for (const [serial, info] of connectedDevices) {
-          const infoSerial = info.usbDevice?.serial;
-          const devSerial = dev?.serial;
-          if (infoSerial && infoSerial === devSerial) {
+          const uid = info._usbId;
+          if (!uid) continue;
+          const match = (uid.vendorId === dev.vendorId && uid.productId === dev.productId)
+            && (uid.serial === dev.serial || !uid.serial || !dev.serial);
+          if (match) {
             setStatus('Device disconnected: ' + serial, 'warn');
             try { info.transport.close(); } catch(ex) {}
             connectedDevices.delete(serial);
@@ -144,7 +153,7 @@ async function connectDevice(usbDevice) {
       navigator.usb.addEventListener('disconnect', _usbDisconnectHandler);
     }
 
-    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName });
+    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adb.serial);
     setStatus('Connected', 'ok');
@@ -192,6 +201,15 @@ function renderDeviceList() {
 }
 
 function selectDevice(serial) {
+  // Save current device shell output before switching
+  if (activeSerial && activeSerial !== serial) {
+    const currentShell = document.getElementById('shell-output');
+    if (currentShell) {
+      if (!dataCache.shellBySerial) dataCache.shellBySerial = {};
+      dataCache.shellBySerial[activeSerial] = currentShell.textContent;
+    }
+  }
+
   const info = connectedDevices.get(serial);
   if (!info) return;
   activeSerial = serial;
@@ -201,9 +219,11 @@ function selectDevice(serial) {
     (info._displayName || serial) + (nick ? ' ("' + nick + '")' : '') + ' (' + serial + ')';
   renderDeviceList();
 
-  // Clear shell output
-  const el = document.getElementById('shell-output');
-  if (el) el.textContent = '';
+  // Restore persisted shell output if cached
+  const shellEl = document.getElementById('shell-output');
+  if (shellEl) {
+    shellEl.textContent = dataCache.shellBySerial?.[serial] || '';
+  }
   document.getElementById('search-props').value = '';
   document.getElementById('search-features').value = '';
   document.getElementById('search-packages').value = '';
