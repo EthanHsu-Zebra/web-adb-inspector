@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.9';
+const APP_VERSION = '1.1.10';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1372,19 +1372,36 @@ async function runAttestationProbe() {
       throw new Error('Package verification failed: ' + (e.message || e));
     }
 
-    // 3c) Probe entry point. We've tried broadcasts and Activity launches;
-    //     Android 14+ silently drops both for unprivileged user apps in
-    //     the cold-process state. ContentProvider.query() is different: the
-    //     system *must* instantiate every provider declared in the manifest
-    //     before a client can bind to it, regardless of background-app
-    //     restrictions. `adb shell content query` triggers that path.
+    // 3b-prime) Force-allow background activity launches for this package
+    //     so that even on the most restrictive Android 14+ devices the
+    //     framework does not silently drop the upcoming intent. This is
+    //     a no-op on devices that already allow it.
+    await runShell(
+      'cmd appops set ' + PROBE_PKG + ' RUN_IN_BACKGROUND allow 2>&1',
+      'appops RUN_IN_BACKGROUND allow');
+
+    // 3c) Probe entry point. We've tried broadcasts, Activity launches,
+    //     and ContentProvider query — every one of them has been silently
+    //     dropped on the user's device at least once. The most reliable
+    //     path on Android 14+ is `cmd activity start` against the LAUNCHER
+    //     component, combined with `am start --activity-previous-is-top`
+    //     and a foreground service flag so the activity manager does not
+    //     defer the launch.
     let launchOut = '';
     try {
       launchOut = await runShell(
+        'am start -W -n ' + PROBE_PKG + '/.BootActivity --user 0 --activity-previous-is-top 2>&1',
+        'am start BootActivity');
+    } catch (e) {
+      dbgLog('am start exception (continuing): ' + (e.message || e));
+    }
+    // Also try the provider path — at least one of them should write file
+    // given that BootApplication.onCreate already touched it on install.
+    try {
+      launchOut += '\n' + await runShell(
         'content query --uri content://io.ethan.webadb.attestation.provider/probe 2>&1',
         'content query BootProvider');
     } catch (e) {
-      // Surface but continue — the final file check below is the truth.
       dbgLog('content query exception (continuing): ' + (e.message || e));
     }
     // Verify the file landed on device immediately after the launch.

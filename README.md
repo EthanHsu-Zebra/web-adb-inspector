@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.9
+**Current:** 1.1.10
 
 ### Changelog
+
+- **1.1.10** — Attestation Probe: added `BootApplication` (Application subclass). `Application.onCreate` is the earliest point at which user-space Java code is guaranteed to run on Android — it's invoked by the framework during process startup, before any Activity / Service / ContentProvider user code, and cannot be silently dropped by background-app restrictions the way Activity launches are. The `BootApplication.onCreate` touches `/data/local/tmp/webadb_attestation.json` and logs to `WebAdbBoot`, so the host can see whether the app process actually instantiated. Manifest now declares `android:name=".BootApplication"`. Site also now force-sets `cmd appops set io.ethan.webadb.attestation RUN_IN_BACKGROUND allow` before triggering, AND fires both `am start BootActivity` and `content query BootProvider` in sequence (one of them must succeed). Bumped APP_VERSION 1.1.9 → 1.1.10.
 
 - **1.1.9** — Attestation Probe: the 0-byte touch moved back into `Probe.run` (was in `BootActivity.onCreate`). Per-step Log.i markers before each probe stage (build / android_id / signing / keystore / write). Write-failure catch rethrows to the outer catch with a Log.e entry, so logcat will surface the actual exception if step 5 fails. Site debug timestamps now show both UTC and Taiwan (UTC+8) times so timestamps in the inline console match `ls -la` on device. Bumped APP_VERSION 1.1.8 → 1.1.9.
 
