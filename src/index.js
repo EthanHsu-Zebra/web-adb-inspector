@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.14';
+const APP_VERSION = '1.1.15';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -112,7 +112,27 @@ async function connectDevice(usbDevice) {
       const brand = await adb.getProp('ro.product.brand');
       displayName = brand + ' ' + model;
     } catch (_) {}
-    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName });
+
+    // Listen for USB disconnect
+    const onDisconnect = () => {
+      const s = adb.serial;
+      setStatus('Device disconnected: ' + s, 'warn');
+      try { transport.close(); } catch(e) {}
+      try { usbDevice.close(); } catch(e) {}
+      connectedDevices.delete(s);
+      if (activeSerial === s) {
+        activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+      }
+      renderDeviceList();
+      if (activeSerial) {
+        selectDevice(activeSerial);
+      } else {
+        document.getElementById('inspector-section').classList.add('hidden');
+      }
+    };
+    usbDevice.addEventListener('disconnect', onDisconnect);
+
+    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName, _onDisconnect: onDisconnect });
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adb.serial);
     setStatus('Connected', 'ok');
@@ -168,10 +188,28 @@ function selectDevice(serial) {
   document.getElementById('selected-device-name').textContent =
     (info._displayName || serial) + (nick ? ' ("' + nick + '")' : '') + ' (' + serial + ')';
   renderDeviceList();
-  document.getElementById('shell-output').textContent = '';
+
+  // Clear all cached outputs for the new device
+  ['shell-output', 'shell-output-androidver', 'shell-output-model', 'shell-output-hardware', 'shell-output-battery', 'shell-output-display', 'shell-output-wifi'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '';
+  });
   document.getElementById('search-props').value = '';
   document.getElementById('search-features').value = '';
   document.getElementById('search-packages').value = '';
+
+  // Clear tab-specific outputs
+  const clearIds = ['hwtrust-output', 'rkp-output', 'apk-verify-output', 'apk-verify-debug', 'attestation-output'];
+  clearIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  });
+
+  // Reset HW trust count badge
+  const countEl = document.getElementById('hwtrust-count');
+  if (countEl) countEl.textContent = '';
+
+  // Fetch all data for the new device
   fetchProperties();
   fetchFeatures();
   fetchPackages();
@@ -182,10 +220,20 @@ function selectDevice(serial) {
 async function disconnectDevice() {
   if (!activeSerial) return;
   const info = connectedDevices.get(activeSerial);
-  if (info) { try { await info.transport.close(); } catch(e) {} try { await info.usbDevice.close(); } catch(e) {} }
+  if (info) {
+    try { info.usbDevice.removeEventListener('disconnect', info._onDisconnect); } catch(e) {}
+    try { await info.transport.close(); } catch(e) {}
+    try { await info.usbDevice.close(); } catch(e) {}
+  }
   connectedDevices.delete(activeSerial);
-  activeSerial = null;
-  document.getElementById('inspector-section').classList.add('hidden');
+  if (connectedDevices.size === 0) {
+    activeSerial = null;
+    document.getElementById('inspector-section').classList.add('hidden');
+  } else {
+    // Switch to first remaining device
+    activeSerial = connectedDevices.keys().next().value;
+    selectDevice(activeSerial);
+  }
   renderDeviceList();
 }
 
@@ -1513,7 +1561,9 @@ async function runAttestationProbe() {
         const v = obj[k];
         const fullKey = prefix ? prefix + '.' + k : k;
         if (v && typeof v === 'object' && !Array.isArray(v)) {
-          html += renderKV(v, fullKey);
+          // Recurse into objects, but skip empty sub-objects
+          const subHtml = renderKV(v, fullKey);
+          if (subHtml) html += subHtml;
         } else if (Array.isArray(v)) {
           html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
             '</span><span>[' + v.length + ' item' + (v.length === 1 ? '' : 's') + ']</span></div>';
@@ -1521,11 +1571,13 @@ async function runAttestationProbe() {
             if (item && typeof item === 'object') {
               html += '<div style="margin-left:1rem;border-left:2px solid var(--border);padding-left:0.5rem">' +
                 renderKV(item, fullKey + '[' + i + ']') + '</div>';
-            } else {
+            } else if (item !== '' && item !== null && item !== undefined) {
               html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' +
                 esc(fullKey + '[' + i + ']') + '</span><span>' + esc(String(item)) + '</span></div>';
             }
           });
+        } else if (v === '' || v === null || v === undefined) {
+          // Skip empty values
         } else {
           const statusColor = v === false ? 'color:var(--red)' : v === true ? 'color:var(--green)' : '';
           html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
@@ -1535,12 +1587,31 @@ async function runAttestationProbe() {
       return html;
     };
 
+    // Custom rendering for hwtrust to show clean status
+    let hwtrustHtml = '';
+    for (const slot of ['default', 'strongbox', 'tee']) {
+      const h = parsed.hwtrust?.[slot];
+      if (h && h.available) {
+        hwtrustHtml += '<div class="pkg-detail-row"><span class="pkg-detail-label">hwtrust.' + esc(slot) + '.status</span><span style="color:var(--green)">CSR obtained</span></div>';
+        hwtrustHtml += '<div class="pkg-detail-row"><span class="pkg-detail-label">hwtrust.' + esc(slot) + '.der_sha256</span><span style="word-break:break-all">' + esc(h.der_sha256) + '</span></div>';
+      } else {
+        hwtrustHtml += '<div class="pkg-detail-row"><span class="pkg-detail-label">hwtrust.' + esc(slot) + '.status</span><span style="color:var(--yellow)">Identity service not available (device does not support cmd identity)</span></div>';
+      }
+    }
+
     let html = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header">' +
       '<h4>Attestation Probe Result (shell-probe)</h4>' +
       '<span style="font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim)">' +
       esc(parsed.build?.fingerprint || '') + '</span>' +
       '</div>';
-    html += renderKV(parsed, '');
+    // Render sections with clean hwtrust output
+    for (const key of ['build', 'android_id', 'verified_boot', 'security_hw', 'keystore', 'keystore_services', 'signing']) {
+      if (parsed[key]) {
+        const subHtml = renderKV({[key]: parsed[key]}, '');
+        if (subHtml) html += subHtml;
+      }
+    }
+    html += hwtrustHtml;
     html += '</div>';
     out.innerHTML = html;
 
