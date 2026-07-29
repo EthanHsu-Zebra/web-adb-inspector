@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.13';
+const APP_VERSION = '1.1.14';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -930,7 +930,31 @@ async function runShell() {
   catch (err) { output.textContent += 'Error: ' + String(err.message || err) + '\n'; }
   output.scrollTop = output.scrollHeight;
 }
-function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runShell(); }
+async function runCmd(cmd) {
+  const info = connectedDevices.get(activeSerial);
+  if (!info) return;
+
+  const cmdOutputs = {
+    'getprop ro.build.version.release': 'shell-output-androidver',
+    'getprop ro.product.model': 'shell-output-model',
+    'getprop ro.hardware': 'shell-output-hardware',
+    'dumpsys battery': 'shell-output-battery',
+    'dumpsys display': 'shell-output-display',
+    'dumpsys wifi': 'shell-output-wifi',
+  };
+
+  const containerId = cmdOutputs[cmd];
+  const el = containerId ? document.getElementById(containerId) : null;
+  if (el) el.textContent = 'Loading...';
+
+  document.getElementById('shell-input').value = cmd;
+  try {
+    const out = await adbShell(info.adb, cmd + ' 2>&1');
+    if (el) el.textContent = out || '(empty output)';
+  } catch (err) {
+    if (el) el.textContent = 'Error: ' + (err.message || err);
+  }
+}
 
 // --- Export JSON ---
 function exportJSON(type) {
@@ -1034,7 +1058,7 @@ window.scanDevices = scanDevices;
 window.disconnectDevice = disconnectDevice;
 window.switchTab = switchTab;
 window.runShell = runShell;
-window.runCmd = runCmd;
+window.runCmd = runCmd; // async
 window.copyPanel = copyPanel;
 window.showADBReleaseDialog = showADBReleaseDialog;
 window.exportJSON = exportJSON;
@@ -1083,12 +1107,14 @@ async function fetchRKP() {
     } catch(e) {}
 
     // 3) GMS Core + Play Integrity
-    let gmsVer = 'Not installed';
+    let gmsVer = '';
     try {
       const g = await adbShell(info.adb, 'pm list packages com.google.android.gms');
       if (g.includes('com.google.android.gms')) {
         const v = await adbShell(info.adb, 'dumpsys package com.google.android.gms | grep -m1 versionName');
         gmsVer = v.match(/versionName\s*=\s*(.+)/)?.[1]?.trim() || 'Installed';
+      } else {
+        gmsVer = '';
       }
     } catch(e) {}
 
@@ -1138,10 +1164,10 @@ async function fetchRKP() {
     rows.push(['Key Attestation', attestOk ? 'Operational' : (attestOut.substring(0, 60) || 'Not available'),
       attestOk ? 'ok' : 'warn', 'cmd key_attestation',
       'Proves keys are hardware-backed. Operational = device generates attestation certs.']);
-    rows.push(['KeyMint Feature', keymintVer || 'Not reported',
+    rows.push(['KeyMint Feature', keymintVer || '',
       keymintVer ? 'ok' : 'warn', 'pm list features | grep keymint',
       'HAL version from pm list features.']);
-    rows.push(['GMS Core', gmsVer, gmsVer !== 'Not installed' ? 'ok' : 'warn',
+    rows.push(['GMS Core', gmsVer, gmsVer !== '' && gmsVer !== 'Not installed' ? 'ok' : 'warn',
       'pm list packages + dumpsys package com.google.android.gms',
       'Google Play Services version. Required for Play Integrity API.']);
     rows.push(['Play Integrity API', piInstalled ? 'Installed' : 'Not installed',
@@ -1170,28 +1196,33 @@ async function fetchRKP() {
       'Fingerprint biometric HAL. Vendor-neutral detection.']);
 
     // Boot security (standard AOSP props)
-    rows.push(['Flash Locked', flashLocked || 'Not set',
+    rows.push(['Flash Locked', flashLocked || '',
       flashLocked === 'true' || flashLocked === '1' ? 'ok' : (flashLocked ? 'warn' : 'unknown'),
       'getprop ro.boot.flash.locked',
       'Bootloader lock. true/1 = locked (required for verified boot).']);
-    rows.push(['Verified Boot State', vbState || 'Not set',
+    rows.push(['Verified Boot State', vbState || '',
       vbState === 'green' ? 'ok' : (vbState === 'orange' || vbState === 'yellow' ? 'warn' : (vbState === 'red' ? 'fail' : 'unknown')),
       'getprop ro.boot.verifiedbootstate',
       'AVB state. green=full, orange/yellow=partial, red=none.']);
-    rows.push(['VBMeta Verify', vbVerify || 'Not set',
+    rows.push(['VBMeta Verify', vbVerify || '',
       vbVerify === 'green' ? 'ok' : (vbVerify === 'unverified' ? 'warn' : 'unknown'),
       'getprop ro.boot.vbmeta.verify_state',
       'VBMeta partition verify state. green=verified, unverified=warning.']);
-    rows.push(['VBMeta Device State', vbDevice || 'Not set',
+    rows.push(['VBMeta Device State', vbDevice || '',
       vbDevice === 'locked' ? 'ok' : (vbDevice === 'unlocked' ? 'fail' : 'unknown'),
       'getprop ro.boot.vbmeta.device_state',
       'Device lock state. locked=not unlocked, unlocked=bootloader unlocked.']);
-    rows.push(['DM-Verity Mode', verity || 'Not set',
+    rows.push(['DM-Verity Mode', verity || '',
       verity === 'enforce' ? 'ok' : (verity === 'logging' || verity === 'log' ? 'warn' : 'unknown'),
       'getprop ro.boot.veritymode',
       'DM-Verity mode. enforce=active protection, logging=degraded.']);
 
-    document.getElementById('rkp-output').innerHTML = renderRKPTable(rows);
+    // Filter out invalid/unset rows — only show rows with real data
+    const validRows = rows.filter(r => {
+      const val = (r[1] || '').toString().trim().toLowerCase();
+      return val !== '' && val !== 'not set' && val !== 'not found' && val !== 'not installed' && val !== 'not reported';
+    });
+    document.getElementById('rkp-output').innerHTML = renderRKPTable(validRows);
   } catch (err) {
     document.getElementById('rkp-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
@@ -1207,22 +1238,32 @@ async function fetchCSR(slot) {
   try {
     let csrText = '';
     try {
-      csrText = await adbShell(info.adb, 'cmd identity get_csr ' + slot);
+      csrText = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
     } catch (e) {
-      out.innerHTML = '<span style="color:#ff5252">' + esc(slot) + ': ' + esc(String(e.message || e)) + '</span>';
+      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:#ff5252">Command failed: ' + esc(String(e.message || e)) + '</div></div>';
+      out.insertAdjacentHTML('beforeend', errHtml);
       showLoading('hwtrust', false);
       return;
     }
     csrText = (csrText || '').trim();
-    if (!csrText) {
-      out.innerHTML = '<span style="color:#ff5252">No CSR returned for slot "' + esc(slot) + '" — KeyMint may be unavailable on this device.</span>';
+
+    // Check for error messages (Identity service not available on many devices)
+    if (!csrText || /can.t find service|error|failed|usage|invalid/i.test(csrText)) {
+      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:var(--yellow)">Identity service not available on this device</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText) + '</div></div>';
+      out.insertAdjacentHTML('beforeend', errHtml);
       showLoading('hwtrust', false);
       return;
     }
 
     // Parse PEM (-----BEGIN CERTIFICATE REQUEST----- ... -----END CERTIFICATE REQUEST-----)
     const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
-    const pem = pemMatch ? pemMatch[0] : csrText;
+    if (!pemMatch) {
+      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:#ff5252">No PEM certificate found in command output</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText.slice(0, 200)) + '</div></div>';
+      out.insertAdjacentHTML('beforeend', errHtml);
+      showLoading('hwtrust', false);
+      return;
+    }
+    const pem = pemMatch[0];
 
     // Derive SHA-256 of the DER bytes (base64-decoded PEM body)
     let derSha256 = '';
@@ -1233,7 +1274,7 @@ async function fetchCSR(slot) {
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       derSha256 = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     } catch (e) {
-      derSha256 = '(unable to compute — PEM malformed)';
+      derSha256 = '(unable to compute — ' + (e.message || e) + ')';
     }
 
     // Cache for export
@@ -1279,15 +1320,7 @@ function copyCSR(slot) {
   });
 }
 
-// --- Attestation Probe: bundled APK → push → install → broadcast → pull ---
-// Ships the site-bundled attestation-test.apk to the device, installs it,
-// fires its probe broadcast, then pulls the resulting JSON back so the user
-// can see what the app context can see (Build.*, AndroidKeyStore probe,
-// app signing cert, certificate chain).
-const PROBE_PKG = 'io.ethan.webadb.attestation';
-const PROBE_REMOTE_APK = '/data/local/tmp/webadb-attestation-test.apk';
-const PROBE_REMOTE_OUT = '/data/local/tmp/webadb_attestation.json';
-const PROBE_BROADCAST = 'io.ethan.webadb.PROBE';
+// --- APK probe removed (v1.1.14) — OEM ROMs block shell-launched app processes ---
 
 async function runAttestationProbe() {
   const info = connectedDevices.get(activeSerial);
@@ -1524,8 +1557,11 @@ async function runAttestationProbe() {
 }
 
 function clearShell() {
-  const el = document.getElementById('shell-output');
-  if (el) el.textContent = '';
+  const ids = ['shell-output', 'shell-output-androidver', 'shell-output-model', 'shell-output-hardware', 'shell-output-battery', 'shell-output-display', 'shell-output-wifi'];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '';
+  }
 }
 
 // --- Debug console helpers ---

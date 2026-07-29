@@ -50,10 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.13
+**Current:** 1.1.14
 
 ### Changelog
 
+- **1.1.14** — Shell tab: per-button independent console outputs (Android Ver, Model, Hardware, Battery, Display, WiFi each has their own output panel — no more mixed output). Added "Clear All" button to clear all panels at once. RKP tab: filter out invalid/unset items (empty, "Not set", "Not found", "Not installed" rows are hidden). HW Trust tab: `fetchCSR` now properly detects `cmd identity` errors ("Can't find service", etc.) and shows clean error message instead of crashing with atob decode error. Removed dead APK probe constants. Bumped APP_VERSION 1.1.13 -> 1.1.14.
 - **1.1.13** — Attestation Probe: removed APK-based flow entirely (OEM ROMs block shell-launched app processes). Replaced with pure shell-only probe: `cmd identity get_csr` (default/strongbox/tee) with proper error handling for devices without Identity service, verified boot state, security hardware properties, KeyStore/KeyMint HAL status, active security services via `service list`. Fixed `atob` decode crash when CSR command returns error text instead of PEM. Added Clear button to Shell tab. Bumped APP_VERSION 1.1.12 -> 1.1.13.
 - **1.1.12** — Attestation Probe shell fallback: enhanced to collect all HW Trust data reachable from adb shell context. New fields: `cmd identity get_csr` for default/strongbox/tee slots (with DER SHA-256 computed client-side via `crypto.subtle`), verified boot state (`ro.boot.verifiedbootstate`, `vbmeta.verify_state`, etc.), security hardware properties (`ro.hardware.keystore`, `ro.hardware.strongbox`, RKP flags), KeyStore/KeyMint HAL status (`cmd keystore`), and active security services (`android.security.keystore`, `android.hardware.keymint` via `service list`). This means even on devices that refuse to instantiate user app processes, the shell fallback still surfaces the device's attestation key identity — no APK launch required. Bumped APP_VERSION 1.1.11 → 1.1.12.
 
