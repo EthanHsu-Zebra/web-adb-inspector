@@ -11,6 +11,8 @@ Browser-based Android device inspector using WebUSB. Connect your Android device
 - **Package Manager Features** — all hardware/software features with SDK classification
 - **Installed Packages** — full dumpsys package data: version, SDK, UID, certs, permissions (with grant status)
 - **Key Attestation** — Verified Boot, VBMeta, DM-Verity, Flash Lock, KeyMint, StrongBox
+- **HW Trust** — KeyMint CSR retrieval (`cmd identity get_csr` for default / strongbox / TEE slots), DER SHA-256 fingerprint, copy PEM, JSON export
+- **APK Signing Verification** — push APK to device, extract cert via `apksigner verify --print-certs`, compare against installed package cert from `dumpsys package` (PASS / FAIL)
 - **RKP Status** — Google server connectivity (`ping play.googleapis.com`), KeyMint provider, attestation, GMS, Play Integrity, Android 15 HAL-based hardware detection (NFC / Keystore / StrongBox / KeyMint / Biometrics via `service list`), standard AOSP boot security properties (with hover tooltips)
 - **ADB Shell** — custom commands with quick-access buttons
 - **JSON Export** — matches CTS `DeviceInfo.deviceinfo.json` schema exactly
@@ -44,14 +46,17 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 - `@yume-chan/adb` — ADB protocol over WebUSB transport
 - `@yume-chan/adb-daemon-webusb` — WebUSB device manager
-- esbuild — single-file bundle (~104 KB)
+- esbuild — single-file bundle (~111 KB)
 
 ## Version
 
-**Current:** 1.0.6
+**Current:** 1.1.0
 
 ### Changelog
 
+- **1.1.0** — New HW Trust tab: KeyMint CSR retrieval via `cmd identity get_csr` (default / strongbox / TEE slots) with DER SHA-256 fingerprinting and PEM copy. New APK Signing Verification: push APK to device, extract cert via `apksigner verify --print-certs`, compare against installed package cert from `dumpsys package`. RKP: removed `Warranty Void (user)` row (`ro.warranty.void`, OEM-specific and redundant with `ro.boot.warranty_bit`).
+- **1.0.8** — Fix init TypeError that silently killed header-version display
+- **1.0.7** — Fix header-version not displaying (module + DOMContentLoaded race)
 - **1.0.6** — RKP rewritten for Android 15: Google server connectivity (`ping play.googleapis.com`), HAL-based hardware detection via `service list` (no more vendor `ro.hardware.*`), standard AOSP boot security props. Package parser: fixed `version_name` parsing on Android 14 multi-KV lines. Package toggle: fixed `togglePkgDetail` selector. Header: version display.
 - **1.0.5** — Parser fixes (trimmed not line), Shell tab, footer removal
 - **1.0.4** — Search/dataCache expose, dumpsys parser fixes, EDI schema fields, cert colon format

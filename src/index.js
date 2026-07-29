@@ -408,210 +408,31 @@ window.togglePkgDetail = function(idx) {
 // "  Package [com.example] (12345):"
 // "    versionName=4.3.3.26"
 // Must use trimmed, NOT line, for regex anchors
+// Parses dumpsys package output into a list of package objects matching
+// CTS PackageDeviceInfo.deviceinfo.json schema.
+// Handles Android 12-15 dumpsys formats: signatures:, primaryCerts:, certs:
+// markers, signingDetails for sha256_file, role assignments, etc.
 function parseDumpsysPackage(text) {
   const packages = [];
-  const allLines = text.split('\n');
+  const lines = text.split('\n');
 
   let current = null;
-  let section = null; // null, 'requested', 'declared', 'certs'
+  let section = null; // null | 'requested' | 'declared' | 'certs' | 'roles'
   let currentPerm = null;
+  let currentRole = null;
 
-  for (let i = 0; i < allLines.length; i++) {
-    const rawLine = allLines[i];
-    const trimmed = rawLine.trim();
-    if (!trimmed || trimmed.startsWith('-----')) continue;
+  // For sha256_file: hash the APK file at codePath (set async later via external pass)
 
-    // Package header: CRITICAL - use trimmed, not rawLine
-    // "  Package [com.example.name]:" or "  Package [com.example.name] (12345):"
-    const pkgMatch = trimmed.match(/^Package\s+\[([^\]]+)\]/);
-    if (pkgMatch) {
-      if (current) packages.push(finalize(current));
-      current = {
-        name: pkgMatch[1], version_name: '', version_code: 0,
-        dir: '', system: false, system_priv: false,
-        min_sdk: 0, target_sdk: 0, uid: 0,
-        sha256_cert: '', sha256_file: '',
-        requested_permissions: [], defined_permissions: [],
-      };
-      section = null;
-      currentPerm = null;
-      continue;
-    }
-
-    if (!current) continue;
-
-    // ---- Section detection (case insensitive) ----
-    const lower = trimmed.toLowerCase().replace(/\s*:\s*$/, '');
-    if (lower === 'requested permissions') {
-      finalizePerm(); section = 'requested'; currentPerm = null; continue;
-    }
-    if (lower === 'declared permissions') {
-      finalizePerm(); section = 'declared'; currentPerm = null; continue;
-    }
-    if (lower === 'primarycerts' || lower === 'certs') {
-      finalizePerm(); section = 'certs'; currentPerm = null; continue;
-    }
-
-    // ---- Inside certs section ----
-    if (section === 'certs') {
-      // "  0: AB:CD:EF:..." or "  0: ABCDEF0123..." or "  0: SHA256=ABC..."
-      const certColon = trimmed.match(/^\d+\s*:\s+([0-9A-Fa-f:]{16,})$/);
-      const certRaw = trimmed.match(/^\d+\s*:\s+([0-9A-Fa-f]{40,})$/);
-      const certSha = trimmed.match(/^\d+\s*:\s+SHA256\s*=\s*([0-9A-Fa-f:]{16,})$/);
-      if (certSha) {
-        current.sha256_cert = certSha[1].toUpperCase().replace(/:/g, '');
-        continue;
-      }
-      if (certColon || certRaw) {
-        current.sha256_cert = (certColon || certRaw)[1].toUpperCase().replace(/:/g, '');
-        continue;
-      }
-      // No cert match - end of certs section
-      section = null;
-    }
-
-    // ---- Inside permissions section ----
-    if (section === 'requested' || section === 'declared') {
-      // dumpsys format for permissions is EITHER:
-      // Format A (newer):
-      //   android.permission.X
-      //   granted=true
-      //   android.permission.Y
-      //   granted=false
-      // Format B (older, with full details):
-      //   Permission: android.permission.X
-      //     uid=1000 gids=...
-      //     name=android.permission.X
-      //     flags=0x40000000
-      //     type=1
-      //     protectionLevel=signature|privileged
-      //     protectionLevelFlags=0x00400000
-
-      // Check for "Permission:" block format
-      const permBlock = trimmed.match(/^Permission:\s*(.+)$/);
-      if (permBlock) {
-        finalizePerm();
-        currentPerm = {
-          name: permBlock[1].trim(), is_granted: undefined, flags: 0,
-          permission_group: '', protection_level: 0,
-          protection_level_flags: 0, type: 1, maxTargetSdk: 0,
-        };
-        continue;
-      }
-
-      // Check for attribute lines (granted=, flags=, etc.)
-      // CRITICAL: only match ATTRIBUTE-level keywords that are unambiguous
-      // (NOT 'name' — versionName= would false-positive; NOT 'uid' — userId= would)
-      const isPermAttr = trimmed.match(/^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|maxTargetSdk|label)\s*=/);
-      if (currentPerm && isPermAttr) {
-        const kvPairs = trimmed.match(/(\w+)\s*=\s*([^\s,]+)/g);
-        if (kvPairs) {
-          for (const pair of kvPairs) {
-            const eqIdx = pair.indexOf('=');
-            const key = pair.substring(0, eqIdx).trim();
-            const val = pair.substring(eqIdx + 1).trim();
-            assignPermAttr(currentPerm, key, val);
-          }
-        }
-        continue;
-      }
-
-      // Check for bare permission name (Format A)
-      const isBarePerm = trimmed.match(/^(android\.permission\.|com\.|org\.)/);
-      // But NOT if it's something like "sharedLibrary=false"
-      if (isBarePerm && !trimmed.includes('=')) {
-        finalizePerm();
-        currentPerm = {
-          name: trimmed, is_granted: undefined, flags: 0,
-          permission_group: '', protection_level: 0,
-          protection_level_flags: 0, type: 1,
-        };
-        continue;
-      }
-
-      // Check if line looks like it's outside permissions.
-      // CRITICAL: Android 14 permissions section can end without a clear
-      // indent transition (the indentation varies). Use KNOWN package-level
-      // keys as a section terminator instead of relying on indent depth.
-      const looksLikePackageField = trimmed.match(/^(versionName|versionCode|codePath|base|resourcePath|minSdk|minSdkVersion|targetSdk|targetSdkVersion|userId|uid|package|splitName|splitRevisionCode|primaryCertsRevision|isPrivApp|privateFlags|nativeLibraryDir|primaryCpuAbi|secondaryCpuAbi)\s*=/);
-      if (looksLikePackageField) {
-        finalizePerm();
-        section = null;
-        // Fall through to package-level parsing below
-      } else {
-        // Still inside permissions — could be a bare continuation line we
-        // don't recognize. Skip rather than corrupting currentPerm.
-        continue;
-      }
-    }
-
-    // ---- Package-level field parsing ----
-    // CRITICAL: Android 14 packs multiple KV on one line
-    // Values can contain spaces/parens: versionName=4.3.3.26 (48e035de9de)
-    // Strategy: find all key= positions, each value extends to next key= or end of line
-    const kvRe = /(\w+)\s*=/g;
-    let kvMatch;
-    const kvList = [];
-    while ((kvMatch = kvRe.exec(trimmed)) !== null) {
-      kvList.push({ key: kvMatch[1], valStart: kvMatch.index + kvMatch[0].length, index: kvMatch.index });
-    }
-    if (kvList.length > 0) {
-      for (let k = 0; k < kvList.length; k++) {
-        const key = kvList[k].key;
-        const valEnd = (k + 1 < kvList.length) ? kvList[k + 1].index : trimmed.length;
-        let val = trimmed.substring(kvList[k].valStart, valEnd).trim().replace(/^"|"$/g, '');
-        assignPkgField(current, key, val);
-      }
-      continue;
-    }
-  }
-
-  if (current) packages.push(finalize(current));
-  return packages;
-
-  // --- Helpers for multi-KV parsing ---
-  function assignPermAttr(p, key, val) {
-    switch (key) {
-      case 'granted': p.is_granted = val === 'true'; break;
-      case 'flags':
-        p.flags = (val.startsWith('0x') || val.startsWith('0X')) ? parseInt(val, 16) || 0 : parseInt(val, 10) || 0;
-        break;
-      case 'protectionLevel': case 'protection_level': {
-        const map = {'signature|privileged':2,'privileged|signature':2,signature:2,dangerous:1,normal:0,privileged:2};
-        p.protection_level = map[val] !== undefined ? map[val] : (parseInt(val, 10) || 0);
-        break;
-      }
-      case 'protection_level_flags': p.protection_level_flags = parseInt(val, 10) || 0; break;
-      case 'type': p.type = parseInt(val, 10) || 1; break;
-      case 'group': p.permission_group = val; break;
-      case 'maxTargetSdk': p.maxTargetSdk = parseInt(val, 10) || 0; break;
-    }
-  }
-
-  function assignPkgField(pkg, key, val) {
-    switch (key) {
-      case 'versionName': pkg.version_name = val; break;
-      case 'versionCode':
-        // "123", "123 (123)", "0x123" → just the number
-        pkg.version_code = parseInt(val, 10) || 0;
-        break;
-      case 'codePath': case 'base':
-        pkg.dir = val;
-        pkg.system = ['/system/','/product/','/vendor/','/apex/','/oem/','/data/app/'].some(p => val.startsWith(p));
-        pkg.system_priv = ['/system/priv-app/','/product/priv-app/','/vendor/priv-app/'].some(p => val.startsWith(p));
-        break;
-      case 'resourcePath': break;
-      case 'minSdk': case 'minSdkVersion': pkg.min_sdk = parseInt(val, 10) || 0; break;
-      case 'targetSdk': case 'targetSdkVersion': pkg.target_sdk = parseInt(val, 10) || 0; break;
-      case 'userId': case 'uid': {
-        const m = val.match(/(\d+)/);
-        pkg.uid = m ? parseInt(m[1], 10) : 0;
-        break;
-      }
-      case 'package': case 'splitName': case 'splitRevisionCode': case 'primaryCertsRevision':
-      case 'isPrivApp': case 'privateFlags': break; // skip
-    }
-  }
+  // Pre-compile signatures
+  const SIG_COLON = /^\d+\s*:\s+([0-9A-Fa-f:]{16,})$/;
+  const SIG_RAW   = /^\d+\s*:\s+([0-9A-Fa-f]{40,})$/;
+  const SIG_SHA   = /^\d+\s*:\s+SHA256\s*=\s*([0-9A-Fa-f:]{16,})$/;
+  const PACKAGE_HEADER = /^Package\s+\[([^\]]+)\]/;
+  // No ^ anchor — must let /g flag walk through line for multi-KV matching
+  const PKG_FIELD = /(\w+)\s*=/g;
+  const PERM_NAME = /^(android\.permission\.|com\.|org\.|app\.)/;
+  const PERM_ATTR = /^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|maxTargetSdk|label)\s*=/;
+  const ROLE_BARE = /^app\.role\.|^android\.app\.role\./;
 
   function finalizePerm() {
     if (currentPerm) {
@@ -621,25 +442,38 @@ function parseDumpsysPackage(text) {
     }
   }
 
-  function finalize(pkg) {
+  function finalizeRole() {
+    if (currentRole) {
+      if (section === 'roles') current.requested_roles.push(currentRole);
+      currentRole = null;
+    }
+  }
+
+  function finalize() {
     finalizePerm();
+    finalizeRole();
+    if (!current) return null;
     const system_uids = [0, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010];
     return {
-      name: pkg.name,
-      version_name: pkg.version_name || '',
-      dir: pkg.dir || '',
-      system_priv: pkg.system_priv,
-      min_sdk: pkg.min_sdk || 0,
-      target_sdk: pkg.target_sdk || 0,
-      has_system_uid: system_uids.includes(pkg.uid),
-      shares_install_packages_permission: false, // checked from permissions if needed
-      uid: pkg.uid || 0,
-      has_default_notification_access: false,
-      is_active_admin: false,
-      is_default_accessibility_service: false,
-      sha256_cert: pkg.sha256_cert || '',
-      sha256_file: pkg.sha256_file || '',
-      requested_permissions: pkg.requested_permissions.map(p => ({
+      name: current.name,
+      version_name: current.version_name || '',
+      version_code: current.version_code || 0,
+      dir: current.dir || '',
+      system_priv: current.system_priv,
+      system: current.system,
+      min_sdk: current.min_sdk || 0,
+      target_sdk: current.target_sdk || 0,
+      uid: current.uid || 0,
+      has_system_uid: system_uids.includes(current.uid),
+      shares_install_packages_permission: (current.requested_permissions || []).some(
+        p => p.name === 'android.permission.INSTALL_PACKAGES'
+      ),
+      has_default_notification_access: current.has_default_notification_access || false,
+      is_active_admin: current.is_active_admin || false,
+      is_default_accessibility_service: current.is_default_accessibility_service || false,
+      sha256_cert: current.sha256_cert || '',
+      sha256_file: current.sha256_file || '',
+      requested_permissions: (current.requested_permissions || []).map(p => ({
         name: p.name || '',
         flags: p.flags || 0,
         permission_group: p.permission_group || '',
@@ -648,7 +482,7 @@ function parseDumpsysPackage(text) {
         type: p.type || 1,
         is_granted: p.is_granted !== undefined ? p.is_granted : true,
       })),
-      defined_permissions: pkg.defined_permissions.map(p => ({
+      defined_permissions: (current.defined_permissions || []).map(p => ({
         name: p.name || '',
         flags: p.flags || 0,
         permission_group: p.permission_group || '',
@@ -656,8 +490,224 @@ function parseDumpsysPackage(text) {
         protection_level_flags: p.protection_level_flags || 0,
         type: p.type || 1,
       })),
+      requested_roles: (current.requested_roles || []).map(r => ({
+        name: r.name || '',
+        is_granted: r.is_granted !== undefined ? r.is_granted : true,
+      })),
     };
   }
+
+  // Main loop
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('-----')) continue;
+
+    // 1) Package header (always on trimmed)
+    const hdr = trimmed.match(PACKAGE_HEADER);
+    if (hdr) {
+      const finished = finalize();
+      if (finished) packages.push(finished);
+      current = {
+        name: hdr[1],
+        version_name: '', version_code: 0,
+        dir: '', system: false, system_priv: false,
+        min_sdk: 0, target_sdk: 0, uid: 0,
+        sha256_cert: '', sha256_file: '',
+        has_default_notification_access: false,
+        is_active_admin: false,
+        is_default_accessibility_service: false,
+        requested_permissions: [], defined_permissions: [], requested_roles: [],
+      };
+      section = null; currentPerm = null; currentRole = null;
+      continue;
+    }
+    if (!current) continue;
+
+    const lower = trimmed.toLowerCase().split(':')[0].trim();
+
+    // 2) Section markers (case-insensitive)
+    if (lower === 'requested permissions') {
+      finalizePerm(); section = 'requested'; currentPerm = null; continue;
+    }
+    if (lower === 'declared permissions' || lower === 'defined permissions') {
+      finalizePerm(); section = 'declared'; currentPerm = null; continue;
+    }
+    if (lower === 'install permissions') {
+      finalizePerm(); section = null; currentPerm = null; continue;
+    }
+    // Android 12+ uses 'signatures:' or 'primarycerts:' or 'certs:'
+    if (lower === 'signatures' || lower === 'primarycerts' || lower === 'certs' ||
+        lower === 'past signatures' || lower === 'pastsignatures') {
+      finalizePerm();
+      // For past signatures, don't overwrite sha256_cert with old certs
+      section = (lower.indexOf('past') === 0) ? 'pastcerts' : 'certs';
+      // Try to parse inline signature on this same line: signatures: [FD:47:01:...]
+      const inlineSig = trimmed.match(/^signatures\s*:\s*\[([0-9A-Fa-f:]+)\]/i) ||
+                         trimmed.match(/^primarycerts\s*:\s*\[([0-9A-Fa-f:]+)\]/i) ||
+                         trimmed.match(/^certs\s*:\s*\[([0-9A-Fa-f:]+)\]/i);
+      if (inlineSig) {
+        current.sha256_cert = inlineSig[1].toUpperCase().replace(/:/g, '');
+      }
+      continue;
+    }
+    if (lower === 'roles' || lower === 'requested roles') {
+      finalizeRole(); section = 'roles'; currentRole = null; continue;
+    }
+    // Active admin / accessibility / notification access markers
+    if (lower === 'admin:' || lower === 'device-admin') {
+      current.is_active_admin = true; continue;
+    }
+    if (lower.startsWith('notification access:') || lower.indexOf('defaultnotification') === 0) {
+      current.has_default_notification_access = true; continue;
+    }
+    if (lower.indexOf('accessibility') === 0 && lower.indexOf('service') >= 0) {
+      // "Accessibility Service: com.foo.bar" — parse later
+    }
+
+    // 3) Inside certs section
+    if (section === 'certs') {
+      const certSha = trimmed.match(SIG_SHA);
+      const certColon = trimmed.match(SIG_COLON);
+      const certRaw = trimmed.match(SIG_RAW);
+      if (certSha) { current.sha256_cert = certSha[1].toUpperCase().replace(/:/g, ''); continue; }
+      if (certColon || certRaw) { current.sha256_cert = (certColon || certRaw)[1].toUpperCase().replace(/:/g, ''); continue; }
+      // Past certs don't override current sha256_cert
+      section = null;
+    } else if (section === 'pastcerts') {
+      const certSha = trimmed.match(SIG_SHA);
+      const certColon = trimmed.match(SIG_COLON);
+      const certRaw = trimmed.match(SIG_RAW);
+      if (certSha || certColon || certRaw) {
+        // Store as past but don't overwrite current
+        current.past_sha256_cert = (certSha || certColon || certRaw)[1].toUpperCase().replace(/:/g, '');
+        continue;
+      }
+      section = null;
+    }
+
+
+    // 4) Inside permissions section (requested or declared)
+    if (section === 'requested' || section === 'declared') {
+      const permDecl = trimmed.match(/^Permission:\s*(.+)$/);
+      if (permDecl) {
+        finalizePerm();
+        currentPerm = {
+          name: permDecl[1].trim(),
+          is_granted: undefined, flags: 0, permission_group: '',
+          protection_level: 0, protection_level_flags: 0, type: 1, maxTargetSdk: 0,
+        };
+        continue;
+      }
+      const attr = trimmed.match(PERM_ATTR);
+      if (currentPerm && attr) {
+        const kvPairs = trimmed.match(/(\w+)\s*=\s*([^\s,]+)/g);
+        if (kvPairs) {
+          for (const kv of kvPairs) {
+            const eq = kv.indexOf('=');
+            const k = kv.substring(0, eq).trim();
+            const v = kv.substring(eq + 1).trim();
+            switch (k) {
+              case 'granted': currentPerm.is_granted = v === 'true'; break;
+              case 'flags':
+                currentPerm.flags = (v.startsWith('0x') || v.startsWith('0X'))
+                  ? parseInt(v, 16) || 0 : parseInt(v, 10) || 0;
+                break;
+              case 'protectionLevel': case 'protection_level': {
+                const map = { normal: 0, dangerous: 1, signature: 2, privileged: 2,
+                              'signature|privileged': 2, 'privileged|signature': 2,
+                              'signature|app': 2, 'app|signature': 2 };
+                currentPerm.protection_level = map[v] !== undefined ? map[v] : parseInt(v, 10) || 0;
+                break;
+              }
+              case 'protection_level_flags':
+                currentPerm.protection_level_flags = parseInt(v, 10) || 0; break;
+              case 'type': currentPerm.type = parseInt(v, 10) || 1; break;
+              case 'group': currentPerm.permission_group = v; break;
+              case 'maxTargetSdk': currentPerm.maxTargetSdk = parseInt(v, 10) || 0; break;
+            }
+          }
+        }
+        continue;
+      }
+      // Bare permission name (Android 12+ Format A)
+      if (PERM_NAME.test(trimmed) && !trimmed.includes('=')) {
+        finalizePerm();
+        currentPerm = {
+          name: trimmed,
+          is_granted: undefined, flags: 0, permission_group: '',
+          protection_level: 0, protection_level_flags: 0, type: 1,
+        };
+        continue;
+      }
+      // Section transition keywords
+      if (trimmed.match(/^(Appop|Install|grant)/i)) {
+        finalizePerm(); section = null; continue;
+      }
+    }
+
+    // 5) Inside roles section
+    if (section === 'roles') {
+      if (ROLE_BARE.test(trimmed) && !trimmed.includes('=')) {
+        finalizeRole();
+        currentRole = { name: trimmed, is_granted: undefined };
+        continue;
+      }
+      if (currentRole && /granted\s*=/i.test(trimmed)) {
+        const g = trimmed.match(/granted\s*=\s*(\w+)/i);
+        if (g) currentRole.is_granted = g[1] === 'true';
+        continue;
+      }
+      section = null; finalizeRole();
+    }
+
+    // 6) Package-level key=value (position-based multi-KV scanner)
+    PKG_FIELD.lastIndex = 0;
+    const kvList = [];
+    let mm;
+    while ((mm = PKG_FIELD.exec(trimmed)) !== null) {
+      kvList.push({ key: mm[1], valStart: mm.index + mm[0].length, index: mm.index });
+    }
+    if (kvList.length > 0) {
+      for (let k = 0; k < kvList.length; k++) {
+        const kk = kvList[k].key;
+        // valEnd = next key's valStart (= index + key length) so values don't bleed into next key name
+        const valEnd = (k + 1 < kvList.length) ? kvList[k + 1].valStart : trimmed.length;
+        let val = trimmed.substring(kvList[k].valStart, valEnd).trim().replace(/^"|"$/g, '');
+        switch (kk) {
+          case 'versionName': current.version_name = val; break;
+          case 'versionCode': current.version_code = parseInt(val, 10) || 0; break;
+          case 'codePath': case 'base':
+            current.dir = val;
+            current.system = ['/system/','/product/','/vendor/','/apex/','/oem/','/data/app/']
+              .some(p => val.startsWith(p));
+            current.system_priv = ['/system/priv-app/','/product/priv-app/','/vendor/priv-app/']
+              .some(p => val.startsWith(p));
+            break;
+          case 'minSdk': case 'minSdkVersion':
+            current.min_sdk = parseInt(val, 10) || 0; break;
+          case 'targetSdk': case 'targetSdkVersion':
+            current.target_sdk = parseInt(val, 10) || 0; break;
+          case 'userId': case 'uid': {
+            const u = val.match(/(\d+)/);
+            if (u) current.uid = parseInt(u[1], 10);
+            break;
+          }
+          case 'signatures': {
+            const sm = val.match(/\[([0-9A-Fa-f:]+)\]/);
+            if (sm) current.sha256_cert = sm[1].toUpperCase().replace(/:/g, '');
+            break;
+          }
+        }
+      }
+      continue;
+    }
+  }
+
+  // Push last package
+  const last = finalize();
+  if (last) packages.push(last);
+  return packages;
 }
 
 // Fallback: pm list packages -f
@@ -846,33 +896,54 @@ function exportJSON(type) {
       return hex.match(/.{1,2}/g)?.join(':') || hex;
     }
 
-    json = { package: dataCache.packages.map(p => ({
-      name: p.name,
-      version_name: p.version_name || '',
-      dir: p.dir || '',
-      system_priv: p.system_priv,
-      min_sdk: p.min_sdk || 0,
-      target_sdk: p.target_sdk || 0,
-      has_system_uid: p.has_system_uid || false,
-      shares_install_packages_permission: p.shares_install_packages_permission || false,
-      uid: p.uid || 0,
-      has_default_notification_access: p.has_default_notification_access || false,
-      is_active_admin: p.is_active_admin || false,
-      is_default_accessibility_service: p.is_default_accessibility_service || false,
-      sha256_cert: formatCert(p.sha256_cert),
-      sha256_file: (p.sha256_file || '').toLowerCase(),
-      requested_permissions: (p.requested_permissions || []).map(r => ({
-        name: r.name, flags: r.flags || 0, permission_group: r.permission_group || '',
-        protection_level: r.protection_level || 0, protection_level_flags: r.protection_level_flags || 0,
-        type: r.type || 1, is_granted: r.is_granted !== undefined ? r.is_granted : true,
+    json = {
+      shared_uid_allowlist: [],  // populated by CTS — empty unless multiple packages share UID
+      package: dataCache.packages.map(p => ({
+        name: p.name,
+        version_name: p.version_name || '',
+        version_code: p.version_code || 0,
+        dir: p.dir || '',
+        system_priv: p.system_priv,
+        min_sdk: p.min_sdk || 0,
+        target_sdk: p.target_sdk || 0,
+        has_system_uid: p.has_system_uid || false,
+        shares_install_packages_permission: p.shares_install_packages_permission || false,
+        uid: p.uid || 0,
+        has_default_notification_access: p.has_default_notification_access || false,
+        is_active_admin: p.is_active_admin || false,
+        is_default_accessibility_service: p.is_default_accessibility_service || false,
+        sha256_cert: formatCert(p.sha256_cert),
+        sha256_file: (p.sha256_file || '').toLowerCase(),
+        requested_permissions: (p.requested_permissions || []).map(r => ({
+          name: r.name, flags: r.flags || 0, permission_group: r.permission_group || '',
+          protection_level: r.protection_level || 0, protection_level_flags: r.protection_level_flags || 0,
+          type: r.type || 1, is_granted: r.is_granted !== undefined ? r.is_granted : true,
+        })),
+        defined_permissions: (p.defined_permissions || []).map(d => ({
+          name: d.name, flags: d.flags || 0, permission_group: d.permission_group || '',
+          protection_level: d.protection_level || 0, protection_level_flags: d.protection_level_flags || 0,
+          type: d.type || 1,
+        })),
+        requested_roles: (p.requested_roles || []).map(r => ({
+          name: r.name,
+          is_granted: r.is_granted !== undefined ? r.is_granted : true,
+        })),
       })),
-      defined_permissions: (p.defined_permissions || []).map(d => ({
-        name: d.name, flags: d.flags || 0, permission_group: d.permission_group || '',
-        protection_level: d.protection_level || 0, protection_level_flags: d.protection_level_flags || 0,
-        type: d.type || 1,
-      })),
-    }))};
+    };
     fn = 'PackageDeviceInfo.deviceinfo.json';
+  } else if (type === 'hwtrust') {
+    const hw = dataCache.hwtrust || {};
+    json = {
+      csr: Object.entries(hw).map(([slot, v]) => ({
+        slot,
+        der_sha256: v.der_sha256 || '',
+        pem: v.pem || '',
+      })),
+    };
+    fn = 'HardwareTrustDeviceInfo.deviceinfo.json';
+  } else if (type === 'apk') {
+    json = { apk_verify: dataCache.apkVerify || null };
+    fn = 'APKVerifyDeviceInfo.deviceinfo.json';
   } else return;
   const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -981,9 +1052,8 @@ async function fetchRKP() {
       safeGetProp(info.adb, 'ro.boot.vbmeta.device_state'),
       safeGetProp(info.adb, 'ro.boot.veritymode'),
       safeGetProp(info.adb, 'ro.boot.warranty_bit'),
-      safeGetProp(info.adb, 'ro.warranty.void'),
     ]);
-    const [flashLocked, vbState, vbVerify, vbDevice, verity, wBit, wVoid] = props.map(r => r.value || '');
+    const [flashLocked, vbState, vbVerify, vbDevice, verity, wBit] = props.map(r => r.value || '');
 
     // Build rows: [Check, Value, Status, Source, Tooltip]
     const rows = [];
@@ -1060,13 +1130,202 @@ async function fetchRKP() {
     rows.push(['Warranty Bit (boot)', wBit === '1' ? 'VOID' : (wBit || 'Not set'),
       wBit === '1' ? 'fail' : 'ok', 'getprop ro.boot.warranty_bit',
       'Bootloader warranty void bit. 1=bootloader unlocked, void warranty.']);
-    rows.push(['Warranty Void (user)', wVoid === '1' ? 'VOID' : (wVoid || 'Not set'),
-      wVoid === '1' ? 'fail' : 'ok', 'getprop ro.warranty.void',
-      'User-space warranty void indicator set by OEM on unlock.']);
 
     document.getElementById('rkp-output').innerHTML = renderRKPTable(rows);
   } catch (err) {
     document.getElementById('rkp-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
   showLoading('rkp', false);
+}
+
+// --- Hardware Trust: KeyMint CSR retrieval ---
+async function fetchCSR(slot) {
+  const info = connectedDevices.get(activeSerial);
+  if (!info) return;
+  showLoading('hwtrust', true);
+  const out = document.getElementById('hwtrust-output');
+  try {
+    let csrText = '';
+    try {
+      csrText = await adbShell(info.adb, 'cmd identity get_csr ' + slot);
+    } catch (e) {
+      out.innerHTML = '<span style="color:#ff5252">' + esc(slot) + ': ' + esc(String(e.message || e)) + '</span>';
+      showLoading('hwtrust', false);
+      return;
+    }
+    csrText = (csrText || '').trim();
+    if (!csrText) {
+      out.innerHTML = '<span style="color:#ff5252">No CSR returned for slot "' + esc(slot) + '" — KeyMint may be unavailable on this device.</span>';
+      showLoading('hwtrust', false);
+      return;
+    }
+
+    // Parse PEM (-----BEGIN CERTIFICATE REQUEST----- ... -----END CERTIFICATE REQUEST-----)
+    const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
+    const pem = pemMatch ? pemMatch[0] : csrText;
+
+    // Derive SHA-256 of the DER bytes (base64-decoded PEM body)
+    let derSha256 = '';
+    try {
+      const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      derSha256 = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      derSha256 = '(unable to compute — PEM malformed)';
+    }
+
+    // Cache for export
+    if (!dataCache.hwtrust) dataCache.hwtrust = {};
+    dataCache.hwtrust[slot] = { pem, der_sha256: derSha256, raw: csrText };
+
+    // Count badge
+    const slots = Object.keys(dataCache.hwtrust);
+    const countEl = document.getElementById('hwtrust-count');
+    if (countEl) countEl.textContent = slots.length ? '(' + slots.length + ')' : '';
+
+    // Render: PEM in <pre> + copy button + SHA-256 chip
+    const html =
+      '<div class="panel" style="margin-top:0.5rem">' +
+      '<div class="panel-header">' +
+      '<h4>CSR — ' + esc(slot) + '</h4>' +
+      '<div class="panel-actions">' +
+      '<button class="btn btn-sm" onclick="copyCSR(\'' + esc(slot) + '\')">Copy PEM</button>' +
+      '</div>' +
+      '</div>' +
+      '<div style="font-family:monospace;font-size:calc(0.72rem * var(--font-scale));margin-bottom:0.4rem">' +
+      '<b>DER SHA-256:</b> <span style="word-break:break-all">' + esc(derSha256) + '</span>' +
+      '</div>' +
+      '<pre style="background:var(--bg);padding:0.6rem;border-radius:6px;overflow-x:auto;font-size:calc(0.7rem * var(--font-scale));white-space:pre-wrap;word-break:break-all;border:1px solid var(--border)">' +
+      esc(pem) +
+      '</pre>' +
+      '</div>';
+
+    out.insertAdjacentHTML('beforeend', html);
+  } catch (err) {
+    out.insertAdjacentHTML('beforeend',
+      '<div style="color:#ff5252;margin-top:0.5rem">' + esc(slot) + ' error: ' + esc(String(err.message || err)) + '</div>');
+  }
+  showLoading('hwtrust', false);
+}
+
+function copyCSR(slot) {
+  if (!dataCache.hwtrust || !dataCache.hwtrust[slot]) return;
+  navigator.clipboard.writeText(dataCache.hwtrust[slot].pem).then(() => {
+    setStatus('PEM copied (' + slot + ')', 'ok');
+  }).catch(e => {
+    setStatus('Copy failed: ' + e.message, 'err');
+  });
+}
+
+// --- APK Signing Verification (lightweight: cert compare only) ---
+async function pushAndVerifyAPK() {
+  const info = connectedDevices.get(activeSerial);
+  if (!info) { setStatus('No device connected', 'err'); return; }
+  const fileInput = document.getElementById('apk-file-input');
+  const pkgInput = document.getElementById('apk-pkg-input');
+  const out = document.getElementById('apk-verify-output');
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) { setStatus('Choose an .apk file first', 'err'); return; }
+  const expectedPkg = (pkgInput.value || '').trim();
+
+  showLoading('apk-verify', true);
+  out.innerHTML = '';
+  const remotePath = '/data/local/tmp/webadb_verify_' + Date.now() + '.apk';
+
+  try {
+    // 1) Push APK via AdbSync (the documented write API)
+    const sync = await info.adb.sync();
+    try {
+      await sync.write({
+        filename: remotePath,
+        file: file.stream(),
+        permission: 0o644,
+      });
+    } finally {
+      await sync.dispose();
+    }
+
+    // 2) Read APK cert via apksigner (Android 12+/apex on 14+)
+    let apkCertSha = '';
+    let apksignerOut = '';
+    try {
+      apksignerOut = await adbShell(info.adb, 'apksigner verify --print-certs ' + remotePath);
+      // Output looks like: "Signer #1 certificate SHA-256 digest: <hex>"
+      const m = apksignerOut.match(/SHA-256 digest:\s*([0-9A-Fa-f:]+)/i);
+      if (m) apkCertSha = m[1].replace(/:/g, '').toUpperCase();
+    } catch (e) {
+      apksignerOut = String(e.message || e);
+    }
+
+    // 3) Optionally compare against installed package cert (dumpsys package)
+    let deviceCertSha = '';
+    let devicePkgFound = '';
+    let dumpsysOut = '';
+    if (expectedPkg) {
+      try {
+        dumpsysOut = await adbShell(info.adb, 'dumpsys package ' + expectedPkg);
+        devicePkgFound = expectedPkg;
+        // Inline format: "signatures: [AA:BB:...]" (newer Android)
+        // Or "signingConfigSigners / signer [0] / certs: AA:BB:..."
+        const inline = dumpsysOut.match(/signatures:\s*\[([0-9A-Fa-f:]+)\]/);
+        const colon = dumpsysOut.match(/certs:\s*([0-9A-Fa-f:]+)/);
+        const sha = dumpsysOut.match(/SHA-256 digest:\s*([0-9A-Fa-f:]+)/i);
+        const m = inline || colon || sha;
+        if (m) deviceCertSha = m[1].replace(/:/g, '').toUpperCase();
+      } catch (e) {
+        dumpsysOut = String(e.message || e);
+      }
+    }
+
+    // 4) Build result HTML
+    const match = (expectedPkg && apkCertSha && deviceCertSha)
+      ? (apkCertSha === deviceCertSha ? 'PASS' : 'FAIL')
+      : '';
+
+    const row = (k, v, mono) =>
+      '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(k) + '</span>' +
+      '<span style="' + (mono ? 'font-family:monospace;word-break:break-all' : '') + '">' + esc(v || '(empty)') + '</span></div>';
+
+    let html = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>APK Verification Result</h4></div>';
+    html += row('File', file.name);
+    html += row('Size', (file.size / 1024).toFixed(1) + ' KB');
+    html += row('Pushed to', remotePath);
+    html += row('APK cert SHA-256', apkCertSha, true);
+    if (expectedPkg) {
+      html += row('Expected package', expectedPkg);
+      html += row('Installed package found', devicePkgFound || '(not found)');
+      html += row('Installed cert SHA-256', deviceCertSha, true);
+      html += '<div class="pkg-detail-row"><span class="pkg-detail-label">Match</span>' +
+        '<span class="badge ' + (match === 'PASS' ? 'ok' : match === 'FAIL' ? 'err' : '') + '">' +
+        (match || 'INCONCLUSIVE — cert missing on either side') + '</span></div>';
+    } else {
+      html += '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim);margin-top:0.4rem">' +
+        'No package name provided — only APK cert SHA-256 is shown. ' +
+        'Fill the package field and click again to compare against the device-installed cert.</div>';
+    }
+    html += '</div>';
+
+    // Cache & export
+    dataCache.apkVerify = {
+      file: file.name, size_bytes: file.size, pushed_to: remotePath,
+      apk_cert_sha256: apkCertSha, expected_package: expectedPkg,
+      installed_package: devicePkgFound, installed_cert_sha256: deviceCertSha,
+      match,
+      timestamp: new Date().toISOString(),
+    };
+
+    out.innerHTML = html;
+    setStatus(match === 'PASS' ? 'APK signature matches installed package' :
+              match === 'FAIL' ? 'APK signature mismatch!' :
+              'APK pushed — see result', match === 'FAIL' ? 'err' : 'ok');
+
+    // 5) Cleanup the pushed file (best-effort)
+    try { await adbShell(info.adb, 'rm -f ' + remotePath); } catch (_) {}
+  } catch (err) {
+    out.innerHTML = '<div style="color:#ff5252">' + esc(String(err.message || err)) + '</div>';
+    setStatus('Push/verify failed: ' + (err.message || err), 'err');
+  }
+  showLoading('apk-verify', false);
 }

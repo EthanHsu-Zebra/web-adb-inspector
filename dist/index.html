@@ -410,6 +410,7 @@
         <div class="tab" onclick="switchTab(this, 'tab-packages')">Packages</div>
         <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
         <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
+        <div class="tab" onclick="switchTab(this, 'tab-hwtrust')">HW Trust</div>
         <div class="tab" onclick="switchTab(this, 'tab-shell')">Shell</div>
       </div>
 
@@ -477,6 +478,39 @@
             <div><span id="rkp-loading" class="loading hidden"></span></div>
           </div>
           <div id="rkp-output"></div>
+        </div>
+      </div>
+
+      <!-- Hardware Trust Tab -->
+      <div id="tab-hwtrust" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Hardware-Backed Key Attestation <span id="hwtrust-count" style="color:var(--accent)"></span></h3>
+            <div class="panel-actions">
+              <span id="hwtrust-loading" class="loading hidden"></span>
+              <button class="btn btn-sm btn-export" onclick="exportJSON('hwtrust')">Export JSON</button>
+            </div>
+          </div>
+          <div style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap">
+            <button class="btn btn-sm" onclick="fetchCSR('default')">Get CSR (default)</button>
+            <button class="btn btn-sm" onclick="fetchCSR('strongbox')">Get CSR (strongbox)</button>
+            <button class="btn btn-sm" onclick="fetchCSR('tee')">Get CSR (TEE)</button>
+          </div>
+          <div id="hwtrust-output"></div>
+
+          <div class="panel-header" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:0.75rem">
+            <h3>APK Signing Verification</h3>
+          </div>
+          <div style="margin-bottom:0.5rem;font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">
+            Push an APK to the device and verify its signing cert matches what's installed (or compare against a package name on the device).
+          </div>
+          <div style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
+            <input type="file" id="apk-file-input" accept=".apk" style="font-size:calc(0.75rem * var(--font-scale))">
+            <input type="text" id="apk-pkg-input" placeholder="expected package name (optional)" class="search-input" style="width:18rem">
+            <button class="btn btn-sm" onclick="pushAndVerifyAPK()">Push & Verify</button>
+            <span id="apk-verify-loading" class="loading hidden"></span>
+          </div>
+          <div id="apk-verify-output"></div>
         </div>
       </div>
 
