@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.22';
+const APP_VERSION = '1.1.23';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -172,6 +172,41 @@ async function connectDevice(usbDevice) {
       const brand = await adb.getProp('ro.product.brand');
       displayName = brand + ' ' + model;
     } catch (_) {}
+
+    // Polling fallback: check ADB responsiveness every 3s
+    // This catches disconnects when browser events (navigator.usb / connection.closed) don't fire
+    const heartbeatKey = 'heartbeat-' + adbSerial;
+    window[heartbeatKey] = setInterval(() => {
+      if (!connectedDevices.has(adbSerial)) {
+        clearInterval(window[heartbeatKey]);
+        delete window[heartbeatKey];
+        return;
+      }
+      (async () => {
+        try {
+          await adb.getProp('ro.build.id');
+        } catch (e) {
+          // ADB operation failed — device likely disconnected
+          clearInterval(window[heartbeatKey]);
+          delete window[heartbeatKey];
+          if (connectedDevices.has(adbSerial)) {
+            console.log('[heartbeat] Device ' + adbSerial + ' lost');
+            try { transport.close(); } catch(ex) {}
+            connectedDevices.delete(adbSerial);
+            if (activeSerial === adbSerial) {
+              activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+            }
+            renderDeviceList();
+            setStatus('Device disconnected: ' + adbSerial, 'warn');
+            if (activeSerial) {
+              selectDevice(activeSerial);
+            } else {
+              document.getElementById('inspector-section').classList.add('hidden');
+            }
+          }
+        }
+      })();
+    }, 3000);
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
     // Store USB identifiers at connect time for reliable disconnect matching

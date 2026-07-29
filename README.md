@@ -50,11 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.22
+**Current:** 1.1.23
 
 ### Changelog
 
-- **1.1.22** — Fix `connection.closed` crash: guard with `typeof connection.closed === 'object'` before calling `.then()` — some browsers return `undefined` causing "Cannot read properties of undefined". Multi-device: scanDevices now checks for already-connected devices (same vendorId+productId+serial) and auto-selects instead of erroring. Disconnect fallback chain: (1) `navigator.usb` disconnect event, (2) `connection.closed` promise, (3) ADB operation "transfer was cancelled" handler. Bumped APP_VERSION 1.1.21 -> 1.1.22.
+- **1.1.23** — Disconnect reliability: added 3s polling heartbeat (`adb.getProp("ro.build.id")`) as last-resort fallback for browsers where both `navigator.usb` disconnect event and `connection.closed` promise silently fail. Multi-device: `+ Connect Device` button can be tapped repeatedly to add more devices — each opens a fresh WebUSB picker. Bumped APP_VERSION 1.1.22 -> 1.1.23.
 - **1.1.19** — USB disconnect detection: added heartbeat ping every 5s as fallback for browsers where `navigator.usb` disconnect event fires but serial/vendorId match fails. Bumped APP_VERSION 1.1.18 -> 1.1.19.
 - **1.1.17** — Probe results now persist per device (dataCache.probeBySerial) — switching away and back restores previous probe output. Shell tab: removed Quick Checks and per-button consoles — back to single ADB Shell with input + Run + Clear. Bumped APP_VERSION 1.1.16 -> 1.1.17.
 - **1.1.14** — Shell tab: per-button independent console outputs (Android Ver, Model, Hardware, Battery, Display, WiFi each has their own output panel — no more mixed output). Added "Clear All" button to clear all panels at once. RKP tab: filter out invalid/unset items (empty, "Not set", "Not found", "Not installed" rows are hidden). HW Trust tab: `fetchCSR` now properly detects `cmd identity` errors ("Can't find service", etc.) and shows clean error message instead of crashing with atob decode error. Removed dead APK probe constants. Bumped APP_VERSION 1.1.13 -> 1.1.14.
