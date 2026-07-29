@@ -50,10 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.12
+**Current:** 1.1.13
 
 ### Changelog
 
+- **1.1.13** — Attestation Probe: removed APK-based flow entirely (OEM ROMs block shell-launched app processes). Replaced with pure shell-only probe: `cmd identity get_csr` (default/strongbox/tee) with proper error handling for devices without Identity service, verified boot state, security hardware properties, KeyStore/KeyMint HAL status, active security services via `service list`. Fixed `atob` decode crash when CSR command returns error text instead of PEM. Added Clear button to Shell tab. Bumped APP_VERSION 1.1.12 -> 1.1.13.
 - **1.1.12** — Attestation Probe shell fallback: enhanced to collect all HW Trust data reachable from adb shell context. New fields: `cmd identity get_csr` for default/strongbox/tee slots (with DER SHA-256 computed client-side via `crypto.subtle`), verified boot state (`ro.boot.verifiedbootstate`, `vbmeta.verify_state`, etc.), security hardware properties (`ro.hardware.keystore`, `ro.hardware.strongbox`, RKP flags), KeyStore/KeyMint HAL status (`cmd keystore`), and active security services (`android.security.keystore`, `android.hardware.keymint` via `service list`). This means even on devices that refuse to instantiate user app processes, the shell fallback still surfaces the device's attestation key identity — no APK launch required. Bumped APP_VERSION 1.1.11 → 1.1.12.
 
 - **1.1.10** — Attestation Probe: added `BootApplication` (Application subclass). `Application.onCreate` is the earliest point at which user-space Java code is guaranteed to run on Android — it's invoked by the framework during process startup, before any Activity / Service / ContentProvider user code, and cannot be silently dropped by background-app restrictions the way Activity launches are. The `BootApplication.onCreate` touches `/data/local/tmp/webadb_attestation.json` and logs to `WebAdbBoot`, so the host can see whether the app process actually instantiated. Manifest now declares `android:name=".BootApplication"`. Site also now force-sets `cmd appops set io.ethan.webadb.attestation RUN_IN_BACKGROUND allow` before triggering, AND fires both `am start BootActivity` and `content query BootProvider` in sequence (one of them must succeed). Bumped APP_VERSION 1.1.9 → 1.1.10.

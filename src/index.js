@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.12';
+const APP_VERSION = '1.1.13';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1046,6 +1046,7 @@ window.renderFeatures = renderFeatures;
 window.renderPackages = renderPackages;
 window.fetchCSR = fetchCSR;
 window.copyCSR = copyCSR;
+window.clearShell = clearShell;
 window.runAttestationProbe = runAttestationProbe;
 window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
@@ -1294,10 +1295,9 @@ async function runAttestationProbe() {
   const out = document.getElementById('apk-verify-output');
   const dbg = document.getElementById('apk-verify-debug');
   showLoading('apk-verify', true);
-  out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Fetching bundled APK…</div>';
+  out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Running shell-based attestation probe...</div>';
   if (dbg) dbg.textContent = '';
 
-  // Per-step debug log so failures are diagnosable from the page itself.
   const dbgLog = (msg) => {
     if (!dbg) return;
     dbg.textContent += (dbg.textContent ? '\n' : '') + '[' +
@@ -1307,317 +1307,173 @@ async function runAttestationProbe() {
   };
   const runShell = async (cmd, label) => {
     dbgLog('> ' + (label || cmd));
-    let out = '';
-    try { out = await adbShell(info.adb, cmd + ' 2>&1'); } catch (e) { dbgLog('  ERROR: ' + (e.message || e)); throw e; }
-    dbgLog('  ' + String(out).replace(/\n/g, '\n  ').trim());
-    return out;
+    try {
+      const result = await adbShell(info.adb, cmd + ' 2>&1');
+      dbgLog('  ' + String(result).replace(/\n/g, '\n  ').trim().slice(0, 300));
+      return result;
+    } catch (e) {
+      dbgLog('  ERROR: ' + (e.message || e));
+      throw e;
+    }
   };
 
   try {
-    // 1) Fetch the bundled APK (served from the same origin as the page).
-    let apkBlob;
-    try {
-      apkBlob = await fetch('attestation-test.apk', { cache: 'no-store' }).then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.blob();
-      });
-      dbgLog('Fetched APK (' + apkBlob.size + ' bytes)');
-    } catch (e) {
-      throw new Error('Could not fetch attestation-test.apk from site: ' + (e.message || e));
+    const getprop = async (k) => {
+      try { return (await adbShell(info.adb, 'getprop ' + k)).trim(); } catch { return ''; }
+    };
+
+    // --- Build info ---
+    dbgLog('Collecting build properties...');
+    const build = {
+      manufacturer: await getprop('ro.product.manufacturer'),
+      model: await getprop('ro.product.model'),
+      brand: await getprop('ro.product.brand'),
+      device: await getprop('ro.product.device'),
+      product: await getprop('ro.product.name'),
+      hardware: await getprop('ro.hardware'),
+      fingerprint: await getprop('ro.build.fingerprint'),
+      release: await getprop('ro.build.version.release'),
+      sdk_int: await getprop('ro.build.version.sdk'),
+      security_patch: await getprop('ro.build.version.security_patch'),
+      bootloader: await getprop('ro.bootloader'),
+    };
+
+    // --- Verified Boot state ---
+    dbgLog('Collecting verified boot state...');
+    const verified_boot = {
+      verifiedbootstate: await getprop('ro.boot.verifiedbootstate'),
+      vbmeta_verify_state: await getprop('ro.boot.vbmeta.verify_state'),
+      vbmeta_device_state: await getprop('ro.boot.vbmeta.device_state'),
+      veritymode: await getprop('ro.boot.veritymode'),
+      flash_locked: await getprop('ro.boot.flash.locked'),
+      warranty_bit: await getprop('ro.boot.warranty_bit'),
+      avb_state: await getprop('ro.boot.vbmeta.avb_state'),
+    };
+
+    // --- Security / Trust hardware ---
+    dbgLog('Collecting security hardware properties...');
+    const security_hw = {
+      keystore: await getprop('ro.hardware.keystore'),
+      keystore2: await getprop('ro.hardware.keystore2'),
+      keymaster: await getprop('ro.hardware.keymaster'),
+      strongbox: await getprop('ro.hardware.strongbox'),
+      rkp_enabled: await getprop('ro.rkp.enabled'),
+      rkp: await getprop('ro.security.rkp'),
+    };
+
+    // --- Android ID ---
+    let android_id = '';
+    try { android_id = (await adbShell(info.adb, 'settings get secure android_id')).trim(); } catch {}
+
+    // --- HW Trust: cmd identity get_csr (shell context, no app needed) ---
+    dbgLog('Collecting HW Trust CSRs (cmd identity get_csr)...');
+    const hwtrust = {};
+    for (const slot of ['default', 'strongbox', 'tee']) {
+      try {
+        const csrOut = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
+        const csrText = (csrOut || '').trim();
+
+        // Check for error messages (Identity service not available on many devices)
+        if (!csrText || /can.t find service|error|failed|usage|invalid/i.test(csrText)) {
+          hwtrust[slot] = {
+            available: false,
+            error: csrText || 'No output',
+            note: 'Identity service not available on this device',
+          };
+          dbgLog('  ' + slot + ': not available - ' + (csrText || 'no output'));
+          continue;
+        }
+
+        // Extract PEM
+        const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
+        if (!pemMatch) {
+          hwtrust[slot] = {
+            available: false,
+            error: 'No PEM certificate found in output',
+            raw: csrText,
+          };
+          dbgLog('  ' + slot + ': no PEM in output');
+          continue;
+        }
+
+        const pem = pemMatch[0];
+        let der_sha256 = '';
+        try {
+          const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
+          der_sha256 = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        } catch (e) {
+          der_sha256 = '(unable to compute - ' + (e.message || e) + ')';
+        }
+        hwtrust[slot] = { available: true, pem, der_sha256, raw_length: csrText.length };
+        dbgLog('  ' + slot + ': CSR obtained, DER SHA-256: ' + der_sha256.slice(0, 16) + '...');
+      } catch (e) {
+        hwtrust[slot] = { available: false, error: String(e.message || e) };
+        dbgLog('  ' + slot + ': error: ' + (e.message || e));
+      }
     }
 
-    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Pushing APK…</div>';
+    // --- KeyStore/KeyMint HAL check ---
+    dbgLog('Checking KeyStore/KeyMint HAL...');
+    let keystore = {};
+    try {
+      const ksOut = await adbShell(info.adb, 'cmd keystore 2>&1 | head -c 2048');
+      keystore = { available: !!ksOut.trim(), raw: ksOut.trim().slice(0, 500) };
+    } catch (e) {
+      keystore = { available: false, error: String(e.message || e) };
+    }
 
-    // 2) Push to /data/local/tmp/ via AdbSync
-    dbgLog('Opening sync channel...');
+    // --- Keystore services ---
+    const keystore_services = {};
+    try {
+      const svcOut = await adbShell(info.adb, 'service list 2>/dev/null');
+      for (const svc of ['android.security.keystore', 'android.hardware.keymaster', 'android.hardware.security.keymint']) {
+        keystore_services[svc] = svcOut.includes(svc);
+      }
+    } catch {}
+
+    // --- Signing cert (sample from 3rd-party packages) ---
+    let signing = {};
+    try {
+      const sigOut = await adbShell(info.adb, 'pm list packages -S -3 2>/dev/null | head -5 | cut -d= -f2');
+      if (sigOut.trim()) {
+        signing = { note: 'shell-probe shows sample 3rd-party cert', sample_3rd_party_certs: sigOut.trim() };
+      }
+    } catch {}
+
+    const result = {
+      source: 'shell-probe',
+      build,
+      android_id,
+      verified_boot,
+      security_hw,
+      hwtrust,
+      keystore,
+      keystore_services,
+      signing,
+      ts: new Date().toISOString(),
+    };
+    dbgLog('Shell probe collected ' + Object.keys(result).join(', '));
+
+    // Push JSON to device and read back
+    const json = JSON.stringify(result, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const remotePath = '/data/local/tmp/webadb_attestation_shell.json';
     const sync = await info.adb.sync();
     try {
-      await sync.write({
-        filename: PROBE_REMOTE_APK,
-        file: apkBlob.stream(),
-        permission: 0o644,
-      });
-      dbgLog('Pushed APK to ' + PROBE_REMOTE_APK);
-    } catch (e) {
-      dbgLog('sync.write failed: ' + (e.message || e));
-      throw e;
+      await sync.write({ filename: remotePath, file: blob.stream(), permission: 0o644 });
     } finally {
       await sync.dispose();
     }
-    // Confirm the file landed on device
-    await runShell('ls -la ' + PROBE_REMOTE_APK, 'verify pushed APK');
+    let probeJson = await readDeviceFile(info.adb, remotePath);
+    dbgLog('Wrote ' + probeJson.length + ' bytes via sync');
 
-    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Querying probe provider…</div>';
+    // Parse and render
+    const parsed = JSON.parse(probeJson);
 
-    // 3) Install (replace if a previous version exists). pm install prints
-    //    "Success" / "Failure [INSTALL_FAILED_...]" — capture both streams
-    //    and surface as a real error if it failed.
-    let installOut = '';
-    try {
-      installOut = await runShell('pm install -r -t ' + PROBE_REMOTE_APK, 'pm install');
-    } catch (e) {
-      throw new Error('pm install failed: ' + (e.message || e));
-    }
-    if (!/Success/i.test(installOut)) {
-      throw new Error('pm install did not report Success: ' + installOut.trim());
-    }
-
-    // 3b) Confirm the package is actually present on the device.
-    try {
-      const verify = await runShell('pm path ' + PROBE_PKG, 'pm path');
-      if (!/package:/i.test(verify)) {
-        throw new Error('pm path returned no path for ' + PROBE_PKG + ': ' + verify.trim());
-      }
-    } catch (e) {
-      throw new Error('Package verification failed: ' + (e.message || e));
-    }
-
-    // 3b-prime) Force-allow background activity launches for this package
-    //     so that even on the most restrictive Android 14+ devices the
-    //     framework does not silently drop the upcoming intent. This is
-    //     a no-op on devices that already allow it.
-    await runShell(
-      'cmd appops set ' + PROBE_PKG + ' RUN_IN_BACKGROUND allow 2>&1',
-      'appops RUN_IN_BACKGROUND allow');
-
-    // 3c) Probe entry point. We've tried broadcasts, Activity launches,
-    //     and ContentProvider query — every one of them has been silently
-    //     dropped on the user's device at least once. The most reliable
-    //     path on Android 14+ is `cmd activity start` against the LAUNCHER
-    //     component, combined with `am start --activity-previous-is-top`
-    //     and a foreground service flag so the activity manager does not
-    //     defer the launch.
-    let launchOut = '';
-    try {
-      launchOut = await runShell(
-        'am start -W -n ' + PROBE_PKG + '/.BootActivity --user 0 --activity-previous-is-top 2>&1',
-        'am start BootActivity');
-    } catch (e) {
-      dbgLog('am start exception (continuing): ' + (e.message || e));
-    }
-    try {
-      launchOut += '\n' + await runShell(
-        'content query --uri content://io.ethan.webadb.attestation.provider/probe 2>&1',
-        'content query BootProvider');
-    } catch (e) {
-      dbgLog('content query exception (continuing): ' + (e.message || e));
-    }
-    // Verify the file landed on device immediately after the launch.
-    await runShell('ls -la ' + PROBE_REMOTE_OUT + ' 2>&1', 'ls output file');
-    await runShell('stat ' + PROBE_REMOTE_OUT + ' 2>&1', 'stat output file');
-
-    // Poll for the output file. Probe wrote it synchronously in
-    // BootActivity.onCreate / BootApplication.onCreate, so it should
-    // appear within a couple of seconds.
-    let probeJson = '';
-    for (let attempt = 0; attempt < 60 && !probeJson; attempt++) {
-      try {
-        const exists = await adbShell(info.adb,
-          'test -f ' + PROBE_REMOTE_OUT + ' && echo OK || echo MISSING');
-        if (exists.trim() === 'OK') {
-          probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
-          if (probeJson) {
-            dbgLog('Got probe JSON from app: ' + probeJson.length + ' bytes');
-            break;
-          }
-        }
-      } catch (e) { /* try again */ }
-      await new Promise(r => setTimeout(r, 500));
-    }
-
-    // SHELL FALLBACK — if the app process refuses to instantiate (some
-    // OEM ROMs silently drop `am start` / `content query` against
-    // unprivileged user packages), gather everything we can from
-    // pure adb shell and write the JSON directly. Doesn't need any
-    // APK to launch.
-    if (!probeJson) {
-      dbgLog('App probe did not write file — falling back to shell-only probe');
-      const sh = async (cmd, label) => {
-        dbgLog('> ' + (label || cmd));
-        try {
-          const out = await adbShell(info.adb, cmd + ' 2>/dev/null | head -c 8192');
-          dbgLog('  ' + String(out).replace(/\n/g, '\n  ').trim().slice(0, 200));
-          return out;
-        } catch {
-          dbgLog('  (command failed)');
-          return '';
-        }
-      };
-      const getprop = async (k) => {
-        try { return (await adbShell(info.adb, 'getprop ' + k)).trim(); } catch { return ''; }
-      };
-
-      // --- Build info ---
-      dbgLog('Collecting build properties...');
-      const build = {
-        manufacturer: await getprop('ro.product.manufacturer'),
-        model: await getprop('ro.product.model'),
-        brand: await getprop('ro.product.brand'),
-        device: await getprop('ro.product.device'),
-        product: await getprop('ro.product.name'),
-        hardware: await getprop('ro.hardware'),
-        fingerprint: await getprop('ro.build.fingerprint'),
-        release: await getprop('ro.build.version.release'),
-        sdk_int: await getprop('ro.build.version.sdk'),
-        security_patch: await getprop('ro.build.version.security_patch'),
-        bootloader: await getprop('ro.bootloader'),
-      };
-
-      // --- Verified Boot state ---
-      dbgLog('Collecting verified boot state...');
-      const verified_boot = {
-        verifiedbootstate: await getprop('ro.boot.verifiedbootstate'),
-        vbmeta_verify_state: await getprop('ro.boot.vbmeta.verify_state'),
-        vbmeta_device_state: await getprop('ro.boot.vbmeta.device_state'),
-        veritymode: await getprop('ro.boot.veritymode'),
-        flash_locked: await getprop('ro.boot.flash.locked'),
-        warranty_bit: await getprop('ro.boot.warranty_bit'),
-        avb_state: await getprop('ro.boot.vbmeta.avb_state'),
-      };
-
-      // --- Security / Trust hardware ---
-      dbgLog('Collecting security hardware properties...');
-      const security_hw = {
-        keystore: await getprop('ro.hardware.keystore'),
-        keystore2: await getprop('ro.hardware.keystore2'),
-        keymaster: await getprop('ro.hardware.keymaster'),
-        strongbox: await getprop('ro.hardware.strongbox'),
-        rkp_enabled: await getprop('ro.rkp.enabled'),
-        rkp: await getprop('ro.security.rkp'),
-      };
-
-      // --- Android ID ---
-      let android_id = '';
-      try { android_id = (await adbShell(info.adb, 'settings get secure android_id')).trim(); } catch {}
-
-      // --- Signing cert (from installed system packages as reference) ---
-      let signing = {};
-      try {
-        const sigOut = await adbShell(info.adb,
-          'pm list packages -S -3 2>/dev/null | head -5 | cut -d= -f2');
-        if (sigOut.trim()) {
-          signing = {
-            note: 'shell-fallback shows sample 3rd-party cert',
-            sample_3rd_party_certs: sigOut.trim(),
-          };
-        }
-      } catch {}
-
-      // --- HW Trust: cmd identity get_csr (shell context, no app needed) ---
-      dbgLog('Collecting HW Trust CSRs (cmd identity get_csr)...');
-      const hwtrust = {};
-      for (const slot of ['default', 'strongbox', 'tee']) {
-        try {
-          const csrOut = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
-          const csrText = (csrOut || '').trim();
-          if (csrText) {
-            // Extract PEM
-            const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
-            const pem = pemMatch ? pemMatch[0] : csrText;
-            // Compute DER SHA-256
-            let der_sha256 = '';
-            try {
-              const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
-              const bin = atob(b64);
-              const bytes = new Uint8Array(bin.length);
-              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-              // SHA-256 via subtle crypto
-              const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
-              der_sha256 = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-            } catch (e) {
-              der_sha256 = '(unable to compute — ' + (e.message || e) + ')';
-            }
-            hwtrust[slot] = { pem, der_sha256, raw_length: csrText.length };
-            dbgLog('  ' + slot + ': CSR obtained, DER SHA-256: ' + der_sha256.slice(0, 16) + '...');
-          } else {
-            hwtrust[slot] = { pem: '', der_sha256: '', note: 'slot not available on this device' };
-            dbgLog('  ' + slot + ': no CSR returned');
-          }
-        } catch (e) {
-          hwtrust[slot] = { pem: '', der_sha256: '', error: String(e.message || e) };
-          dbgLog('  ' + slot + ': error: ' + (e.message || e));
-        }
-      }
-
-      // --- KeyStore/KeyMint HAL check ---
-      dbgLog('Checking KeyStore/KeyMint HAL...');
-      let keystore = {};
-      try {
-        const ksOut = await adbShell(info.adb, 'cmd keystore 2>&1 | head -c 2048');
-        keystore = {
-          available: !!ksOut.trim(),
-          raw: ksOut.trim().slice(0, 500),
-        };
-      } catch (e) {
-        keystore = { available: false, error: String(e.message || e) };
-      }
-
-      // --- Keystore services ---
-      const keystore_services = {};
-      try {
-        const svcOut = await adbShell(info.adb, 'service list 2>/dev/null');
-        for (const svc of ['android.security.keystore', 'android.hardware.keymaster', 'android.hardware.security.keymint']) {
-          keystore_services[svc] = svcOut.includes(svc);
-        }
-      } catch {}
-
-      const result = {
-        source: 'shell-fallback',
-        build,
-        android_id,
-        verified_boot,
-        security_hw,
-        hwtrust,
-        keystore,
-        keystore_services,
-        signing,
-        ts: new Date().toISOString(),
-      };
-      const json = JSON.stringify(result, null, 2);
-      dbgLog('Shell-fallback collected ' + Object.keys(result).join(', '));
-
-      // Push the JSON to the device and read it back via cat.
-      try {
-        const blob = new Blob([json], { type: 'application/json' });
-        const remotePath = '/data/local/tmp/webadb_attestation_fallback.json';
-        const sync2 = await info.adb.sync();
-        try {
-          await sync2.write({ filename: remotePath, file: blob.stream(), permission: 0o644 });
-        } finally {
-          await sync2.dispose();
-        }
-        probeJson = await readDeviceFile(info.adb, remotePath);
-        dbgLog('Shell-fallback wrote ' + probeJson.length + ' bytes via sync');
-      } catch (e) {
-        dbgLog('Shell-fallback sync failed: ' + (e.message || e));
-        // Last resort: Base64 in a single shell line.
-        try {
-          const b64 = btoa(unescape(encodeURIComponent(json)));
-          await adbShell(info.adb,
-            'echo ' + b64 + ' | base64 -d > ' + PROBE_REMOTE_OUT + ' && chmod 644 ' + PROBE_REMOTE_OUT);
-          probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
-          dbgLog('Shell-fallback wrote via base64: ' + probeJson.length + ' bytes');
-        } catch (e2) {
-          dbgLog('Shell-fallback base64 also failed: ' + (e2.message || e2));
-        }
-      }
-    }
-
-    if (!probeJson) {
-      let debugInfo = '';
-      try { debugInfo = await readDeviceFile(info.adb, PROBE_REMOTE_OUT); } catch(_) {}
-      throw new Error(
-        'Probe did not produce ' + PROBE_REMOTE_OUT + ' within 30s.\n' +
-        'pm install: ' + installOut.trim() + '\n' +
-        'am start: ' + launchOut.trim() + '\n' +
-        'file on device: ' + (debugInfo ? `'${debugInfo.slice(0, 200)}'` : '(empty / not created)'));
-    }
-
-    let parsed;
-    try { parsed = JSON.parse(probeJson); }
-    catch (e) { throw new Error('Probe output is not valid JSON: ' + (e.message || e)); }
-
-    // 5) Render — every key → row
     const renderKV = (obj, prefix) => {
       let html = '';
       for (const k of Object.keys(obj || {})) {
@@ -1638,15 +1494,16 @@ async function runAttestationProbe() {
             }
           });
         } else {
+          const statusColor = v === false ? 'color:var(--red)' : v === true ? 'color:var(--green)' : '';
           html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
-            '</span><span style="word-break:break-all">' + esc(String(v)) + '</span></div>';
+            '</span><span style="word-break:break-all;' + statusColor + '">' + esc(String(v)) + '</span></div>';
         }
       }
       return html;
     };
 
     let html = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header">' +
-      '<h4>Attestation Probe Result</h4>' +
+      '<h4>Attestation Probe Result (shell-probe)</h4>' +
       '<span style="font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim)">' +
       esc(parsed.build?.fingerprint || '') + '</span>' +
       '</div>';
@@ -1654,25 +1511,21 @@ async function runAttestationProbe() {
     html += '</div>';
     out.innerHTML = html;
 
-    // Cache & export
     dataCache.attestationProbe = parsed;
-
     setStatus('Attestation probe complete', 'ok');
 
-    // 6) Best-effort cleanup: remove APK from /data/local/tmp
-    try { await adbShell(info.adb, 'rm -f ' + PROBE_REMOTE_APK); } catch (_) {}
-    // We deliberately leave the installed app + output JSON on device so the
-    // user can inspect / uninstall separately. Provide a hint to uninstall:
-    out.insertAdjacentHTML('beforeend',
-      '<div style="margin-top:0.5rem;font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim)">' +
-      'APK left installed on device. Uninstall with:<br>' +
-      '<code>adb uninstall ' + esc(PROBE_PKG) + '</code>' +
-      '</div>');
+    // Cleanup
+    try { await adbShell(info.adb, 'rm -f ' + remotePath); } catch (_) {}
   } catch (err) {
     out.innerHTML = '<div style="color:#ff5252">' + esc(String(err.message || err)) + '</div>';
     setStatus('Probe failed: ' + (err.message || err), 'err');
   }
   showLoading('apk-verify', false);
+}
+
+function clearShell() {
+  const el = document.getElementById('shell-output');
+  if (el) el.textContent = '';
 }
 
 // --- Debug console helpers ---
