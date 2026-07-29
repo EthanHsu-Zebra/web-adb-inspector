@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.4
+**Current:** 1.1.5
 
 ### Changelog
+
+- **1.1.5** — Attestation Probe: gave up on broadcasts entirely. Even with --user 0 + explicit component + -S, Android 14+ silently drops broadcasts to a cold app process (result=0 but receiver never runs). Switched to launching the new BootActivity LAUNCHER activity via `am start -W -n io.ethan.webadb.attestation/.BootActivity` — Activity onCreate runs the probe synchronously, so the result file is guaranteed to appear. Refactored probe logic out of ProbeReceiver into a shared `Probe.run(Context)` helper so both the LAUNCHER activity and the (now fallback) broadcast receiver invoke the same code. Bumped APP_VERSION 1.1.4 → 1.1.5.
 
 - **1.1.4** — Attestation Probe: APK now ships a LAUNCHER activity (`BootActivity`, Theme.NoDisplay, immediately `finish()`). Without a started app process, Android 14+ silently drops broadcasts to installed receivers even with `--user 0` / explicit component. Site now calls `monkey -p <pkg> 1` after install to start the process. `pm install` result is now parsed for `Success`; `pm path <pkg>` confirms the package is actually present; `am broadcast -S` (sticky, blocking) reports how many receivers actually fired. Error message now includes pm install + broadcast output for diagnosis. Bumped APP_VERSION 1.1.3 → 1.1.4.
 

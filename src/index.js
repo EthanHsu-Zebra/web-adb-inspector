@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.4';
+const APP_VERSION = '1.1.5';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1318,7 +1318,7 @@ async function runAttestationProbe() {
       await sync.dispose();
     }
 
-    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Installing APK…</div>';
+    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Launching probe activity…</div>';
 
     // 3) Install (replace if a previous version exists). pm install prints
     //    "Success" / "Failure [INSTALL_FAILED_...]" — capture both streams
@@ -1346,28 +1346,23 @@ async function runAttestationProbe() {
     }
 
     // 3c) On Android 14+, an installed app with no activities and no
-    //     started process cannot receive broadcasts. Boot the app via
-    //     `monkey -p <pkg> 1` to ensure its process is alive, then
-    //     broadcast. The receiver will then fire normally.
+    //     started process cannot receive broadcasts (result=0 even when
+    //     --user 0 / explicit component are used). Launch the LAUNCHER
+    //     activity we ship in the APK — it runs the probe synchronously
+    //     in onCreate, then finishes. This is the only reliable way to
+    //     get user-space Java code running from an adb shell context.
+    let launchOut = '';
     try {
-      await adbShell(info.adb, 'monkey -p ' + PROBE_PKG + ' -c android.intent.category.LAUNCHER 1 2>&1');
-    } catch (_) { /* monkey may fail if no LAUNCHER; that's fine — process still starts */ }
-
-    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Triggering probe broadcast…</div>';
-
-    // 4) Trigger probe broadcast. -S (sticky) waits for receivers to finish
-    //    and reports how many actually received the broadcast, so we can
-    //    tell "broadcast queued but no receiver ran" from "receiver ran".
-    let broadcastOut = '';
-    try {
-      broadcastOut = await adbShell(info.adb,
-        'am broadcast -S -a ' + PROBE_BROADCAST +
-        ' -n ' + PROBE_PKG + '/.ProbeReceiver --user 0 2>&1');
+      launchOut = await adbShell(info.adb,
+        'am start -W -n ' + PROBE_PKG + '/.BootActivity --user 0 2>&1');
     } catch (e) {
-      throw new Error('am broadcast failed: ' + (e.message || e));
+      // Surface but continue — sometimes am start prints "Warning" but
+      // the activity still ran. Final file check below is the source of truth.
+      launchOut = launchOut + '\nam start warning: ' + (e.message || e);
     }
 
-    // Poll for the output file (probe receiver touches it on entry).
+    // Poll for the output file. Probe wrote it synchronously in
+    // BootActivity.onCreate, so it should appear within a couple of seconds.
     let probeJson = '';
     for (let attempt = 0; attempt < 60 && !probeJson; attempt++) {
       try {
@@ -1387,7 +1382,7 @@ async function runAttestationProbe() {
       throw new Error(
         'Probe did not produce ' + PROBE_REMOTE_OUT + ' within 30s.\n' +
         'pm install: ' + installOut.trim() + '\n' +
-        'broadcast: ' + broadcastOut.trim() + '\n' +
+        'am start: ' + launchOut.trim() + '\n' +
         'file on device: ' + (debugInfo ? `'${debugInfo.slice(0, 200)}'` : '(empty / not created)'));
     }
 
