@@ -31,11 +31,21 @@ public final class Probe {
     private static final String TAG = "WebAdbProbe";
 
     public static void run(Context ctx) {
-        // Probe helper. Note: BootActivity.onCreate already touches the
-        // output file before calling us, so if you see a 0-byte file
-        // after a run, Probe.run was never called.
+        // Touch the output file BEFORE anything else. This is the single
+        // signal the host uses to know our code ran at all. If the file
+        // never appears, neither Probe.run nor its caller executed.
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(OUT_PATH);
+            fos.close();
+            Log.i(TAG, "Touched " + OUT_PATH);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to touch output file", t);
+        }
+
         try {
             Map<String, Object> out = new LinkedHashMap<>();
+
+            Log.i(TAG, "Probe.run: step 1 build");
 
             // 1) Build.*
             Map<String, Object> build = new LinkedHashMap<>();
@@ -53,11 +63,15 @@ public final class Probe {
             try { build.put("radio", Build.getRadioVersion()); } catch (Throwable t) {}
             out.put("build", build);
 
+            Log.i(TAG, "Probe.run: step 2 android_id");
+
             // 2) Settings.Secure.ANDROID_ID
             try {
                 out.put("android_id", Settings.Secure.getString(
                     ctx.getContentResolver(), Settings.Secure.ANDROID_ID));
             } catch (Throwable t) { out.put("android_id", "(unavailable: " + t.getMessage() + ")"); }
+
+            Log.i(TAG, "Probe.run: step 3 signing");
 
             // 3) Package signing cert — try modern path then legacy fallback
             try {
@@ -95,6 +109,8 @@ public final class Probe {
                 sig.put("error", String.valueOf(t.getMessage()));
                 out.put("signing_error", sig);
             }
+
+            Log.i(TAG, "Probe.run: step 4 keystore");
 
             // 4) AndroidKeyStore / KeyMint probe
             try {
@@ -149,10 +165,15 @@ public final class Probe {
                 out.put("keystore", ks_out);
             }
 
+            Log.i(TAG, "Probe.run: step 5 write file");
+
             // 5) Write JSON
             File outFile = new File(OUT_PATH);
             try (FileOutputStream fos = new FileOutputStream(outFile)) {
                 fos.write(JsonWriter.toJson(out).getBytes("UTF-8"));
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to write " + OUT_PATH, t);
+                throw t;
             }
             try {
                 Runtime.getRuntime().exec("chmod 644 " + OUT_PATH).waitFor();

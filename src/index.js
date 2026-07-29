@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.8';
+const APP_VERSION = '1.1.9';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1300,7 +1300,9 @@ async function runAttestationProbe() {
   // Per-step debug log so failures are diagnosable from the page itself.
   const dbgLog = (msg) => {
     if (!dbg) return;
-    dbg.textContent += (dbg.textContent ? '\n' : '') + '[' + new Date().toISOString().slice(11,19) + '] ' + msg;
+    dbg.textContent += (dbg.textContent ? '\n' : '') + '[' +
+      new Date().toISOString().slice(11,19) + ' UTC / ' +
+      new Date(new Date().getTime() + 8*3600*1000).toISOString().slice(11,19) + ' TW] ' + msg;
     dbg.scrollTop = dbg.scrollHeight;
   };
   const runShell = async (cmd, label) => {

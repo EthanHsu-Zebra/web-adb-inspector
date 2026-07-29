@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.8
+**Current:** 1.1.9
 
 ### Changelog
+
+- **1.1.9** — Attestation Probe: the 0-byte touch moved back into `Probe.run` (was in `BootActivity.onCreate`). Per-step Log.i markers before each probe stage (build / android_id / signing / keystore / write). Write-failure catch rethrows to the outer catch with a Log.e entry, so logcat will surface the actual exception if step 5 fails. Site debug timestamps now show both UTC and Taiwan (UTC+8) times so timestamps in the inline console match `ls -la` on device. Bumped APP_VERSION 1.1.8 → 1.1.9.
 
 - **1.1.8** — Attestation Probe: switched from `am start BootActivity` to `adb shell content query --uri content://io.ethan.webadb.attestation.provider/probe`. Even with the 0-byte touch as the first statement of `BootActivity.onCreate` (v1.1.7), the file still doesn't appear on the user's device — `am start` reports `Status: ok` but the activity's onCreate never actually runs (confirmed: the touch doesn't happen, the file is missing, not 0 bytes). ContentProvider is the Android-recommended way to guarantee user-space Java code runs: the system *must* instantiate every provider declared in the manifest before a client (including adb shell) can bind to it, regardless of background-app restrictions that block Activity launches and broadcasts. APK now ships a `BootProvider` whose `query()` invokes `Probe.run(getContext())` and returns an empty cursor. Bumped APP_VERSION 1.1.7 → 1.1.8.
 
