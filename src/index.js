@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.2';
+const APP_VERSION = '1.1.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -965,8 +965,12 @@ function exportJSON(type) {
         has_default_notification_access: p.has_default_notification_access || false,
         is_active_admin: p.is_active_admin || false,
         is_default_accessibility_service: p.is_default_accessibility_service || false,
-        sha256_cert: formatCert(p.sha256_cert) || '(not parsed)',
-        sha256_file: (p.sha256_file || '').toLowerCase() || '(not parsed)',
+        sha256_cert: formatCert(p.sha256_cert) || '(not in dumpsys)',
+        // sha256_file = SHA-256 of the APK binary at codePath. dumpsys does
+        // not include this; computing it requires reading the APK file,
+        // which needs root or run-as (Android sandbox). Marker shown to
+        // make it clear this is a sandbox limit, not a parser bug.
+        sha256_file: '(requires root/run-as to read APK)',
         requested_permissions: (p.requested_permissions || []).map(r => ({
           name: r.name, flags: r.flags || 0, permission_group: r.permission_group || '',
           protection_level: r.protection_level || 0, protection_level_flags: r.protection_level_flags || 0,
@@ -1327,25 +1331,36 @@ async function runAttestationProbe() {
     out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Triggering probe broadcast…</div>';
 
     // 4) Trigger probe broadcast, wait for file to appear
+    //    Broadcast to a freshly-installed app on Android 14+ may take a
+    //    moment to actually deliver, and the receiver's KeyMint probe can
+    //    take 5-15s on first invocation (HAL init). Poll up to 30s.
     await adbShell(info.adb,
       'am broadcast -a ' + PROBE_BROADCAST +
-      ' -n ' + PROBE_PKG + '/.ProbeReceiver 2>&1');
+      ' -n ' + PROBE_PKG + '/.ProbeReceiver --user 0 2>&1');
 
     // Poll briefly for the output file
     let probeJson = '';
-    for (let attempt = 0; attempt < 10 && !probeJson; attempt++) {
+    for (let attempt = 0; attempt < 60 && !probeJson; attempt++) {
       try {
         const exists = await adbShell(info.adb,
           'test -f ' + PROBE_REMOTE_OUT + ' && echo OK || echo MISSING');
         if (exists.trim() === 'OK') {
           probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
-          break;
+          if (probeJson) break;
         }
       } catch (e) { /* try again */ }
       await new Promise(r => setTimeout(r, 500));
     }
 
-    if (!probeJson) throw new Error('Probe did not produce ' + PROBE_REMOTE_OUT + ' within 5s');
+    if (!probeJson) {
+      // Pull whatever we have to help the user debug — could be empty
+      // (receiver never fired) or partial (later step threw).
+      let debugInfo = '';
+      try { debugInfo = await readDeviceFile(info.adb, PROBE_REMOTE_OUT); } catch(_) {}
+      throw new Error('Probe did not produce ' + PROBE_REMOTE_OUT +
+        ' within 30s. Receiver may not have fired. File on device: ' +
+        (debugInfo ? `'${debugInfo.slice(0, 200)}'` : '(empty)'));
+    }
 
     let parsed;
     try { parsed = JSON.parse(probeJson); }

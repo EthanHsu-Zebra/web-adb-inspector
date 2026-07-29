@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.2
+**Current:** 1.1.3
 
 ### Changelog
+
+- **1.1.3** — Attestation Probe: add immediate file touch in `onReceive` (so host can detect receiver firing vs. silent failure), add `--user 0` to broadcast flag (Android 14+ delivery fix), poll timeout 5s → 30s with 500ms interval (KeyMint HAL init can take 10-15s), error message now reports whatever the file contains if it exists (empty vs partial). APK signing cert: fall back to deprecated `PackageManager.GET_SIGNATURES` path when `SigningInfo` path returns the empty v1-scheme blob (this APK is debug-signed with v1 only). Packages export: `sha256_file` now labeled `(requires root/run-as to read APK)` — it's a sandbox limit, not a parser bug. Bumped APP_VERSION 1.1.2 → 1.1.3.
 
 - **1.1.2** — Fix Attestation Probe failure: APK was writing its output to `/sdcard/Download/` which is blocked by Android 11+ scoped storage for unprivileged apps; now writes to `/data/local/tmp/webadb_attestation.json` with chmod 644. Fix `readDeviceFile`: was calling `adb.syncProtocol.recv()` which isn't wired up in `@yume-chan/adb`'s `Adb` class (dead code path — packages were silently falling back to the `pm list` fallback that has no version/cert/sha fields). Replaced with `adbShell(info.adb, 'cat ' + path)`. Also simplified `fetchPackages` to dump directly via shell protocol instead of writing a temp file first. Bumped APP_VERSION 1.1.1 → 1.1.2.
 - **1.1.1** — Fix HW Trust / Attestation Probe buttons not firing (new functions weren't registered on `window`, so esbuild minified names made `onclick` handlers resolve to undefined). Fix dumpsys parser: `codePath` was truncated at embedded `==` (e.g. `/data/app/~~abc==/pkg-XYZ` → `/data/app/~~abc=`); requested/declared permissions in `name: attr=value` format weren't captured. Empty fields in Packages export JSON now show `(not parsed)` instead of empty strings. Raw dumpsys text cached as `dataCache.lastDumpsysText` for debugging.

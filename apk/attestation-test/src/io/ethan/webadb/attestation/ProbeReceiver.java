@@ -44,6 +44,12 @@ public class ProbeReceiver extends BroadcastReceiver {
 
     @Override
     public void onReceive(Context ctx, Intent intent) {
+        // Touch the output file immediately so the host can detect that
+        // the receiver was actually invoked (even if a later step throws).
+        try {
+            new FileOutputStream(PROBE_OUT_PATH).close();
+        } catch (Throwable ignored) {}
+
         try {
             Map<String, Object> out = new LinkedHashMap<>();
 
@@ -67,21 +73,47 @@ public class ProbeReceiver extends BroadcastReceiver {
             out.put("android_id", Settings.Secure.getString(
                 ctx.getContentResolver(), Settings.Secure.ANDROID_ID));
 
-            // 3) Package signing cert — proves this APK's identity
+            // 3) Package signing cert — proves this APK's identity.
+            //    `Signature.toByteArray()` on the SigningInfo path returns
+            //    the cert DER only when the APK uses v2+ signing; v1-signed
+            //    APKs (like this debug-signed build) give an empty/4-byte
+            //    blob. Try the legacy `signatures` path which always returns
+            //    the actual cert DER for the querying app.
             try {
                 Map<String, Object> sig = new LinkedHashMap<>();
-                android.content.pm.PackageInfo pi = ctx.getPackageManager().getPackageInfo(
-                    ctx.getPackageName(),
-                    android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES);
-                android.content.pm.Signature[] sigs = pi.signingInfo.getApkContentsSigners();
-                if (sigs != null && sigs.length > 0) {
-                    byte[] certBytes = sigs[0].toByteArray();
+                byte[] certBytes = null;
+                // Prefer modern path (v2/v3); fall back to legacy v1 path.
+                try {
+                    android.content.pm.PackageInfo pi2 = ctx.getPackageManager().getPackageInfo(
+                        ctx.getPackageName(),
+                        android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES);
+                    if (pi2.signingInfo != null) {
+                        android.content.pm.Signature[] sigs = pi2.signingInfo.getApkContentsSigners();
+                        if (sigs != null && sigs.length > 0 && sigs[0].toByteArray().length > 32) {
+                            certBytes = sigs[0].toByteArray();
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                if (certBytes == null || certBytes.length <= 32) {
+                    android.content.pm.PackageInfo pi1 = ctx.getPackageManager().getPackageInfo(
+                        ctx.getPackageName(),
+                        android.content.pm.PackageManager.GET_SIGNATURES);
+                    if (pi1.signatures != null && pi1.signatures.length > 0) {
+                        certBytes = pi1.signatures[0].toByteArray();
+                    }
+                }
+                if (certBytes != null && certBytes.length > 32) {
                     sig.put("sha256", sha256Hex(certBytes));
                     sig.put("size_bytes", certBytes.length);
+                } else {
+                    sig.put("sha256", "(unable to read signing cert)");
+                    sig.put("size_bytes", certBytes != null ? certBytes.length : 0);
                 }
                 out.put("signing", sig);
             } catch (Throwable t) {
-                out.put("signing_error", t.getMessage());
+                Map<String, Object> sig = new LinkedHashMap<>();
+                sig.put("error", String.valueOf(t.getMessage()));
+                out.put("signing_error", sig);
             }
 
             // 4) AndroidKeyStore probe — does the device have a working KeyMint/TEE?
