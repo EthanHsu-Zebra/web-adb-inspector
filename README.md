@@ -46,14 +46,15 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 - `@yume-chan/adb` — ADB protocol over WebUSB transport
 - `@yume-chan/adb-daemon-webusb` — WebUSB device manager
-- esbuild — single-file bundle (~111 KB)
+- esbuild — single-file bundle (~113 KB)
 
 ## Version
 
-**Current:** 1.1.0
+**Current:** 1.1.1
 
 ### Changelog
 
+- **1.1.1** — Fix HW Trust / Attestation Probe buttons not firing (new functions weren't registered on `window`, so esbuild minified names made `onclick` handlers resolve to undefined). Fix dumpsys parser: `codePath` was truncated at embedded `==` (e.g. `/data/app/~~abc==/pkg-XYZ` → `/data/app/~~abc=`); requested/declared permissions in `name: attr=value` format weren't captured. Empty fields in Packages export JSON now show `(not parsed)` instead of empty strings. Raw dumpsys text cached as `dataCache.lastDumpsysText` for debugging.
 - **1.1.0** — New HW Trust tab: KeyMint CSR retrieval via `cmd identity get_csr` (default / strongbox / TEE slots) with DER SHA-256 fingerprinting and PEM copy. New Attestation Probe: ships bundled `attestation-test.apk` to device → install → broadcast → pull JSON (Build.*, AndroidKeyStore probe, signing cert, key attestation chain). RKP: removed both `Warranty Bit (boot)` and `Warranty Void (user)` rows (OEM-specific, redundant). Bumped APP_VERSION 1.0.8 → 1.1.0.
 - **1.0.8** — Fix init TypeError that silently killed header-version display
 - **1.0.7** — Fix header-version not displaying (module + DOMContentLoaded race)
