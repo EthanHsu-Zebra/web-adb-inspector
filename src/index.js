@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.10';
+const APP_VERSION = '1.1.11';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1395,8 +1395,6 @@ async function runAttestationProbe() {
     } catch (e) {
       dbgLog('am start exception (continuing): ' + (e.message || e));
     }
-    // Also try the provider path — at least one of them should write file
-    // given that BootApplication.onCreate already touched it on install.
     try {
       launchOut += '\n' + await runShell(
         'content query --uri content://io.ethan.webadb.attestation.provider/probe 2>&1',
@@ -1409,7 +1407,8 @@ async function runAttestationProbe() {
     await runShell('stat ' + PROBE_REMOTE_OUT + ' 2>&1', 'stat output file');
 
     // Poll for the output file. Probe wrote it synchronously in
-    // BootActivity.onCreate, so it should appear within a couple of seconds.
+    // BootActivity.onCreate / BootApplication.onCreate, so it should
+    // appear within a couple of seconds.
     let probeJson = '';
     for (let attempt = 0; attempt < 60 && !probeJson; attempt++) {
       try {
@@ -1418,12 +1417,81 @@ async function runAttestationProbe() {
         if (exists.trim() === 'OK') {
           probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
           if (probeJson) {
-            dbgLog('Got probe JSON: ' + probeJson.length + ' bytes');
+            dbgLog('Got probe JSON from app: ' + probeJson.length + ' bytes');
             break;
           }
         }
       } catch (e) { /* try again */ }
       await new Promise(r => setTimeout(r, 500));
+    }
+
+    // SHELL FALLBACK — if the app process refuses to instantiate (some
+    // OEM ROMs silently drop `am start` / `content query` against
+    // unprivileged user packages), gather everything we can from
+    // pure adb shell and write the JSON directly. Doesn't need any
+    // APK to launch.
+    if (!probeJson) {
+      dbgLog('App probe did not write file — falling back to shell-only probe');
+      const sh = (cmd) => adbShell(info.adb, cmd + ' 2>/dev/null | head -c 4000');
+      const getprop = async (k) => {
+        try { return (await sh('getprop ' + k)).trim(); } catch { return ''; }
+      };
+      const build = {
+        manufacturer: await getprop('ro.product.manufacturer'),
+        model: await getprop('ro.product.model'),
+        brand: await getprop('ro.product.brand'),
+        device: await getprop('ro.product.device'),
+        product: await getprop('ro.product.name'),
+        hardware: await getprop('ro.hardware'),
+        fingerprint: await getprop('ro.build.fingerprint'),
+        release: await getprop('ro.build.version.release'),
+        sdk_int: await getprop('ro.build.version.sdk'),
+        security_patch: await getprop('ro.build.version.security_patch'),
+        bootloader: await getprop('ro.bootloader'),
+      };
+      let keystore = { success: false, note: 'shell-fallback cannot create a TEE-backed key without app code' };
+      let signing = { note: 'shell-fallback cannot read our app cert via getprop' };
+      let android_id = '';
+      try {
+        android_id = (await sh('settings get secure android_id')).trim();
+      } catch {}
+      const out = {
+        source: 'shell-fallback',
+        build,
+        android_id,
+        signing,
+        keystore,
+        ts: new Date().toISOString(),
+      };
+      const json = JSON.stringify(out, null, 2);
+      // Push the JSON to the device and read it back via cat.
+      const localPath = '/tmp/webadb_attestation_fallback.json';
+      try {
+        const fs = window.__TAURI__?.fs || null;
+        // No Tauri — just write a Blob and push via sync.
+        const blob = new Blob([json], { type: 'application/json' });
+        const remotePath = '/data/local/tmp/webadb_attestation_fallback.json';
+        const sync2 = await info.adb.sync();
+        try {
+          await sync2.write({ filename: remotePath, file: blob.stream(), permission: 0o644 });
+        } finally {
+          await sync2.dispose();
+        }
+        probeJson = await readDeviceFile(info.adb, remotePath);
+        dbgLog('Shell-fallback wrote ' + probeJson.length + ' bytes via sync');
+      } catch (e) {
+        dbgLog('Shell-fallback sync failed: ' + (e.message || e));
+        // Last resort: Base64 in a single shell line.
+        try {
+          const b64 = btoa(unescape(encodeURIComponent(json)));
+          await adbShell(info.adb,
+            'echo ' + b64 + ' | base64 -d > ' + PROBE_REMOTE_OUT + ' && chmod 644 ' + PROBE_REMOTE_OUT);
+          probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
+          dbgLog('Shell-fallback wrote via base64: ' + probeJson.length + ' bytes');
+        } catch (e2) {
+          dbgLog('Shell-fallback base64 also failed: ' + (e2.message || e2));
+        }
+      }
     }
 
     if (!probeJson) {

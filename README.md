@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.10
+**Current:** 1.1.11
 
 ### Changelog
+
+- **1.1.11** — Attestation Probe: added a shell-only fallback path. After `am start` + `content query` + 30s of polling, if the app probe still hasn't written the file, the site now collects everything it can from pure adb shell (`getprop ro.product.*`, `getprop ro.build.*`, `settings get secure android_id`) and pushes the JSON directly via `AdbSync` to `/data/local/tmp/webadb_attestation_fallback.json`. The shell-only probe cannot create a TEE-backed key (`keystore.success=false`) or read the app's signing cert (notes those as not-applicable), but it produces a valid JSON file with Build.* info and Android ID. Last-resort: `echo <base64> | base64 -d > file`. So even if the device OEM silently drops every Activity/Provider/Application intent for unprivileged user packages, the host still gets a useful JSON file. Bumped APP_VERSION 1.1.10 → 1.1.11.
 
 - **1.1.10** — Attestation Probe: added `BootApplication` (Application subclass). `Application.onCreate` is the earliest point at which user-space Java code is guaranteed to run on Android — it's invoked by the framework during process startup, before any Activity / Service / ContentProvider user code, and cannot be silently dropped by background-app restrictions the way Activity launches are. The `BootApplication.onCreate` touches `/data/local/tmp/webadb_attestation.json` and logs to `WebAdbBoot`, so the host can see whether the app process actually instantiated. Manifest now declares `android:name=".BootApplication"`. Site also now force-sets `cmd appops set io.ethan.webadb.attestation RUN_IN_BACKGROUND allow` before triggering, AND fires both `am start BootActivity` and `content query BootProvider` in sequence (one of them must succeed). Bumped APP_VERSION 1.1.9 → 1.1.10.
 
