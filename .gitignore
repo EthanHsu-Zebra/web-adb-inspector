@@ -1,2 +1,4 @@
 node_modules/
 *.js.map
+apk/attestation-test/build/
+apk/attestation-test/build.log

@@ -499,15 +499,13 @@
           <div id="hwtrust-output"></div>
 
           <div class="panel-header" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:0.75rem">
-            <h3>APK Signing Verification</h3>
+            <h3>Attestation Probe (bundled APK)</h3>
           </div>
           <div style="margin-bottom:0.5rem;font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">
-            Push an APK to the device and verify its signing cert matches what's installed (or compare against a package name on the device).
+            Pushes the bundled <code>attestation-test.apk</code> to the device, installs it, fires its probe broadcast, and pulls back what the app context can see (Build.*, AndroidKeyStore probe, app signing cert, key attestation chain).
           </div>
           <div style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
-            <input type="file" id="apk-file-input" accept=".apk" style="font-size:calc(0.75rem * var(--font-scale))">
-            <input type="text" id="apk-pkg-input" placeholder="expected package name (optional)" class="search-input" style="width:18rem">
-            <button class="btn btn-sm" onclick="pushAndVerifyAPK()">Push & Verify</button>
+            <button class="btn" onclick="runAttestationProbe()">Run Attestation Probe</button>
             <span id="apk-verify-loading" class="loading hidden"></span>
           </div>
           <div id="apk-verify-output"></div>

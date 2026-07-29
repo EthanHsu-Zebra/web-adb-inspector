@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.0.8';
+const APP_VERSION = '1.1.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -942,8 +942,8 @@ function exportJSON(type) {
     };
     fn = 'HardwareTrustDeviceInfo.deviceinfo.json';
   } else if (type === 'apk') {
-    json = { apk_verify: dataCache.apkVerify || null };
-    fn = 'APKVerifyDeviceInfo.deviceinfo.json';
+    json = { attestation_probe: dataCache.attestationProbe || null };
+    fn = 'AttestationProbeDeviceInfo.deviceinfo.json';
   } else return;
   const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -1051,9 +1051,8 @@ async function fetchRKP() {
       safeGetProp(info.adb, 'ro.boot.vbmeta.verify_state'),
       safeGetProp(info.adb, 'ro.boot.vbmeta.device_state'),
       safeGetProp(info.adb, 'ro.boot.veritymode'),
-      safeGetProp(info.adb, 'ro.boot.warranty_bit'),
     ]);
-    const [flashLocked, vbState, vbVerify, vbDevice, verity, wBit] = props.map(r => r.value || '');
+    const [flashLocked, vbState, vbVerify, vbDevice, verity] = props.map(r => r.value || '');
 
     // Build rows: [Check, Value, Status, Source, Tooltip]
     const rows = [];
@@ -1127,9 +1126,6 @@ async function fetchRKP() {
       verity === 'enforce' ? 'ok' : (verity === 'logging' || verity === 'log' ? 'warn' : 'unknown'),
       'getprop ro.boot.veritymode',
       'DM-Verity mode. enforce=active protection, logging=degraded.']);
-    rows.push(['Warranty Bit (boot)', wBit === '1' ? 'VOID' : (wBit || 'Not set'),
-      wBit === '1' ? 'fail' : 'ok', 'getprop ro.boot.warranty_bit',
-      'Bootloader warranty void bit. 1=bootloader unlocked, void warranty.']);
 
     document.getElementById('rkp-output').innerHTML = renderRKPTable(rows);
   } catch (err) {
@@ -1219,113 +1215,140 @@ function copyCSR(slot) {
   });
 }
 
-// --- APK Signing Verification (lightweight: cert compare only) ---
-async function pushAndVerifyAPK() {
+// --- Attestation Probe: bundled APK → push → install → broadcast → pull ---
+// Ships the site-bundled attestation-test.apk to the device, installs it,
+// fires its probe broadcast, then pulls the resulting JSON back so the user
+// can see what the app context can see (Build.*, AndroidKeyStore probe,
+// app signing cert, certificate chain).
+const PROBE_PKG = 'io.ethan.webadb.attestation';
+const PROBE_REMOTE_APK = '/data/local/tmp/webadb-attestation-test.apk';
+const PROBE_REMOTE_OUT = '/sdcard/Download/webadb_attestation.json';
+const PROBE_BROADCAST = 'io.ethan.webadb.PROBE';
+
+async function runAttestationProbe() {
   const info = connectedDevices.get(activeSerial);
   if (!info) { setStatus('No device connected', 'err'); return; }
-  const fileInput = document.getElementById('apk-file-input');
-  const pkgInput = document.getElementById('apk-pkg-input');
   const out = document.getElementById('apk-verify-output');
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) { setStatus('Choose an .apk file first', 'err'); return; }
-  const expectedPkg = (pkgInput.value || '').trim();
-
   showLoading('apk-verify', true);
-  out.innerHTML = '';
-  const remotePath = '/data/local/tmp/webadb_verify_' + Date.now() + '.apk';
+  out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Fetching bundled APK…</div>';
 
   try {
-    // 1) Push APK via AdbSync (the documented write API)
+    // 1) Fetch the bundled APK (served from the same origin as the page).
+    let apkBlob;
+    try {
+      apkBlob = await fetch('attestation-test.apk', { cache: 'no-store' }).then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      });
+    } catch (e) {
+      throw new Error('Could not fetch attestation-test.apk from site: ' + (e.message || e));
+    }
+
+    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Pushing APK…</div>';
+
+    // 2) Push to /data/local/tmp/ via AdbSync
     const sync = await info.adb.sync();
     try {
       await sync.write({
-        filename: remotePath,
-        file: file.stream(),
+        filename: PROBE_REMOTE_APK,
+        file: apkBlob.stream(),
         permission: 0o644,
       });
     } finally {
       await sync.dispose();
     }
 
-    // 2) Read APK cert via apksigner (Android 12+/apex on 14+)
-    let apkCertSha = '';
-    let apksignerOut = '';
+    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Installing APK…</div>';
+
+    // 3) Install (replace if a previous version exists)
     try {
-      apksignerOut = await adbShell(info.adb, 'apksigner verify --print-certs ' + remotePath);
-      // Output looks like: "Signer #1 certificate SHA-256 digest: <hex>"
-      const m = apksignerOut.match(/SHA-256 digest:\s*([0-9A-Fa-f:]+)/i);
-      if (m) apkCertSha = m[1].replace(/:/g, '').toUpperCase();
+      await adbShell(info.adb,
+        'pm install -r -t ' + PROBE_REMOTE_APK + ' 2>&1');
     } catch (e) {
-      apksignerOut = String(e.message || e);
+      throw new Error('pm install failed: ' + (e.message || e));
     }
 
-    // 3) Optionally compare against installed package cert (dumpsys package)
-    let deviceCertSha = '';
-    let devicePkgFound = '';
-    let dumpsysOut = '';
-    if (expectedPkg) {
+    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Triggering probe broadcast…</div>';
+
+    // 4) Trigger probe broadcast, wait for file to appear
+    await adbShell(info.adb,
+      'am broadcast -a ' + PROBE_BROADCAST +
+      ' -n ' + PROBE_PKG + '/.ProbeReceiver 2>&1');
+
+    // Poll briefly for the output file
+    let probeJson = '';
+    for (let attempt = 0; attempt < 10 && !probeJson; attempt++) {
       try {
-        dumpsysOut = await adbShell(info.adb, 'dumpsys package ' + expectedPkg);
-        devicePkgFound = expectedPkg;
-        // Inline format: "signatures: [AA:BB:...]" (newer Android)
-        // Or "signingConfigSigners / signer [0] / certs: AA:BB:..."
-        const inline = dumpsysOut.match(/signatures:\s*\[([0-9A-Fa-f:]+)\]/);
-        const colon = dumpsysOut.match(/certs:\s*([0-9A-Fa-f:]+)/);
-        const sha = dumpsysOut.match(/SHA-256 digest:\s*([0-9A-Fa-f:]+)/i);
-        const m = inline || colon || sha;
-        if (m) deviceCertSha = m[1].replace(/:/g, '').toUpperCase();
-      } catch (e) {
-        dumpsysOut = String(e.message || e);
+        const exists = await adbShell(info.adb,
+          'test -f ' + PROBE_REMOTE_OUT + ' && echo OK || echo MISSING');
+        if (exists.trim() === 'OK') {
+          probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
+          break;
+        }
+      } catch (e) { /* try again */ }
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (!probeJson) throw new Error('Probe did not produce ' + PROBE_REMOTE_OUT + ' within 5s');
+
+    let parsed;
+    try { parsed = JSON.parse(probeJson); }
+    catch (e) { throw new Error('Probe output is not valid JSON: ' + (e.message || e)); }
+
+    // 5) Render — every key → row
+    const renderKV = (obj, prefix) => {
+      let html = '';
+      for (const k of Object.keys(obj || {})) {
+        const v = obj[k];
+        const fullKey = prefix ? prefix + '.' + k : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          html += renderKV(v, fullKey);
+        } else if (Array.isArray(v)) {
+          html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
+            '</span><span>[' + v.length + ' item' + (v.length === 1 ? '' : 's') + ']</span></div>';
+          v.forEach((item, i) => {
+            if (item && typeof item === 'object') {
+              html += '<div style="margin-left:1rem;border-left:2px solid var(--border);padding-left:0.5rem">' +
+                renderKV(item, fullKey + '[' + i + ']') + '</div>';
+            } else {
+              html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' +
+                esc(fullKey + '[' + i + ']') + '</span><span>' + esc(String(item)) + '</span></div>';
+            }
+          });
+        } else {
+          html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
+            '</span><span style="word-break:break-all">' + esc(String(v)) + '</span></div>';
+        }
       }
-    }
-
-    // 4) Build result HTML
-    const match = (expectedPkg && apkCertSha && deviceCertSha)
-      ? (apkCertSha === deviceCertSha ? 'PASS' : 'FAIL')
-      : '';
-
-    const row = (k, v, mono) =>
-      '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(k) + '</span>' +
-      '<span style="' + (mono ? 'font-family:monospace;word-break:break-all' : '') + '">' + esc(v || '(empty)') + '</span></div>';
-
-    let html = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>APK Verification Result</h4></div>';
-    html += row('File', file.name);
-    html += row('Size', (file.size / 1024).toFixed(1) + ' KB');
-    html += row('Pushed to', remotePath);
-    html += row('APK cert SHA-256', apkCertSha, true);
-    if (expectedPkg) {
-      html += row('Expected package', expectedPkg);
-      html += row('Installed package found', devicePkgFound || '(not found)');
-      html += row('Installed cert SHA-256', deviceCertSha, true);
-      html += '<div class="pkg-detail-row"><span class="pkg-detail-label">Match</span>' +
-        '<span class="badge ' + (match === 'PASS' ? 'ok' : match === 'FAIL' ? 'err' : '') + '">' +
-        (match || 'INCONCLUSIVE — cert missing on either side') + '</span></div>';
-    } else {
-      html += '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim);margin-top:0.4rem">' +
-        'No package name provided — only APK cert SHA-256 is shown. ' +
-        'Fill the package field and click again to compare against the device-installed cert.</div>';
-    }
-    html += '</div>';
-
-    // Cache & export
-    dataCache.apkVerify = {
-      file: file.name, size_bytes: file.size, pushed_to: remotePath,
-      apk_cert_sha256: apkCertSha, expected_package: expectedPkg,
-      installed_package: devicePkgFound, installed_cert_sha256: deviceCertSha,
-      match,
-      timestamp: new Date().toISOString(),
+      return html;
     };
 
+    let html = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header">' +
+      '<h4>Attestation Probe Result</h4>' +
+      '<span style="font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim)">' +
+      esc(parsed.build?.fingerprint || '') + '</span>' +
+      '</div>';
+    html += renderKV(parsed, '');
+    html += '</div>';
     out.innerHTML = html;
-    setStatus(match === 'PASS' ? 'APK signature matches installed package' :
-              match === 'FAIL' ? 'APK signature mismatch!' :
-              'APK pushed — see result', match === 'FAIL' ? 'err' : 'ok');
 
-    // 5) Cleanup the pushed file (best-effort)
-    try { await adbShell(info.adb, 'rm -f ' + remotePath); } catch (_) {}
+    // Cache & export
+    dataCache.attestationProbe = parsed;
+
+    setStatus('Attestation probe complete', 'ok');
+
+    // 6) Best-effort cleanup: remove APK from /data/local/tmp
+    try { await adbShell(info.adb, 'rm -f ' + PROBE_REMOTE_APK); } catch (_) {}
+    // We deliberately leave the installed app + output JSON on device so the
+    // user can inspect / uninstall separately. Provide a hint to uninstall:
+    out.insertAdjacentHTML('beforeend',
+      '<div style="margin-top:0.5rem;font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim)">' +
+      'APK left installed on device. Uninstall with:<br>' +
+      '<code>adb uninstall ' + esc(PROBE_PKG) + '</code>' +
+      '</div>');
   } catch (err) {
     out.innerHTML = '<div style="color:#ff5252">' + esc(String(err.message || err)) + '</div>';
-    setStatus('Push/verify failed: ' + (err.message || err), 'err');
+    setStatus('Probe failed: ' + (err.message || err), 'err');
   }
   showLoading('apk-verify', false);
 }

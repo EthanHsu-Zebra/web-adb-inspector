@@ -12,7 +12,7 @@ Browser-based Android device inspector using WebUSB. Connect your Android device
 - **Installed Packages** — full dumpsys package data: version, SDK, UID, certs, permissions (with grant status)
 - **Key Attestation** — Verified Boot, VBMeta, DM-Verity, Flash Lock, KeyMint, StrongBox
 - **HW Trust** — KeyMint CSR retrieval (`cmd identity get_csr` for default / strongbox / TEE slots), DER SHA-256 fingerprint, copy PEM, JSON export
-- **APK Signing Verification** — push APK to device, extract cert via `apksigner verify --print-certs`, compare against installed package cert from `dumpsys package` (PASS / FAIL)
+- **Attestation Probe** — ships a bundled `attestation-test.apk` to the device, installs it, fires its probe broadcast, pulls back what an unprivileged app context can see (`Build.*`, `Settings.Secure.ANDROID_ID`, app signing cert, `AndroidKeyStore` probe with security level / key size / cert chain). Result rendered as full key-value tree; export → `AttestationProbeDeviceInfo.deviceinfo.json`.
 - **RKP Status** — Google server connectivity (`ping play.googleapis.com`), KeyMint provider, attestation, GMS, Play Integrity, Android 15 HAL-based hardware detection (NFC / Keystore / StrongBox / KeyMint / Biometrics via `service list`), standard AOSP boot security properties (with hover tooltips)
 - **ADB Shell** — custom commands with quick-access buttons
 - **JSON Export** — matches CTS `DeviceInfo.deviceinfo.json` schema exactly
@@ -54,7 +54,7 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ### Changelog
 
-- **1.1.0** — New HW Trust tab: KeyMint CSR retrieval via `cmd identity get_csr` (default / strongbox / TEE slots) with DER SHA-256 fingerprinting and PEM copy. New APK Signing Verification: push APK to device, extract cert via `apksigner verify --print-certs`, compare against installed package cert from `dumpsys package`. RKP: removed `Warranty Void (user)` row (`ro.warranty.void`, OEM-specific and redundant with `ro.boot.warranty_bit`).
+- **1.1.0** — New HW Trust tab: KeyMint CSR retrieval via `cmd identity get_csr` (default / strongbox / TEE slots) with DER SHA-256 fingerprinting and PEM copy. New Attestation Probe: ships bundled `attestation-test.apk` to device → install → broadcast → pull JSON (Build.*, AndroidKeyStore probe, signing cert, key attestation chain). RKP: removed both `Warranty Bit (boot)` and `Warranty Void (user)` rows (OEM-specific, redundant). Bumped APP_VERSION 1.0.8 → 1.1.0.
 - **1.0.8** — Fix init TypeError that silently killed header-version display
 - **1.0.7** — Fix header-version not displaying (module + DOMContentLoaded race)
 - **1.0.6** — RKP rewritten for Android 15: Google server connectivity (`ping play.googleapis.com`), HAL-based hardware detection via `service list` (no more vendor `ro.hardware.*`), standard AOSP boot security props. Package parser: fixed `version_name` parsing on Android 14 multi-KV lines. Package toggle: fixed `togglePkgDetail` selector. Header: version display.

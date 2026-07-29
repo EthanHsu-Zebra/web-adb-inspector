@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.ethan.webadb.attestation"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+
+    <!-- Standard permissions - no special privileges required. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="WebADB Attestation Probe"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.NoDisplay">
+
+        <!-- Broadcast receiver: triggered by
+               adb shell am broadcast -a io.ethan.webadb.PROBE -n io.ethan.webadb.attestation/.ProbeReceiver
+             Writes its findings to /sdcard/Download/webadb_attestation.json
+        -->
+        <receiver
+            android:name=".ProbeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.ethan.webadb.PROBE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
