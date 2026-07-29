@@ -14,9 +14,25 @@
         android:allowBackup="false"
         android:theme="@android:style/Theme.NoDisplay">
 
+        <!-- Dummy LAUNCHER activity. The activity itself does nothing visible
+             (Theme.NoDisplay + immediately finish), but its mere existence
+             allows monkey to start the app process. Without a started
+             process, Android 14+ silently drops broadcasts to installed
+             receivers even with explicit component + user 0 flag.
+        -->
+        <activity
+            android:name=".BootActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <!-- Broadcast receiver: triggered by
                adb shell am broadcast -a io.ethan.webadb.PROBE -n io.ethan.webadb.attestation/.ProbeReceiver
-             Writes its findings to /sdcard/Download/webadb_attestation.json
+             Writes its findings to /data/local/tmp/webadb_attestation.json
         -->
         <receiver
             android:name=".ProbeReceiver"

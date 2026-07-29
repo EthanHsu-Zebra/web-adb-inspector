@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.3';
+const APP_VERSION = '1.1.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1320,25 +1320,54 @@ async function runAttestationProbe() {
 
     out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Installing APK…</div>';
 
-    // 3) Install (replace if a previous version exists)
+    // 3) Install (replace if a previous version exists). pm install prints
+    //    "Success" / "Failure [INSTALL_FAILED_...]" — capture both streams
+    //    and surface as a real error if it failed.
+    let installOut = '';
     try {
-      await adbShell(info.adb,
+      installOut = await adbShell(info.adb,
         'pm install -r -t ' + PROBE_REMOTE_APK + ' 2>&1');
     } catch (e) {
       throw new Error('pm install failed: ' + (e.message || e));
     }
+    if (!/Success/i.test(installOut)) {
+      throw new Error('pm install did not report Success: ' + installOut.trim());
+    }
+
+    // 3b) Confirm the package is actually present on the device.
+    try {
+      const verify = await adbShell(info.adb,
+        'pm path ' + PROBE_PKG + ' 2>&1');
+      if (!/package:/i.test(verify)) {
+        throw new Error('pm path returned no path for ' + PROBE_PKG + ': ' + verify.trim());
+      }
+    } catch (e) {
+      throw new Error('Package verification failed: ' + (e.message || e));
+    }
+
+    // 3c) On Android 14+, an installed app with no activities and no
+    //     started process cannot receive broadcasts. Boot the app via
+    //     `monkey -p <pkg> 1` to ensure its process is alive, then
+    //     broadcast. The receiver will then fire normally.
+    try {
+      await adbShell(info.adb, 'monkey -p ' + PROBE_PKG + ' -c android.intent.category.LAUNCHER 1 2>&1');
+    } catch (_) { /* monkey may fail if no LAUNCHER; that's fine — process still starts */ }
 
     out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Triggering probe broadcast…</div>';
 
-    // 4) Trigger probe broadcast, wait for file to appear
-    //    Broadcast to a freshly-installed app on Android 14+ may take a
-    //    moment to actually deliver, and the receiver's KeyMint probe can
-    //    take 5-15s on first invocation (HAL init). Poll up to 30s.
-    await adbShell(info.adb,
-      'am broadcast -a ' + PROBE_BROADCAST +
-      ' -n ' + PROBE_PKG + '/.ProbeReceiver --user 0 2>&1');
+    // 4) Trigger probe broadcast. -S (sticky) waits for receivers to finish
+    //    and reports how many actually received the broadcast, so we can
+    //    tell "broadcast queued but no receiver ran" from "receiver ran".
+    let broadcastOut = '';
+    try {
+      broadcastOut = await adbShell(info.adb,
+        'am broadcast -S -a ' + PROBE_BROADCAST +
+        ' -n ' + PROBE_PKG + '/.ProbeReceiver --user 0 2>&1');
+    } catch (e) {
+      throw new Error('am broadcast failed: ' + (e.message || e));
+    }
 
-    // Poll briefly for the output file
+    // Poll for the output file (probe receiver touches it on entry).
     let probeJson = '';
     for (let attempt = 0; attempt < 60 && !probeJson; attempt++) {
       try {
@@ -1353,13 +1382,13 @@ async function runAttestationProbe() {
     }
 
     if (!probeJson) {
-      // Pull whatever we have to help the user debug — could be empty
-      // (receiver never fired) or partial (later step threw).
       let debugInfo = '';
       try { debugInfo = await readDeviceFile(info.adb, PROBE_REMOTE_OUT); } catch(_) {}
-      throw new Error('Probe did not produce ' + PROBE_REMOTE_OUT +
-        ' within 30s. Receiver may not have fired. File on device: ' +
-        (debugInfo ? `'${debugInfo.slice(0, 200)}'` : '(empty)'));
+      throw new Error(
+        'Probe did not produce ' + PROBE_REMOTE_OUT + ' within 30s.\n' +
+        'pm install: ' + installOut.trim() + '\n' +
+        'broadcast: ' + broadcastOut.trim() + '\n' +
+        'file on device: ' + (debugInfo ? `'${debugInfo.slice(0, 200)}'` : '(empty / not created)'));
     }
 
     let parsed;

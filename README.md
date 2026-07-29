@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.3
+**Current:** 1.1.4
 
 ### Changelog
+
+- **1.1.4** — Attestation Probe: APK now ships a LAUNCHER activity (`BootActivity`, Theme.NoDisplay, immediately `finish()`). Without a started app process, Android 14+ silently drops broadcasts to installed receivers even with `--user 0` / explicit component. Site now calls `monkey -p <pkg> 1` after install to start the process. `pm install` result is now parsed for `Success`; `pm path <pkg>` confirms the package is actually present; `am broadcast -S` (sticky, blocking) reports how many receivers actually fired. Error message now includes pm install + broadcast output for diagnosis. Bumped APP_VERSION 1.1.3 → 1.1.4.
 
 - **1.1.3** — Attestation Probe: add immediate file touch in `onReceive` (so host can detect receiver firing vs. silent failure), add `--user 0` to broadcast flag (Android 14+ delivery fix), poll timeout 5s → 30s with 500ms interval (KeyMint HAL init can take 10-15s), error message now reports whatever the file contains if it exists (empty vs partial). APK signing cert: fall back to deprecated `PackageManager.GET_SIGNATURES` path when `SigningInfo` path returns the empty v1-scheme blob (this APK is debug-signed with v1 only). Packages export: `sha256_file` now labeled `(requires root/run-as to read APK)` — it's a sandbox limit, not a parser bug. Bumped APP_VERSION 1.1.2 → 1.1.3.
 
