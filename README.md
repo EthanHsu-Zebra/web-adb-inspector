@@ -50,11 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.20
+**Current:** 1.1.21
 
 ### Changelog
 
-- **1.1.20** — USB disconnect: replaced heartbeat polling with `USBConnection.closed` promise — native WebUSB event fires instantly on physical cable removal, no polling needed. Bumped APP_VERSION 1.1.19 -> 1.1.20.
+- **1.1.21** — USB disconnect: added `handleUsbError()` to catch "transfer was cancelled" errors on ADB operations mid-disconnect. Each device card now has its own Disconnect button. ADB operations (Properties, Features, Packages, Attestation, Shell, RKP) all check for USB errors and trigger clean disconnect. Bumped APP_VERSION 1.1.20 -> 1.1.21.
 - **1.1.19** — USB disconnect detection: added heartbeat ping every 5s as fallback for browsers where `navigator.usb` disconnect event fires but serial/vendorId match fails. Bumped APP_VERSION 1.1.18 -> 1.1.19.
 - **1.1.17** — Probe results now persist per device (dataCache.probeBySerial) — switching away and back restores previous probe output. Shell tab: removed Quick Checks and per-button consoles — back to single ADB Shell with input + Run + Clear. Bumped APP_VERSION 1.1.16 -> 1.1.17.
 - **1.1.14** — Shell tab: per-button independent console outputs (Android Ver, Model, Hardware, Battery, Display, WiFi each has their own output panel — no more mixed output). Added "Clear All" button to clear all panels at once. RKP tab: filter out invalid/unset items (empty, "Not set", "Not found", "Not installed" rows are hidden). HW Trust tab: `fetchCSR` now properly detects `cmd identity` errors ("Can't find service", etc.) and shows clean error message instead of crashing with atob decode error. Removed dead APK probe constants. Bumped APP_VERSION 1.1.13 -> 1.1.14.

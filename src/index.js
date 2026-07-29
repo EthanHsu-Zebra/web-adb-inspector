@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.20';
+const APP_VERSION = '1.1.21';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -96,6 +96,29 @@ async function scanDevices() {
   }
 }
 
+// Helper: handle "transfer was cancelled" errors from WebUSB
+// These fire when USB drops mid-operation — treat as disconnect
+function handleUsbError(err, serial) {
+  if (err && typeof err === 'object' && 'message' in err && err.message && err.message.includes('transfer was cancelled')) {
+    if (connectedDevices.has(serial)) {
+      setStatus('Device disconnected (USB transfer error): ' + serial, 'warn');
+      try { connectedDevices.get(serial)?.transport?.close(); } catch(ex) {}
+      connectedDevices.delete(serial);
+      if (activeSerial === serial) {
+        activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+      }
+      renderDeviceList();
+      if (activeSerial) {
+        selectDevice(activeSerial);
+      } else {
+        document.getElementById('inspector-section').classList.add('hidden');
+      }
+    }
+    return true; // handled
+  }
+  return false;
+}
+
 // Global USB disconnect handler (USBDevice.addEventListener not supported in all browsers)
 let _usbDisconnectHandler = null;
 
@@ -109,15 +132,16 @@ async function connectDevice(usbDevice) {
       initialDelayedAckBytes: ADB_DAEMON_DEFAULT_INITIAL_PAYLOAD_SIZE,
     });
 
+    const adb = new Adb(transport);
+
     // Event-driven disconnect: connection.closed resolves on physical USB removal
-    const serialPromise = Promise.resolve(usbDevice.serial || 'usb');
-    connection.closed.catch(() => {}).then(async () => {
-      const s = await serialPromise.catch(() => 'unknown');
-      if (connectedDevices.has(s)) {
-        setStatus('Device disconnected: ' + s, 'warn');
+    const adbSerial = adb.serial;
+    connection.closed.then(() => {
+      if (connectedDevices.has(adbSerial)) {
+        setStatus('Device disconnected: ' + adbSerial, 'warn');
         try { transport.close(); } catch(ex) {}
-        connectedDevices.delete(s);
-        if (activeSerial === s) {
+        connectedDevices.delete(adbSerial);
+        if (activeSerial === adbSerial) {
           activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
         }
         renderDeviceList();
@@ -127,9 +151,7 @@ async function connectDevice(usbDevice) {
           document.getElementById('inspector-section').classList.add('hidden');
         }
       }
-    });
-
-    const adb = new Adb(transport);
+    }).catch(() => {});
     let displayName = usbDevice.name || 'Android Device';
     try {
       const model = await adb.getProp('ro.product.model');
@@ -148,12 +170,11 @@ async function connectDevice(usbDevice) {
     if (!_usbDisconnectHandler) {
       _usbDisconnectHandler = (e) => {
         const dev = e.device;
-        // Match by vendorId+productId (always present) or serial (may be null after disconnect)
+        // Match by vendorId+productId (always present) — serial can be null after disconnect
         for (const [serial, info] of connectedDevices) {
           const uid = info._usbId;
           if (!uid) continue;
-          const match = (uid.vendorId === dev.vendorId && uid.productId === dev.productId)
-            && (uid.serial === dev.serial || !uid.serial || !dev.serial);
+          const match = uid.vendorId === dev.vendorId && uid.productId === dev.productId;
           if (match) {
             setStatus('Device disconnected: ' + serial, 'warn');
             try { info.transport.close(); } catch(ex) {}
@@ -216,7 +237,9 @@ function renderDeviceList() {
       ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
       <div class="dev-name">${esc(info._displayName || serial)}</div>
       <div class="dev-serial">${esc(serial)}</div>
-    </div><span class="dev-status" style="color:var(--green)">Connected</span>`;
+    </div>
+    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected</span>
+    <button class="btn btn-sm" style="margin-left:0.5rem" onclick="event.stopPropagation();disconnectOne('${serial}')">Disconnect</button>`;
     card.onclick = () => selectDevice(serial);
     list.appendChild(card);
   }
@@ -279,6 +302,23 @@ function selectDevice(serial) {
   fetchPackages();
   fetchAttestation();
   fetchRKP();
+}
+
+async function disconnectOne(serial) {
+  const info = connectedDevices.get(serial);
+  if (!info) return;
+  try { info.transport.close(); } catch(e) {}
+  connectedDevices.delete(serial);
+  if (activeSerial === serial) {
+    activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+  }
+  renderDeviceList();
+  if (activeSerial) {
+    selectDevice(activeSerial);
+  } else {
+    document.getElementById('inspector-section').classList.add('hidden');
+  }
+  setStatus('Device disconnected: ' + serial, 'warn');
 }
 
 async function disconnectDevice() {
@@ -1143,6 +1183,7 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 window.dataCache = dataCache;
 window.scanDevices = scanDevices;
 window.disconnectDevice = disconnectDevice;
+window.disconnectOne = disconnectOne;
 window.switchTab = switchTab;
 window.runShell = runShell;
 
