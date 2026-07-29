@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.24';
+const APP_VERSION = '1.1.25';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -97,13 +97,16 @@ async function scanDevices() {
     }
     const unconnected = granted.filter(d => {
       const key = d.vendorId + ':' + d.productId + ':' + (d.serial || '');
-      return !connectedIds.has(key);
+      // Skip if already connected OR already opened (stale from previous session)
+      if (connectedIds.has(key)) return false;
+      if (d.opened) return false;
+      return true;
     });
 
     if (unconnected.length > 0) {
       // Show custom picker for already-granted unconnected devices
       if (unconnected.length === 1) {
-        await connectDevice(unconnected[0]);
+        await connectDevice(unconnected[0]).catch(e => setStatus('Failed: ' + e.message, 'err'));
         return;
       }
       await showDevicePicker(unconnected);
@@ -144,7 +147,7 @@ async function showDevicePicker(devices) {
       const name = dev.name || 'USB Device';
       const serial = dev.serial || 'N/A';
       row.innerHTML = `<div style="flex:1;"><div style="font-weight:500;">${name}</div><div style="font-size:12px;color:#a6adc6;">${serial}</div></div><div style="font-size:12px;color:#a6adc6;">${dev.vendorId && dev.productId ? 'VID:'+dev.vendorId+' PID:'+dev.productId : ''}</div>`;
-      row.onclick = () => { cleanup(); connectDevice(dev); resolve(); };
+      row.onclick = () => { cleanup(); connectDevice(dev).catch(e => setStatus('Failed: ' + e.message, 'err')); resolve(); };
       list.appendChild(row);
     }
     box.appendChild(list);
@@ -192,6 +195,11 @@ let _usbDisconnectHandler = null;
 
 async function connectDevice(usbDevice) {
   try {
+    // Guard: ensure we have a valid USBDevice with connect()
+    if (!usbDevice || typeof usbDevice.connect !== 'function') {
+      setStatus('Invalid device object — please reconnect', 'err');
+      return;
+    }
     setStatus('Connecting...', 'connecting');
     const connection = await usbDevice.connect();
     const transport = await AdbDaemonTransport.authenticate({
