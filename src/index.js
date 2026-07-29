@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.7';
+const APP_VERSION = '1.1.8';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1345,7 +1345,7 @@ async function runAttestationProbe() {
     // Confirm the file landed on device
     await runShell('ls -la ' + PROBE_REMOTE_APK, 'verify pushed APK');
 
-    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Launching probe activity…</div>';
+    out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Querying probe provider…</div>';
 
     // 3) Install (replace if a previous version exists). pm install prints
     //    "Success" / "Failure [INSTALL_FAILED_...]" — capture both streams
@@ -1370,19 +1370,20 @@ async function runAttestationProbe() {
       throw new Error('Package verification failed: ' + (e.message || e));
     }
 
-    // 3c) On Android 14+, an installed app with no activities and no
-    //     started process cannot receive broadcasts (result=0 even when
-    //     --user 0 / explicit component are used). Launch the LAUNCHER
-    //     activity we ship in the APK — it runs the probe synchronously
-    //     in onCreate, then finishes. This is the only reliable way to
-    //     get user-space Java code running from an adb shell context.
+    // 3c) Probe entry point. We've tried broadcasts and Activity launches;
+    //     Android 14+ silently drops both for unprivileged user apps in
+    //     the cold-process state. ContentProvider.query() is different: the
+    //     system *must* instantiate every provider declared in the manifest
+    //     before a client can bind to it, regardless of background-app
+    //     restrictions. `adb shell content query` triggers that path.
     let launchOut = '';
     try {
-      launchOut = await runShell('am start -W -n ' + PROBE_PKG + '/.BootActivity --user 0', 'am start BootActivity');
+      launchOut = await runShell(
+        'content query --uri content://io.ethan.webadb.attestation.provider/probe 2>&1',
+        'content query BootProvider');
     } catch (e) {
-      // Surface but continue — sometimes am start prints "Warning" but
-      // the activity still ran. Final file check below is the source of truth.
-      dbgLog('am start exception (continuing): ' + (e.message || e));
+      // Surface but continue — the final file check below is the truth.
+      dbgLog('content query exception (continuing): ' + (e.message || e));
     }
     // Verify the file landed on device immediately after the launch.
     await runShell('ls -la ' + PROBE_REMOTE_OUT + ' 2>&1', 'ls output file');

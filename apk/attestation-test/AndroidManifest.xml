@@ -41,5 +41,17 @@
                 <action android:name="io.ethan.webadb.PROBE" />
             </intent-filter>
         </receiver>
+
+        <!-- ContentProvider probe entry point. The host site calls
+             adb shell "content query" against this URI, which is
+             guaranteed to instantiate this provider (and thus the app
+             process) before returning, regardless of Android 14+
+             background-app broadcast restrictions that have been
+             blocking Activity launches silently for the user.
+        -->
+        <provider
+            android:name=".BootProvider"
+            android:authorities="io.ethan.webadb.attestation.provider"
+            android:exported="true" />
     </application>
 </manifest>
