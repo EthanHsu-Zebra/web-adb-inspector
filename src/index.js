@@ -220,20 +220,30 @@ async function connectDevice(usbDevice) {
       displayName = brand + ' ' + model;
     } catch (_) {}
 
-    // Polling fallback: check usbDevice.opened every 1s
+    // Polling fallback: ping USB control endpoint every 2s
     const hbKey = 'hb-' + adbSerial;
-    console.log('[heartbeat] starting for', adbSerial, 'interval=', window[hbKey] ? 'ALREADY_EXISTS' : 'NEW');
-    window[hbKey] = setInterval(() => {
+    console.log('[heartbeat] starting for', adbSerial);
+    window[hbKey] = setInterval(async () => {
       if (!connectedDevices.has(adbSerial)) {
         clearInterval(window[hbKey]);
         delete window[hbKey];
         return;
       }
-      // usbDevice.opened flips to false instantly on physical USB disconnect
-      if (!usbDevice.opened) {
+      // Visible counter
+      window['_hbCount_' + adbSerial] = (window['_hbCount_' + adbSerial] || 0) + 1;
+      const statusEl = document.querySelector('[data-status="' + adbSerial + '"]');
+      if (statusEl) statusEl.textContent = 'Connected (hbt:' + window['_hbCount_' + adbSerial] + ')';
+      // Ping USB control endpoint — throws instantly if physically disconnected
+      try {
+        await Promise.race([
+          usbDevice.controlTransferOut({bRequestType:0, bRequest:0, wValue:0, wIndex:0}, new Uint8Array(0)),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500))
+        ]);
+      } catch (e) {
+        if (!connectedDevices.has(adbSerial)) return;
         clearInterval(window[hbKey]);
         delete window[hbKey];
-        console.log('[heartbeat] DISCONNECT DETECTED! Device', adbSerial, 'usbDevice.opened=false, opened attr:', usbDevice.opened);
+        console.log('[heartbeat] DISCONNECT:', adbSerial, e.message);
         try { transport.close(); } catch(ex) {}
         connectedDevices.delete(adbSerial);
         if (activeSerial === adbSerial) {
@@ -247,7 +257,7 @@ async function connectDevice(usbDevice) {
           document.getElementById('inspector-section').classList.add('hidden');
         }
       }
-    }, 1000);
+    }, 2000);
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
     // Store USB identifiers at connect time for reliable disconnect matching
@@ -323,7 +333,8 @@ function renderDeviceList() {
     const nick = deviceNicknames[serial] || '';
     const card = document.createElement('div');
     card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
-    const hbActive = window['hb-' + serial] ? ' (hbt)' : '';
+    const hbCounter = window['_hbCount_' + serial] || 0;
+    const hbActive = window['hb-' + serial] ? ' (hbt:' + hbCounter + ')' : '';
     card.innerHTML = `<div>
       ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
       <div class="dev-name">${esc(info._displayName || serial)}</div>

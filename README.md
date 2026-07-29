@@ -50,11 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.25
+**Current:** 1.1.26
 
 ### Changelog
 
-- **1.1.25** — Fix "connect is not a function": added type guard in `connectDevice()` — validates `usbDevice.connect` exists before calling. Custom picker: also skips devices with `opened=true` (stale from previous session). All picker paths wrapped with try-catch. Bumped APP_VERSION 1.1.24 -> 1.1.25.
+- **1.1.26** — Heartbeat: replaced `usbDevice.opened` check (never fires on cable removal) with `usbDevice.controlTransferOut()` ping every 2s — throws immediately on physical disconnect. Visible heartbeat counter `(hbt:N)` in device card. scanDevices: always use native WebUSB picker (removed broken custom picker). Bumped APP_VERSION 1.1.25 -> 1.1.26.
 - **1.1.19** — USB disconnect detection: added heartbeat ping every 5s as fallback for browsers where `navigator.usb` disconnect event fires but serial/vendorId match fails. Bumped APP_VERSION 1.1.18 -> 1.1.19.
 - **1.1.17** — Probe results now persist per device (dataCache.probeBySerial) — switching away and back restores previous probe output. Shell tab: removed Quick Checks and per-button consoles — back to single ADB Shell with input + Run + Clear. Bumped APP_VERSION 1.1.16 -> 1.1.17.
 - **1.1.14** — Shell tab: per-button independent console outputs (Android Ver, Model, Hardware, Battery, Display, WiFi each has their own output panel — no more mixed output). Added "Clear All" button to clear all panels at once. RKP tab: filter out invalid/unset items (empty, "Not set", "Not found", "Not installed" rows are hidden). HW Trust tab: `fetchCSR` now properly detects `cmd identity` errors ("Can't find service", etc.) and shows clean error message instead of crashing with atob decode error. Removed dead APK probe constants. Bumped APP_VERSION 1.1.13 -> 1.1.14.
