@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.23';
+const APP_VERSION = '1.1.24';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -82,30 +82,80 @@ function showADBReleaseDialog() {
 }
 
 // --- Device Discovery ---
+// Custom device picker: show only unconnected ADB-compatible USB devices
 async function scanDevices() {
-  const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
-  if (!mgr) return;
   try {
-    const device = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
-    if (!device) return;
-    // Check if already connected
-    const existingSerial = device.serial || 'usb';
-    for (const [serial, info] of connectedDevices) {
-      if (info._usbId && info._usbId.vendorId === device.vendorId && info._usbId.productId === device.productId) {
-        // Could be same device with same serial — skip
-        if (info._usbId.serial === existingSerial) {
-          setStatus('Device already connected: ' + serial, 'warn');
-          selectDevice(serial);
-          return;
-        }
+    // Get all available ADB USB devices (includes already-connected ones)
+    const available = await navigator.usb.getDevices();
+    // Filter out devices already in connectedDevices
+    const connectedIds = new Set();
+    for (const [, info] of connectedDevices) {
+      if (info._usbId) {
+        const key = info._usbId.vendorId + ':' + info._usbId.productId + ':' + (info._usbId.serial || '');
+        connectedIds.add(key);
       }
     }
-    await connectDevice(device);
+    const unconnected = available.filter(d => {
+      const key = d.vendorId + ':' + d.productId + ':' + (d.serial || '');
+      return !connectedIds.has(key);
+    });
+
+    if (unconnected.length === 0) {
+      setStatus('All available devices are already connected', 'warn');
+      return;
+    }
+
+    // If only one unconnected device, connect directly
+    if (unconnected.length === 1) {
+      await connectDevice(unconnected[0]);
+      return;
+    }
+
+    // Multiple candidates: show custom picker
+    await showDevicePicker(unconnected);
   } catch (err) {
-    const msg = err.message || String(err);
-    if (msg.includes('already in use')) showADBReleaseDialog();
-    else setStatus('Failed: ' + msg, 'err');
+    setStatus('Failed: ' + (err.message || String(err)), 'err');
   }
+}
+
+// Custom device picker UI — list unconnected devices in a modal
+async function showDevicePicker(devices) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+    overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
+
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:320px;max-width:500px;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+    box.innerHTML = '<h3 style="margin:0 0 16px;font-size:18px;">Select Device</h3>';
+
+    const list = document.createElement('div');
+    for (const dev of devices) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:12px;border-radius:8px;cursor:pointer;transition:background 0.15s;border:1px solid transparent;margin-bottom:4px;';
+      row.onmouseover = () => { row.style.background = '#313244'; row.style.borderColor = '#89b4fa'; };
+      row.onmouseout = () => { row.style.background = 'transparent'; row.style.borderColor = 'transparent'; };
+      const name = dev.name || 'USB Device';
+      const serial = dev.serial || 'N/A';
+      row.innerHTML = `<div style="flex:1;"><div style="font-weight:500;">${name}</div><div style="font-size:12px;color:#a6adc6;">${serial}</div></div><div style="font-size:12px;color:#a6adc6;">${dev.vendorId && dev.productId ? 'VID:'+dev.vendorId+' PID:'+dev.productId : ''}</div>`;
+      row.onclick = () => { cleanup(); connectDevice(dev); resolve(); };
+      list.appendChild(row);
+    }
+    box.appendChild(list);
+
+    const cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText = 'margin-top:16px;padding:8px 20px;border-radius:6px;border:1px solid #585b70;background:#313244;color:#cdd6f4;cursor:pointer;font-size:14px;';
+    cancel.onclick = () => { cleanup(); resolve(); };
+    box.appendChild(cancel);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    function cleanup() {
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    }
+  });
 }
 
 // Helper: handle "transfer was cancelled" errors from WebUSB
@@ -174,38 +224,36 @@ async function connectDevice(usbDevice) {
     } catch (_) {}
 
     // Polling fallback: check ADB responsiveness every 3s
-    // This catches disconnects when browser events (navigator.usb / connection.closed) don't fire
-    const heartbeatKey = 'heartbeat-' + adbSerial;
-    window[heartbeatKey] = setInterval(() => {
+    // This catches disconnects when browser events don't fire
+    const hbKey = 'hb-' + adbSerial;
+    window[hbKey] = setInterval(() => {
       if (!connectedDevices.has(adbSerial)) {
-        clearInterval(window[heartbeatKey]);
-        delete window[heartbeatKey];
+        clearInterval(window[hbKey]);
+        delete window[hbKey];
         return;
       }
-      (async () => {
-        try {
-          await adb.getProp('ro.build.id');
-        } catch (e) {
-          // ADB operation failed — device likely disconnected
-          clearInterval(window[heartbeatKey]);
-          delete window[heartbeatKey];
-          if (connectedDevices.has(adbSerial)) {
-            console.log('[heartbeat] Device ' + adbSerial + ' lost');
-            try { transport.close(); } catch(ex) {}
-            connectedDevices.delete(adbSerial);
-            if (activeSerial === adbSerial) {
-              activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
-            }
-            renderDeviceList();
-            setStatus('Device disconnected: ' + adbSerial, 'warn');
-            if (activeSerial) {
-              selectDevice(activeSerial);
-            } else {
-              document.getElementById('inspector-section').classList.add('hidden');
-            }
-          }
+      // Use Promise.race for timeout — adb.getProp can hang forever when USB drops
+      Promise.race([
+        adb.getProp('ro.build.id'),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000))
+      ]).catch((e) => {
+        if (!connectedDevices.has(adbSerial)) return;
+        clearInterval(window[hbKey]);
+        delete window[hbKey];
+        console.log('[heartbeat] Device ' + adbSerial + ' lost: ' + e.message);
+        try { transport.close(); } catch(ex) {}
+        connectedDevices.delete(adbSerial);
+        if (activeSerial === adbSerial) {
+          activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
         }
-      })();
+        renderDeviceList();
+        setStatus('Device disconnected: ' + adbSerial, 'warn');
+        if (activeSerial) {
+          selectDevice(activeSerial);
+        } else {
+          document.getElementById('inspector-section').classList.add('hidden');
+        }
+      });
     }, 3000);
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)

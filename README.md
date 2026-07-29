@@ -50,11 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.23
+**Current:** 1.1.24
 
 ### Changelog
 
-- **1.1.23** — Disconnect reliability: added 3s polling heartbeat (`adb.getProp("ro.build.id")`) as last-resort fallback for browsers where both `navigator.usb` disconnect event and `connection.closed` promise silently fail. Multi-device: `+ Connect Device` button can be tapped repeatedly to add more devices — each opens a fresh WebUSB picker. Bumped APP_VERSION 1.1.22 -> 1.1.23.
+- **1.1.24** — Connect Device: custom picker shows only unconnected devices (filters by VID:PID:serial). Heartbeat: added 2s timeout via `Promise.race` — `adb.getProp` hangs forever when USB drops, now properly times out. Single unconnected device auto-connects without picker. Bumped APP_VERSION 1.1.23 -> 1.1.24.
 - **1.1.19** — USB disconnect detection: added heartbeat ping every 5s as fallback for browsers where `navigator.usb` disconnect event fires but serial/vendorId match fails. Bumped APP_VERSION 1.1.18 -> 1.1.19.
 - **1.1.17** — Probe results now persist per device (dataCache.probeBySerial) — switching away and back restores previous probe output. Shell tab: removed Quick Checks and per-button consoles — back to single ADB Shell with input + Run + Clear. Bumped APP_VERSION 1.1.16 -> 1.1.17.
 - **1.1.14** — Shell tab: per-button independent console outputs (Android Ver, Model, Hardware, Battery, Display, WiFi each has their own output panel — no more mixed output). Added "Clear All" button to clear all panels at once. RKP tab: filter out invalid/unset items (empty, "Not set", "Not found", "Not installed" rows are hidden). HW Trust tab: `fetchCSR` now properly detects `cmd identity` errors ("Can't find service", etc.) and shows clean error message instead of crashing with atob decode error. Removed dead APK probe constants. Bumped APP_VERSION 1.1.13 -> 1.1.14.
