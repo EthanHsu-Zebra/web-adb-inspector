@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.26';
+const APP_VERSION = '1.1.27';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -229,21 +229,23 @@ async function connectDevice(usbDevice) {
         delete window[hbKey];
         return;
       }
-      // Visible counter
+      // Visible counter — only update the counter span, never touch the "Connected" text
       window['_hbCount_' + adbSerial] = (window['_hbCount_' + adbSerial] || 0) + 1;
-      const statusEl = document.querySelector('[data-status="' + adbSerial + '"]');
-      if (statusEl) statusEl.textContent = 'Connected (hbt:' + window['_hbCount_' + adbSerial] + ')';
+      const counterEl = document.querySelector('[data-hb="' + adbSerial + '"]');
+      if (counterEl) counterEl.textContent = '(hbt:' + window['_hbCount_' + adbSerial] + ')';
       // Ping USB control endpoint — throws instantly if physically disconnected
+      const pingStart = Date.now();
       try {
         await Promise.race([
           usbDevice.controlTransferOut({bRequestType:0, bRequest:0, wValue:0, wIndex:0}, new Uint8Array(0)),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500))
         ]);
       } catch (e) {
+        const pingMs = Date.now() - pingStart;
+        console.log('[heartbeat] PING FAILED:', adbSerial, pingMs + 'ms', e.message);
         if (!connectedDevices.has(adbSerial)) return;
         clearInterval(window[hbKey]);
         delete window[hbKey];
-        console.log('[heartbeat] DISCONNECT:', adbSerial, e.message);
         try { transport.close(); } catch(ex) {}
         connectedDevices.delete(adbSerial);
         if (activeSerial === adbSerial) {
@@ -333,15 +335,19 @@ function renderDeviceList() {
     const nick = deviceNicknames[serial] || '';
     const card = document.createElement('div');
     card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
-    const hbCounter = window['_hbCount_' + serial] || 0;
-    const hbActive = window['hb-' + serial] ? ' (hbt:' + hbCounter + ')' : '';
     card.innerHTML = `<div>
       ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
       <div class="dev-name">${esc(info._displayName || serial)}</div>
       <div class="dev-serial">${esc(serial)}</div>
     </div>
-    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected${hbActive}</span>
+    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected <span class="hb-counter" data-hb="${serial}"></span></span>
     <button class="btn btn-sm" style="margin-left:0.5rem" onclick="event.stopPropagation();disconnectOne('${serial}')">Disconnect</button>`;
+    // Restore heartbeat counter if running
+    const hbCount = window['_hbCount_' + serial] || 0;
+    if (hbCount > 0) {
+      const counterEl = card.querySelector('.hb-counter');
+      if (counterEl) counterEl.textContent = '(hbt:' + hbCount + ')';
+    }
     card.onclick = () => selectDevice(serial);
     list.appendChild(card);
   }
