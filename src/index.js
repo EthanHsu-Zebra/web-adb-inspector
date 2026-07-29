@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.18';
+const APP_VERSION = '1.1.19';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -99,6 +99,37 @@ async function scanDevices() {
 // Global USB disconnect handler (USBDevice.addEventListener not supported in all browsers)
 let _usbDisconnectHandler = null;
 
+// Heartbeat: ping every connected device, remove dead ones
+function heartbeatDevices() {
+  const dead = [];
+  const timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));
+  for (const [serial, info] of connectedDevices) {
+    Promise.race([info.adb.getProp('ro.build.id'), timeout(3000)]).then(
+      () => {},
+      () => dead.push(serial)
+    ).catch(() => dead.push(serial));
+  }
+  // After ping window, process dead devices
+  setTimeout(() => {
+    for (const serial of dead) {
+      if (!connectedDevices.has(serial)) continue;
+      const info = connectedDevices.get(serial);
+      setStatus('Device disconnected (heartbeat): ' + serial, 'warn');
+      try { info.transport.close(); } catch(ex) {}
+      connectedDevices.delete(serial);
+      if (activeSerial === serial) {
+        activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+      }
+      renderDeviceList();
+      if (activeSerial) {
+        selectDevice(activeSerial);
+      } else {
+        document.getElementById('inspector-section').classList.add('hidden');
+      }
+    }
+  }, 4000);
+}
+
 async function connectDevice(usbDevice) {
   try {
     setStatus('Connecting...', 'connecting');
@@ -157,6 +188,11 @@ async function connectDevice(usbDevice) {
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adb.serial);
     setStatus('Connected', 'ok');
+
+    // Start heartbeat if not already running
+    if (!window._adbHeartbeat) {
+      window._adbHeartbeat = setInterval(heartbeatDevices, 5000);
+    }
   } catch (err) {
     const msg = err.message || String(err);
     if (msg.includes('already in use')) showADBReleaseDialog();
