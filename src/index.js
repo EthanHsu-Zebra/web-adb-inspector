@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.21';
+const APP_VERSION = '1.1.22';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -88,11 +88,23 @@ async function scanDevices() {
   try {
     const device = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
     if (!device) return;
+    // Check if already connected
+    const existingSerial = device.serial || 'usb';
+    for (const [serial, info] of connectedDevices) {
+      if (info._usbId && info._usbId.vendorId === device.vendorId && info._usbId.productId === device.productId) {
+        // Could be same device with same serial — skip
+        if (info._usbId.serial === existingSerial) {
+          setStatus('Device already connected: ' + serial, 'warn');
+          selectDevice(serial);
+          return;
+        }
+      }
+    }
     await connectDevice(device);
   } catch (err) {
     const msg = err.message || String(err);
     if (msg.includes('already in use')) showADBReleaseDialog();
-    else alert('Failed: ' + msg);
+    else setStatus('Failed: ' + msg, 'err');
   }
 }
 
@@ -134,24 +146,26 @@ async function connectDevice(usbDevice) {
 
     const adb = new Adb(transport);
 
-    // Event-driven disconnect: connection.closed resolves on physical USB removal
+    // Event-driven disconnect via connection.closed (when available)
     const adbSerial = adb.serial;
-    connection.closed.then(() => {
-      if (connectedDevices.has(adbSerial)) {
-        setStatus('Device disconnected: ' + adbSerial, 'warn');
-        try { transport.close(); } catch(ex) {}
-        connectedDevices.delete(adbSerial);
-        if (activeSerial === adbSerial) {
-          activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+    if (connection && typeof connection.closed === 'object') {
+      connection.closed.then(() => {
+        if (connectedDevices.has(adbSerial)) {
+          setStatus('Device disconnected: ' + adbSerial, 'warn');
+          try { transport.close(); } catch(ex) {}
+          connectedDevices.delete(adbSerial);
+          if (activeSerial === adbSerial) {
+            activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+          }
+          renderDeviceList();
+          if (activeSerial) {
+            selectDevice(activeSerial);
+          } else {
+            document.getElementById('inspector-section').classList.add('hidden');
+          }
         }
-        renderDeviceList();
-        if (activeSerial) {
-          selectDevice(activeSerial);
-        } else {
-          document.getElementById('inspector-section').classList.add('hidden');
-        }
-      }
-    }).catch(() => {});
+      }).catch(() => {});
+    }
     let displayName = usbDevice.name || 'Android Device';
     try {
       const model = await adb.getProp('ro.product.model');
