@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.28';
+const APP_VERSION = '1.1.29';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -220,31 +220,29 @@ async function connectDevice(usbDevice) {
       displayName = brand + ' ' + model;
     } catch (_) {}
 
-    // Polling fallback: ping USB control endpoint every 2s
+    // Polling fallback: adb.getProp() with 1s timeout every 3s
     const hbKey = 'hb-' + adbSerial;
-    console.log('[heartbeat] starting for', adbSerial);
-    window[hbKey] = setInterval(async () => {
+    const hbInterval = setInterval(() => {
+      console.log('[hb-tick]', adbSerial, 'in_map:', connectedDevices.has(adbSerial));
       if (!connectedDevices.has(adbSerial)) {
-        clearInterval(window[hbKey]);
+        clearInterval(hbInterval);
         delete window[hbKey];
         return;
       }
-      // Visible counter — only update the counter span, never touch the "Connected" text
+      // Visible counter
       window['_hbCount_' + adbSerial] = (window['_hbCount_' + adbSerial] || 0) + 1;
       const counterEl = document.querySelector('[data-hb="' + adbSerial + '"]');
       if (counterEl) counterEl.textContent = '(hbt:' + window['_hbCount_' + adbSerial] + ')';
-      // Ping USB control endpoint — throws instantly if physically disconnected
-      const pingStart = Date.now();
-      try {
-        await Promise.race([
-          usbDevice.controlTransferOut({bRequestType:0, bRequest:0, wValue:0, wIndex:0}, new Uint8Array(0)),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500))
-        ]);
-      } catch (e) {
-        const pingMs = Date.now() - pingStart;
-        console.log('[heartbeat] PING FAILED:', adbSerial, pingMs + 'ms', e.message);
+      // adb.getProp throws immediately when USB physically disconnected
+      const p = adb.getProp('ro.build.id');
+      console.log('[hb-ping]', typeof p, p instanceof Promise);
+      Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
+      ]).then(r => console.log('[hb-ping] OK:', r)).catch(e => {
+        console.log('[hb-ping] FAIL:', adbSerial, e.message);
         if (!connectedDevices.has(adbSerial)) return;
-        clearInterval(window[hbKey]);
+        clearInterval(hbInterval);
         delete window[hbKey];
         try { transport.close(); } catch(ex) {}
         connectedDevices.delete(adbSerial);
@@ -253,13 +251,12 @@ async function connectDevice(usbDevice) {
         }
         renderDeviceList();
         setStatus('Device disconnected: ' + adbSerial, 'warn');
-        if (activeSerial) {
-          selectDevice(activeSerial);
-        } else {
-          document.getElementById('inspector-section').classList.add('hidden');
-        }
-      }
-    }, 2000);
+        if (activeSerial) selectDevice(activeSerial);
+        else document.getElementById('inspector-section').classList.add('hidden');
+      });
+    }, 3000);
+    window[hbKey] = hbInterval;
+    console.log('[heartbeat] started for', adbSerial, 'id=', hbInterval);
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
     // Store USB identifiers at connect time for reliable disconnect matching
