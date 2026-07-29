@@ -50,9 +50,11 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.5
+**Current:** 1.1.6
 
 ### Changelog
+
+- **1.1.6** — Attestation Probe: added an inline debug console below the Run button. Per-step timestamps for fetch, push, pm install, pm path, am start, plus immediate `ls -la` and `stat` of the output file after launch. Buttons for fetching device logcat (filtered to WebAdbProbe/WebAdbBoot/AndroidRuntime) and copying the entire debug log to clipboard. BootActivity now logs entry/exit and any exception via `Log.i / Log.e` (tags `WebAdbBoot` and `WebAdbProbe`) so we can see on logcat whether the activity actually ran and whether Probe.run threw. Bumped APP_VERSION 1.1.5 → 1.1.6.
 
 - **1.1.5** — Attestation Probe: gave up on broadcasts entirely. Even with --user 0 + explicit component + -S, Android 14+ silently drops broadcasts to a cold app process (result=0 but receiver never runs). Switched to launching the new BootActivity LAUNCHER activity via `am start -W -n io.ethan.webadb.attestation/.BootActivity` — Activity onCreate runs the probe synchronously, so the result file is guaranteed to appear. Refactored probe logic out of ProbeReceiver into a shared `Probe.run(Context)` helper so both the LAUNCHER activity and the (now fallback) broadcast receiver invoke the same code. Bumped APP_VERSION 1.1.4 → 1.1.5.
 

@@ -15,13 +15,17 @@ import android.os.Bundle;
  * from an adb shell context.
  */
 public class BootActivity extends Activity {
+    private static final String TAG = "WebAdbBoot";
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        android.util.Log.i(TAG, "BootActivity.onCreate: starting probe");
         try {
             Probe.run(getApplicationContext());
+            android.util.Log.i(TAG, "BootActivity.onCreate: Probe.run returned");
         } catch (Throwable t) {
-            android.util.Log.e("WebAdbProbe", "BootActivity probe failed", t);
+            android.util.Log.e(TAG, "BootActivity probe failed", t);
         }
         finish();
     }

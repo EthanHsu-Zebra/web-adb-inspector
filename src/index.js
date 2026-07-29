@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.5';
+const APP_VERSION = '1.1.6';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1047,6 +1047,9 @@ window.renderPackages = renderPackages;
 window.fetchCSR = fetchCSR;
 window.copyCSR = copyCSR;
 window.runAttestationProbe = runAttestationProbe;
+window.clearProbeDebug = clearProbeDebug;
+window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
+window.copyProbeDebug = copyProbeDebug;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 async function fetchRKP() {
@@ -1289,8 +1292,24 @@ async function runAttestationProbe() {
   const info = connectedDevices.get(activeSerial);
   if (!info) { setStatus('No device connected', 'err'); return; }
   const out = document.getElementById('apk-verify-output');
+  const dbg = document.getElementById('apk-verify-debug');
   showLoading('apk-verify', true);
   out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Fetching bundled APK…</div>';
+  if (dbg) dbg.textContent = '';
+
+  // Per-step debug log so failures are diagnosable from the page itself.
+  const dbgLog = (msg) => {
+    if (!dbg) return;
+    dbg.textContent += (dbg.textContent ? '\n' : '') + '[' + new Date().toISOString().slice(11,19) + '] ' + msg;
+    dbg.scrollTop = dbg.scrollHeight;
+  };
+  const runShell = async (cmd, label) => {
+    dbgLog('> ' + (label || cmd));
+    let out = '';
+    try { out = await adbShell(info.adb, cmd + ' 2>&1'); } catch (e) { dbgLog('  ERROR: ' + (e.message || e)); throw e; }
+    dbgLog('  ' + String(out).replace(/\n/g, '\n  ').trim());
+    return out;
+  };
 
   try {
     // 1) Fetch the bundled APK (served from the same origin as the page).
@@ -1300,6 +1319,7 @@ async function runAttestationProbe() {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.blob();
       });
+      dbgLog('Fetched APK (' + apkBlob.size + ' bytes)');
     } catch (e) {
       throw new Error('Could not fetch attestation-test.apk from site: ' + (e.message || e));
     }
@@ -1307,6 +1327,7 @@ async function runAttestationProbe() {
     out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Pushing APK…</div>';
 
     // 2) Push to /data/local/tmp/ via AdbSync
+    dbgLog('Opening sync channel...');
     const sync = await info.adb.sync();
     try {
       await sync.write({
@@ -1314,9 +1335,15 @@ async function runAttestationProbe() {
         file: apkBlob.stream(),
         permission: 0o644,
       });
+      dbgLog('Pushed APK to ' + PROBE_REMOTE_APK);
+    } catch (e) {
+      dbgLog('sync.write failed: ' + (e.message || e));
+      throw e;
     } finally {
       await sync.dispose();
     }
+    // Confirm the file landed on device
+    await runShell('ls -la ' + PROBE_REMOTE_APK, 'verify pushed APK');
 
     out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Launching probe activity…</div>';
 
@@ -1325,8 +1352,7 @@ async function runAttestationProbe() {
     //    and surface as a real error if it failed.
     let installOut = '';
     try {
-      installOut = await adbShell(info.adb,
-        'pm install -r -t ' + PROBE_REMOTE_APK + ' 2>&1');
+      installOut = await runShell('pm install -r -t ' + PROBE_REMOTE_APK, 'pm install');
     } catch (e) {
       throw new Error('pm install failed: ' + (e.message || e));
     }
@@ -1336,8 +1362,7 @@ async function runAttestationProbe() {
 
     // 3b) Confirm the package is actually present on the device.
     try {
-      const verify = await adbShell(info.adb,
-        'pm path ' + PROBE_PKG + ' 2>&1');
+      const verify = await runShell('pm path ' + PROBE_PKG, 'pm path');
       if (!/package:/i.test(verify)) {
         throw new Error('pm path returned no path for ' + PROBE_PKG + ': ' + verify.trim());
       }
@@ -1353,13 +1378,15 @@ async function runAttestationProbe() {
     //     get user-space Java code running from an adb shell context.
     let launchOut = '';
     try {
-      launchOut = await adbShell(info.adb,
-        'am start -W -n ' + PROBE_PKG + '/.BootActivity --user 0 2>&1');
+      launchOut = await runShell('am start -W -n ' + PROBE_PKG + '/.BootActivity --user 0', 'am start BootActivity');
     } catch (e) {
       // Surface but continue — sometimes am start prints "Warning" but
       // the activity still ran. Final file check below is the source of truth.
-      launchOut = launchOut + '\nam start warning: ' + (e.message || e);
+      dbgLog('am start exception (continuing): ' + (e.message || e));
     }
+    // Verify the file landed on device immediately after the launch.
+    await runShell('ls -la ' + PROBE_REMOTE_OUT + ' 2>&1', 'ls output file');
+    await runShell('stat ' + PROBE_REMOTE_OUT + ' 2>&1', 'stat output file');
 
     // Poll for the output file. Probe wrote it synchronously in
     // BootActivity.onCreate, so it should appear within a couple of seconds.
@@ -1370,7 +1397,10 @@ async function runAttestationProbe() {
           'test -f ' + PROBE_REMOTE_OUT + ' && echo OK || echo MISSING');
         if (exists.trim() === 'OK') {
           probeJson = await readDeviceFile(info.adb, PROBE_REMOTE_OUT);
-          if (probeJson) break;
+          if (probeJson) {
+            dbgLog('Got probe JSON: ' + probeJson.length + ' bytes');
+            break;
+          }
         }
       } catch (e) { /* try again */ }
       await new Promise(r => setTimeout(r, 500));
@@ -1446,4 +1476,37 @@ async function runAttestationProbe() {
     setStatus('Probe failed: ' + (err.message || err), 'err');
   }
   showLoading('apk-verify', false);
+}
+
+// --- Debug console helpers ---
+function clearProbeDebug() {
+  const dbg = document.getElementById('apk-verify-debug');
+  if (dbg) dbg.textContent = '';
+}
+
+async function fetchProbeDebugLogcat() {
+  const info = connectedDevices.get(activeSerial);
+  if (!info) return;
+  const dbg = document.getElementById('apk-verify-debug');
+  if (dbg) dbg.textContent += (dbg.textContent ? '\n' : '') +
+    '[logcat] fetching WebAdbProbe:* lines...';
+  try {
+    // -d = dump and exit (don't follow), -t 100 = last 100 lines,
+    // -s WebAdbProbe:V AndroidRuntime:E *:S = filter to our tag + crashes.
+    const out = await adbShell(info.adb,
+      'logcat -d -t 200 -s WebAdbProbe:V WebAdbBoot:V AndroidRuntime:E *:S 2>&1');
+    if (dbg) dbg.textContent += '\n--- logcat ---\n' + out + '\n--- end ---';
+  } catch (e) {
+    if (dbg) dbg.textContent += '\n[logcat] error: ' + (e.message || e);
+  }
+}
+
+function copyProbeDebug() {
+  const dbg = document.getElementById('apk-verify-debug');
+  if (!dbg || !dbg.textContent) return;
+  navigator.clipboard.writeText(dbg.textContent).then(() => {
+    setStatus('Debug log copied', 'ok');
+  }).catch(e => {
+    setStatus('Copy failed: ' + e.message, 'err');
+  });
 }
