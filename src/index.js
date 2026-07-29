@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.25';
+const APP_VERSION = '1.1.26';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -82,43 +82,24 @@ function showADBReleaseDialog() {
 }
 
 // --- Device Discovery ---
-// Connect device — uses custom picker for granted devices, native picker for first-time grant
+// Connect device — always use native WebUSB picker, filter connected after selection
 async function scanDevices() {
   try {
-    // Get all USB devices already granted permission by the user
-    const granted = await navigator.usb.getDevices();
-    // Filter out devices already in connectedDevices
-    const connectedIds = new Set();
-    for (const [, info] of connectedDevices) {
-      if (info._usbId) {
-        const key = info._usbId.vendorId + ':' + info._usbId.productId + ':' + (info._usbId.serial || '');
-        connectedIds.add(key);
-      }
-    }
-    const unconnected = granted.filter(d => {
-      const key = d.vendorId + ':' + d.productId + ':' + (d.serial || '');
-      // Skip if already connected OR already opened (stale from previous session)
-      if (connectedIds.has(key)) return false;
-      if (d.opened) return false;
-      return true;
-    });
-
-    if (unconnected.length > 0) {
-      // Show custom picker for already-granted unconnected devices
-      if (unconnected.length === 1) {
-        await connectDevice(unconnected[0]).catch(e => setStatus('Failed: ' + e.message, 'err'));
-        return;
-      }
-      await showDevicePicker(unconnected);
-      return;
-    }
-
-    // No granted devices available — fall back to native picker for first-time permission
-    // This also lets user re-grant permission to a previously disconnected device
     const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
     if (!mgr) return;
     const device = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
     if (!device) return;
+    // Check if this device is already connected
+    const key = device.vendorId + ':' + device.productId + ':' + (device.serial || '');
+    for (const [, info] of connectedDevices) {
+      if (info._usbId) {
+        const existing = info._usbId.vendorId + ':' + info._usbId.productId + ':' + (info._usbId.serial || '');
+        if (existing === key) {
+          setStatus('Already connected: ' + (info._displayName || 'device'), 'warn');
+          return;
+        }
+      }
+    }
     await connectDevice(device);
   } catch (err) {
     const msg = err.message || String(err);
@@ -127,7 +108,7 @@ async function scanDevices() {
   }
 }
 
-// Custom device picker UI — list unconnected devices in a modal
+
 async function showDevicePicker(devices) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -201,7 +182,9 @@ async function connectDevice(usbDevice) {
       return;
     }
     setStatus('Connecting...', 'connecting');
+    console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
     const connection = await usbDevice.connect();
+    console.log('[connect] connected, opened:', usbDevice.opened, 'conn.closed:', typeof connection.closed);
     const transport = await AdbDaemonTransport.authenticate({
       serial: usbDevice.serial || 'usb', connection, credentialStore,
       features: ADB_DAEMON_DEFAULT_FEATURES,
@@ -237,9 +220,9 @@ async function connectDevice(usbDevice) {
       displayName = brand + ' ' + model;
     } catch (_) {}
 
-    // Polling fallback: check usbDevice.opened every 3s
-    // This catches disconnects when navigator.usb events silently fail
+    // Polling fallback: check usbDevice.opened every 1s
     const hbKey = 'hb-' + adbSerial;
+    console.log('[heartbeat] starting for', adbSerial, 'interval=', window[hbKey] ? 'ALREADY_EXISTS' : 'NEW');
     window[hbKey] = setInterval(() => {
       if (!connectedDevices.has(adbSerial)) {
         clearInterval(window[hbKey]);
@@ -250,7 +233,7 @@ async function connectDevice(usbDevice) {
       if (!usbDevice.opened) {
         clearInterval(window[hbKey]);
         delete window[hbKey];
-        console.log('[heartbeat] Device ' + adbSerial + ' usbDevice.opened=false');
+        console.log('[heartbeat] DISCONNECT DETECTED! Device', adbSerial, 'usbDevice.opened=false, opened attr:', usbDevice.opened);
         try { transport.close(); } catch(ex) {}
         connectedDevices.delete(adbSerial);
         if (activeSerial === adbSerial) {
@@ -264,7 +247,7 @@ async function connectDevice(usbDevice) {
           document.getElementById('inspector-section').classList.add('hidden');
         }
       }
-    }, 3000);
+    }, 1000);
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
     // Store USB identifiers at connect time for reliable disconnect matching
@@ -340,12 +323,13 @@ function renderDeviceList() {
     const nick = deviceNicknames[serial] || '';
     const card = document.createElement('div');
     card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
+    const hbActive = window['hb-' + serial] ? ' (hbt)' : '';
     card.innerHTML = `<div>
       ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
       <div class="dev-name">${esc(info._displayName || serial)}</div>
       <div class="dev-serial">${esc(serial)}</div>
     </div>
-    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected</span>
+    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected${hbActive}</span>
     <button class="btn btn-sm" style="margin-left:0.5rem" onclick="event.stopPropagation();disconnectOne('${serial}')">Disconnect</button>`;
     card.onclick = () => selectDevice(serial);
     list.appendChild(card);
