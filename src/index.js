@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.15';
+const APP_VERSION = '1.1.16';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -96,6 +96,9 @@ async function scanDevices() {
   }
 }
 
+// Global USB disconnect handler (USBDevice.addEventListener not supported in all browsers)
+let _usbDisconnectHandler = null;
+
 async function connectDevice(usbDevice) {
   try {
     setStatus('Connecting...', 'connecting');
@@ -113,26 +116,34 @@ async function connectDevice(usbDevice) {
       displayName = brand + ' ' + model;
     } catch (_) {}
 
-    // Listen for USB disconnect
-    const onDisconnect = () => {
-      const s = adb.serial;
-      setStatus('Device disconnected: ' + s, 'warn');
-      try { transport.close(); } catch(e) {}
-      try { usbDevice.close(); } catch(e) {}
-      connectedDevices.delete(s);
-      if (activeSerial === s) {
-        activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
-      }
-      renderDeviceList();
-      if (activeSerial) {
-        selectDevice(activeSerial);
-      } else {
-        document.getElementById('inspector-section').classList.add('hidden');
-      }
-    };
-    usbDevice.addEventListener('disconnect', onDisconnect);
+    // Use global navigator.usb.ondisconnect (reliable across browsers)
+    if (!_usbDisconnectHandler) {
+      _usbDisconnectHandler = (e) => {
+        const disconnectedDevice = e.device;
+        // Find matching serial in connectedDevices
+        for (const [serial, info] of connectedDevices) {
+          if (info.usbDevice === disconnectedDevice || info.usbDevice.serial === disconnectedDevice.serial) {
+            setStatus('Device disconnected: ' + serial, 'warn');
+            try { info.transport.close(); } catch(ex) {}
+            try { info.usbDevice.close(); } catch(ex) {}
+            connectedDevices.delete(serial);
+            if (activeSerial === serial) {
+              activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+            }
+            renderDeviceList();
+            if (activeSerial) {
+              selectDevice(activeSerial);
+            } else {
+              document.getElementById('inspector-section').classList.add('hidden');
+            }
+            break;
+          }
+        }
+      };
+      navigator.usb.addEventListener('disconnect', _usbDisconnectHandler);
+    }
 
-    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName, _onDisconnect: onDisconnect });
+    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName });
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adb.serial);
     setStatus('Connected', 'ok');
@@ -221,7 +232,6 @@ async function disconnectDevice() {
   if (!activeSerial) return;
   const info = connectedDevices.get(activeSerial);
   if (info) {
-    try { info.usbDevice.removeEventListener('disconnect', info._onDisconnect); } catch(e) {}
     try { await info.transport.close(); } catch(e) {}
     try { await info.usbDevice.close(); } catch(e) {}
   }
