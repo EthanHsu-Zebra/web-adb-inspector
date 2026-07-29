@@ -302,6 +302,7 @@ async function fetchPackages() {
     document.getElementById('packages-count').textContent = '(' + packages.length + ')';
     if (packages.length > 0) {
       dataCache.packages = packages;
+      dataCache.lastDumpsysText = text;  // keep raw text for export / debug
       renderPackages(packages, false, 'dumpsys');
       showLoading('packages', false);
       return;
@@ -589,6 +590,46 @@ function parseDumpsysPackage(text) {
 
     // 4) Inside permissions section (requested or declared)
     if (section === 'requested' || section === 'declared') {
+      // Android dumpsys canonical format: "android.permission.X: granted=true flags=..."
+      // Split on the FIRST ":" that is not part of a URL or scheme.
+      const colonIdx = trimmed.indexOf(':');
+      if (colonIdx > 0 && !trimmed.startsWith('Permission:')) {
+        const permName = trimmed.substring(0, colonIdx).trim();
+        if (PERM_NAME.test(permName)) {
+          finalizePerm();
+          currentPerm = {
+            name: permName,
+            is_granted: undefined, flags: 0, permission_group: '',
+            protection_level: 0, protection_level_flags: 0, type: 1, maxTargetSdk: 0,
+          };
+          // Continue parsing the rest of the line as attributes
+          const rest = trimmed.substring(colonIdx + 1).trim();
+          if (rest) {
+            const kvPairs = rest.match(/(\w+)\s*=\s*([^\s,]+)/g);
+            if (kvPairs) {
+              for (const kv of kvPairs) {
+                const eq = kv.indexOf('=');
+                const k = kv.substring(0, eq).trim();
+                const v = kv.substring(eq + 1).trim();
+                if (k === 'granted') currentPerm.is_granted = v === 'true';
+                else if (k === 'flags') currentPerm.flags = (v.startsWith('0x') || v.startsWith('0X')) ? parseInt(v, 16) || 0 : parseInt(v, 10) || 0;
+                else if (k === 'protectionLevel' || k === 'protection_level') {
+                  const map = { normal: 0, dangerous: 1, signature: 2, privileged: 2,
+                                'signature|privileged': 2, 'privileged|signature': 2,
+                                'signature|app': 2, 'app|signature': 2 };
+                  currentPerm.protection_level = map[v] !== undefined ? map[v] : parseInt(v, 10) || 0;
+                }
+                else if (k === 'protection_level_flags') currentPerm.protection_level_flags = parseInt(v, 10) || 0;
+                else if (k === 'type') currentPerm.type = parseInt(v, 10) || 1;
+                else if (k === 'group') currentPerm.permission_group = v;
+                else if (k === 'maxTargetSdk') currentPerm.maxTargetSdk = parseInt(v, 10) || 0;
+              }
+            }
+          }
+          continue;
+        }
+      }
+
       const permDecl = trimmed.match(/^Permission:\s*(.+)$/);
       if (permDecl) {
         finalizePerm();
@@ -662,6 +703,19 @@ function parseDumpsysPackage(text) {
     }
 
     // 6) Package-level key=value (position-based multi-KV scanner)
+    //    Special-case: codePath / base are paths that may contain '=' (e.g.
+    //    /data/app/~~abc==/pkg-XYZ). Multi-KV scanner treats every '=' as a
+    //    separator, so we extract them with a dedicated regex first.
+    const codePathMatch = trimmed.match(/(?:^|\s)(?:codePath|base)\s*=\s*(\S+)/);
+    if (codePathMatch) {
+      const val = codePathMatch[1];
+      current.dir = val;
+      current.system = ['/system/','/product/','/vendor/','/apex/','/oem/','/data/app/']
+        .some(p => val.startsWith(p));
+      current.system_priv = ['/system/priv-app/','/product/priv-app/','/vendor/priv-app/']
+        .some(p => val.startsWith(p));
+    }
+
     PKG_FIELD.lastIndex = 0;
     const kvList = [];
     let mm;
@@ -678,11 +732,14 @@ function parseDumpsysPackage(text) {
           case 'versionName': current.version_name = val; break;
           case 'versionCode': current.version_code = parseInt(val, 10) || 0; break;
           case 'codePath': case 'base':
-            current.dir = val;
-            current.system = ['/system/','/product/','/vendor/','/apex/','/oem/','/data/app/']
-              .some(p => val.startsWith(p));
-            current.system_priv = ['/system/priv-app/','/product/priv-app/','/vendor/priv-app/']
-              .some(p => val.startsWith(p));
+            // Already handled above (paths can contain '='); only set if not yet set.
+            if (!current.dir) {
+              current.dir = val;
+              current.system = ['/system/','/product/','/vendor/','/apex/','/oem/','/data/app/']
+                .some(p => val.startsWith(p));
+              current.system_priv = ['/system/priv-app/','/product/priv-app/','/vendor/priv-app/']
+                .some(p => val.startsWith(p));
+            }
             break;
           case 'minSdk': case 'minSdkVersion':
             current.min_sdk = parseInt(val, 10) || 0; break;
@@ -900,9 +957,9 @@ function exportJSON(type) {
       shared_uid_allowlist: [],  // populated by CTS — empty unless multiple packages share UID
       package: dataCache.packages.map(p => ({
         name: p.name,
-        version_name: p.version_name || '',
+        version_name: p.version_name || '(not parsed)',
         version_code: p.version_code || 0,
-        dir: p.dir || '',
+        dir: p.dir || '(not parsed)',
         system_priv: p.system_priv,
         min_sdk: p.min_sdk || 0,
         target_sdk: p.target_sdk || 0,
@@ -912,8 +969,8 @@ function exportJSON(type) {
         has_default_notification_access: p.has_default_notification_access || false,
         is_active_admin: p.is_active_admin || false,
         is_default_accessibility_service: p.is_default_accessibility_service || false,
-        sha256_cert: formatCert(p.sha256_cert),
-        sha256_file: (p.sha256_file || '').toLowerCase(),
+        sha256_cert: formatCert(p.sha256_cert) || '(not parsed)',
+        sha256_file: (p.sha256_file || '').toLowerCase() || '(not parsed)',
         requested_permissions: (p.requested_permissions || []).map(r => ({
           name: r.name, flags: r.flags || 0, permission_group: r.permission_group || '',
           protection_level: r.protection_level || 0, protection_level_flags: r.protection_level_flags || 0,
@@ -987,6 +1044,9 @@ window.changeFontSize = changeFontSize;
 window.renderProperties = renderProperties;
 window.renderFeatures = renderFeatures;
 window.renderPackages = renderPackages;
+window.fetchCSR = fetchCSR;
+window.copyCSR = copyCSR;
+window.runAttestationProbe = runAttestationProbe;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 async function fetchRKP() {
