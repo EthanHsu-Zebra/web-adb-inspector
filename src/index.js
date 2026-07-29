@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.11';
+const APP_VERSION = '1.1.12';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1432,10 +1432,23 @@ async function runAttestationProbe() {
     // APK to launch.
     if (!probeJson) {
       dbgLog('App probe did not write file — falling back to shell-only probe');
-      const sh = (cmd) => adbShell(info.adb, cmd + ' 2>/dev/null | head -c 4000');
-      const getprop = async (k) => {
-        try { return (await sh('getprop ' + k)).trim(); } catch { return ''; }
+      const sh = async (cmd, label) => {
+        dbgLog('> ' + (label || cmd));
+        try {
+          const out = await adbShell(info.adb, cmd + ' 2>/dev/null | head -c 8192');
+          dbgLog('  ' + String(out).replace(/\n/g, '\n  ').trim().slice(0, 200));
+          return out;
+        } catch {
+          dbgLog('  (command failed)');
+          return '';
+        }
       };
+      const getprop = async (k) => {
+        try { return (await adbShell(info.adb, 'getprop ' + k)).trim(); } catch { return ''; }
+      };
+
+      // --- Build info ---
+      dbgLog('Collecting build properties...');
       const build = {
         manufacturer: await getprop('ro.product.manufacturer'),
         model: await getprop('ro.product.model'),
@@ -1449,26 +1462,122 @@ async function runAttestationProbe() {
         security_patch: await getprop('ro.build.version.security_patch'),
         bootloader: await getprop('ro.bootloader'),
       };
-      let keystore = { success: false, note: 'shell-fallback cannot create a TEE-backed key without app code' };
-      let signing = { note: 'shell-fallback cannot read our app cert via getprop' };
+
+      // --- Verified Boot state ---
+      dbgLog('Collecting verified boot state...');
+      const verified_boot = {
+        verifiedbootstate: await getprop('ro.boot.verifiedbootstate'),
+        vbmeta_verify_state: await getprop('ro.boot.vbmeta.verify_state'),
+        vbmeta_device_state: await getprop('ro.boot.vbmeta.device_state'),
+        veritymode: await getprop('ro.boot.veritymode'),
+        flash_locked: await getprop('ro.boot.flash.locked'),
+        warranty_bit: await getprop('ro.boot.warranty_bit'),
+        avb_state: await getprop('ro.boot.vbmeta.avb_state'),
+      };
+
+      // --- Security / Trust hardware ---
+      dbgLog('Collecting security hardware properties...');
+      const security_hw = {
+        keystore: await getprop('ro.hardware.keystore'),
+        keystore2: await getprop('ro.hardware.keystore2'),
+        keymaster: await getprop('ro.hardware.keymaster'),
+        strongbox: await getprop('ro.hardware.strongbox'),
+        rkp_enabled: await getprop('ro.rkp.enabled'),
+        rkp: await getprop('ro.security.rkp'),
+      };
+
+      // --- Android ID ---
       let android_id = '';
+      try { android_id = (await adbShell(info.adb, 'settings get secure android_id')).trim(); } catch {}
+
+      // --- Signing cert (from installed system packages as reference) ---
+      let signing = {};
       try {
-        android_id = (await sh('settings get secure android_id')).trim();
+        const sigOut = await adbShell(info.adb,
+          'pm list packages -S -3 2>/dev/null | head -5 | cut -d= -f2');
+        if (sigOut.trim()) {
+          signing = {
+            note: 'shell-fallback shows sample 3rd-party cert',
+            sample_3rd_party_certs: sigOut.trim(),
+          };
+        }
       } catch {}
-      const out = {
+
+      // --- HW Trust: cmd identity get_csr (shell context, no app needed) ---
+      dbgLog('Collecting HW Trust CSRs (cmd identity get_csr)...');
+      const hwtrust = {};
+      for (const slot of ['default', 'strongbox', 'tee']) {
+        try {
+          const csrOut = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
+          const csrText = (csrOut || '').trim();
+          if (csrText) {
+            // Extract PEM
+            const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
+            const pem = pemMatch ? pemMatch[0] : csrText;
+            // Compute DER SHA-256
+            let der_sha256 = '';
+            try {
+              const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
+              const bin = atob(b64);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              // SHA-256 via subtle crypto
+              const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
+              der_sha256 = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+            } catch (e) {
+              der_sha256 = '(unable to compute — ' + (e.message || e) + ')';
+            }
+            hwtrust[slot] = { pem, der_sha256, raw_length: csrText.length };
+            dbgLog('  ' + slot + ': CSR obtained, DER SHA-256: ' + der_sha256.slice(0, 16) + '...');
+          } else {
+            hwtrust[slot] = { pem: '', der_sha256: '', note: 'slot not available on this device' };
+            dbgLog('  ' + slot + ': no CSR returned');
+          }
+        } catch (e) {
+          hwtrust[slot] = { pem: '', der_sha256: '', error: String(e.message || e) };
+          dbgLog('  ' + slot + ': error: ' + (e.message || e));
+        }
+      }
+
+      // --- KeyStore/KeyMint HAL check ---
+      dbgLog('Checking KeyStore/KeyMint HAL...');
+      let keystore = {};
+      try {
+        const ksOut = await adbShell(info.adb, 'cmd keystore 2>&1 | head -c 2048');
+        keystore = {
+          available: !!ksOut.trim(),
+          raw: ksOut.trim().slice(0, 500),
+        };
+      } catch (e) {
+        keystore = { available: false, error: String(e.message || e) };
+      }
+
+      // --- Keystore services ---
+      const keystore_services = {};
+      try {
+        const svcOut = await adbShell(info.adb, 'service list 2>/dev/null');
+        for (const svc of ['android.security.keystore', 'android.hardware.keymaster', 'android.hardware.security.keymint']) {
+          keystore_services[svc] = svcOut.includes(svc);
+        }
+      } catch {}
+
+      const result = {
         source: 'shell-fallback',
         build,
         android_id,
-        signing,
+        verified_boot,
+        security_hw,
+        hwtrust,
         keystore,
+        keystore_services,
+        signing,
         ts: new Date().toISOString(),
       };
-      const json = JSON.stringify(out, null, 2);
+      const json = JSON.stringify(result, null, 2);
+      dbgLog('Shell-fallback collected ' + Object.keys(result).join(', '));
+
       // Push the JSON to the device and read it back via cat.
-      const localPath = '/tmp/webadb_attestation_fallback.json';
       try {
-        const fs = window.__TAURI__?.fs || null;
-        // No Tauri — just write a Blob and push via sync.
         const blob = new Blob([json], { type: 'application/json' });
         const remotePath = '/data/local/tmp/webadb_attestation_fallback.json';
         const sync2 = await info.adb.sync();
