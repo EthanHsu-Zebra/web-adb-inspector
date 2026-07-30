@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.34';
+const APP_VERSION = '1.1.35';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -108,6 +108,53 @@ async function scanDevices() {
     else setStatus('Failed: ' + msg, 'err');
   }
 }
+
+// Scan for previously granted USB devices and populate the "Ready to Connect" section
+async function scanAvailableDevices() {
+  try {
+    const granted = await navigator.usb.getDevices();
+    console.log('[scan-available] granted devices:', granted.length);
+    // For each granted device, check if it's already connected
+    for (const usbDevice of granted) {
+      const uid = { vendorId: usbDevice.vendorId, productId: usbDevice.productId, serial: usbDevice.serial };
+scanAvailableDevices();
+
+      // Check if already connected
+      let alreadyConnected = false;
+      for (const [, info] of connectedDevices) {
+        if (info._usbId && info._usbId.vendorId === uid.vendorId && info._usbId.productId === uid.productId) {
+          alreadyConnected = true;
+          break;
+        }
+      }
+      if (alreadyConnected) continue;
+      // Check if already in available
+      let alreadyAvailable = false;
+      for (const [, info] of availableDevices) {
+        if (info._usbId && info._usbId.vendorId === uid.vendorId && info._usbId.productId === uid.productId) {
+          alreadyAvailable = true;
+          break;
+        }
+      }
+      if (alreadyAvailable) continue;
+      // Add to available — we need to show it, but can't fully connect yet without user action
+      // Store enough info to reconnect later
+      const key = usbDevice.vendorId + ':' + usbDevice.productId + ':' + (usbDevice.serial || 'x');
+      const displayName = usbDevice.productName || ('USB Device ' + usbDevice.vendorId + ':' + usbDevice.productId);
+      availableDevices.set(key, {
+        adb: null, usbDevice, transport: null,
+        _displayName: displayName,
+        _usbId: uid,
+        _tempKey: true,
+      });
+      console.log('[scan-available] added available:', key, displayName);
+    }
+    renderDeviceList();
+  } catch (err) {
+    console.log('[scan-available] failed:', err);
+  }
+}
+
 
 
 async function showDevicePicker(devices) {
@@ -377,12 +424,13 @@ function renderDeviceList() {
     availList.innerHTML = '';
     for (const [serial, info] of availableDevices) {
       const nick = deviceNicknames[serial] || '';
+      const displaySerial = info._usbId && info._usbId.serial ? info._usbId.serial : serial;
       const card = document.createElement('div');
       card.className = 'device-card available';
       card.innerHTML = `<div class="dev-info">
         ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
-        <div class="dev-name">${esc(info._displayName || serial)}</div>
-        <div class="dev-serial">${esc(serial)}</div>
+        <div class="dev-name">${esc(info._displayName || displaySerial)}</div>
+        <div class="dev-serial">${esc(displaySerial)}</div>
       </div>
       <div class="dev-actions">
         <span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
@@ -456,26 +504,69 @@ async function connectAvailable(serial) {
   const info = availableDevices.get(serial);
   if (!info) return;
   availableDevices.delete(serial);
-  // Re-open USB device and reconnect
-  info.usbDevice.connect().then(connection => {
+  setStatus('Connecting...', 'connecting');
+  const usbDevice = info.usbDevice;
+  if (!usbDevice || typeof usbDevice.connect !== 'function') {
+    setStatus('Device no longer available — please re-plug', 'err');
+    return;
+  }
+  usbDevice.connect().then(connection => {
     return AdbDaemonTransport.authenticate({
-      serial: info.usbDevice.serial || 'usb', connection, credentialStore,
+      serial: usbDevice.serial || 'usb', connection, credentialStore,
       features: ADB_DAEMON_DEFAULT_FEATURES,
       initialDelayedAckBytes: ADB_DAEMON_DEFAULT_INITIAL_PAYLOAD_SIZE,
     });
   }).then(transport => {
     const adb = new Adb(transport);
-    info.adb = adb;
-    info.transport = transport;
-    // Use stored serial — no need to re-query
-    connectedDevices.set(serial, info);
-    availableDevices.delete(serial);
+    // Get real serial
+    return adb.getProp('ro.serialno').then(realSerial => {
+      if (realSerial) return { transport, adb, realSerial };
+      return { transport, adb, realSerial: adb.serial };
+    });
+  }).then(({ transport, adb, realSerial }) => {
+    let displayName = usbDevice.name || usbDevice.productName || 'Android Device';
+    const newInfo = {
+      adb, usbDevice, transport,
+      _displayName: displayName,
+      _usbId: info._usbId,
+    };
+    // Start heartbeat
+    const hbKey = 'hb-' + realSerial;
+    const hbInterval = setInterval(() => {
+      if (!connectedDevices.has(realSerial)) {
+        clearInterval(hbInterval);
+        delete window[hbKey];
+        return;
+      }
+      Promise.race([
+        adb.getProp('ro.build.id'),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
+      ]).catch(e => {
+        if (!connectedDevices.has(realSerial)) return;
+        clearInterval(hbInterval);
+        delete window[hbKey];
+        try { transport.close(); } catch(ex) {}
+        connectedDevices.delete(realSerial);
+        availableDevices.delete(realSerial);
+        if (activeSerial === realSerial) {
+          activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+        }
+        renderDeviceList();
+        scanAvailableDevices();
+        setStatus('Device disconnected: ' + realSerial, 'warn');
+        if (activeSerial) selectDevice(activeSerial);
+        else document.getElementById('inspector-section').classList.add('hidden');
+      });
+    }, 3000);
+    window[hbKey] = hbInterval;
+
+    connectedDevices.set(realSerial, newInfo);
     renderDeviceList();
-    selectDevice(serial);
+    selectDevice(realSerial);
     setStatus('Connected', 'ok');
   }).catch(err => {
     console.log('[connectAvailable] failed:', err.message);
-    setStatus('Reconnect failed: ' + err.message, 'err');
+    setStatus('Connect failed: ' + err.message, 'err');
   });
 }
 
@@ -493,6 +584,7 @@ function disconnectOne(serial) {
     activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
   }
   renderDeviceList();
+  scanAvailableDevices();
   if (activeSerial) {
     selectDevice(activeSerial);
   } else {
