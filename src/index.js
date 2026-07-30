@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.32';
+const APP_VERSION = '1.1.33';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -270,6 +270,7 @@ async function connectDevice(usbDevice) {
 
     if (!_usbDisconnectHandler) {
       _usbDisconnectHandler = (e) => {
+        console.log('[disconnect-event] fired, device:', e.device.vendorId, e.device.productId, e.device.serial);
         const dev = e.device;
         // Match by vendorId+productId (always present) — serial can be null after disconnect
         for (const [serial, info] of connectedDevices) {
@@ -277,6 +278,7 @@ async function connectDevice(usbDevice) {
           if (!uid) continue;
           const match = uid.vendorId === dev.vendorId && uid.productId === dev.productId;
           if (match) {
+            console.log('[disconnect-event] MATCH:', serial);
             setStatus('Device disconnected: ' + serial, 'warn');
             try { info.transport.close(); } catch(ex) {}
             connectedDevices.delete(serial);
