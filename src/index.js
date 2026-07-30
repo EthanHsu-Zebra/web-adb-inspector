@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.29';
+const APP_VERSION = '1.1.30';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -193,8 +193,17 @@ async function connectDevice(usbDevice) {
 
     const adb = new Adb(transport);
 
-    // Event-driven disconnect via connection.closed (when available)
-    const adbSerial = adb.serial;
+    // Get REAL serial from device property — adb.serial may fall back to USB vendor:product
+    let adbSerial = adb.serial;
+    try {
+      const realSerial = await adb.getProp('ro.serialno');
+      if (realSerial && realSerial !== adbSerial) {
+        console.log('[serial] overriding', adbSerial, '->', realSerial);
+        adbSerial = realSerial;
+      }
+    } catch(e) {
+      console.log('[serial] getProp failed, using fallback:', adbSerial);
+    }
     if (connection && typeof connection.closed === 'object') {
       connection.closed.then(() => {
         if (connectedDevices.has(adbSerial)) {
@@ -223,24 +232,18 @@ async function connectDevice(usbDevice) {
     // Polling fallback: adb.getProp() with 1s timeout every 3s
     const hbKey = 'hb-' + adbSerial;
     const hbInterval = setInterval(() => {
-      console.log('[hb-tick]', adbSerial, 'in_map:', connectedDevices.has(adbSerial));
+
       if (!connectedDevices.has(adbSerial)) {
         clearInterval(hbInterval);
         delete window[hbKey];
         return;
       }
-      // Visible counter
-      window['_hbCount_' + adbSerial] = (window['_hbCount_' + adbSerial] || 0) + 1;
-      const counterEl = document.querySelector('[data-hb="' + adbSerial + '"]');
-      if (counterEl) counterEl.textContent = '(hbt:' + window['_hbCount_' + adbSerial] + ')';
+      // Silent heartbeat — no UI counter
       // adb.getProp throws immediately when USB physically disconnected
-      const p = adb.getProp('ro.build.id');
-      console.log('[hb-ping]', typeof p, p instanceof Promise);
       Promise.race([
-        p,
+        adb.getProp('ro.build.id'),
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
-      ]).then(r => console.log('[hb-ping] OK:', r)).catch(e => {
-        console.log('[hb-ping] FAIL:', adbSerial, e.message);
+      ]).catch(e => {
         if (!connectedDevices.has(adbSerial)) return;
         clearInterval(hbInterval);
         delete window[hbKey];
@@ -256,7 +259,6 @@ async function connectDevice(usbDevice) {
       });
     }, 3000);
     window[hbKey] = hbInterval;
-    console.log('[heartbeat] started for', adbSerial, 'id=', hbInterval);
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
     // Store USB identifiers at connect time for reliable disconnect matching
@@ -337,14 +339,8 @@ function renderDeviceList() {
       <div class="dev-name">${esc(info._displayName || serial)}</div>
       <div class="dev-serial">${esc(serial)}</div>
     </div>
-    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected <span class="hb-counter" data-hb="${serial}"></span></span>
+    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected</span>
     <button class="btn btn-sm" style="margin-left:0.5rem" onclick="event.stopPropagation();disconnectOne('${serial}')">Disconnect</button>`;
-    // Restore heartbeat counter if running
-    const hbCount = window['_hbCount_' + serial] || 0;
-    if (hbCount > 0) {
-      const counterEl = card.querySelector('.hb-counter');
-      if (counterEl) counterEl.textContent = '(hbt:' + hbCount + ')';
-    }
     card.onclick = () => selectDevice(serial);
     list.appendChild(card);
   }
