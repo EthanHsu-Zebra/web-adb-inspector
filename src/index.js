@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.45';
+const APP_VERSION = '1.1.43';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -28,27 +28,15 @@ function debugLogPush(msg, level) {
   level = level || 'evt';
   const ts = new Date().toLocaleTimeString('en-GB', {hour12:false}) + '.' + String(new Date().getMilliseconds()).padStart(3,'0');
   debugLog.push({ts, msg, level});
-
-  // Always log to browser console too — visible even when debug panel is closed
-  const prefix = `[Debug] ${ts} [${level.toUpperCase()}]`;
-  if (level === 'err') console.error(prefix, msg);
-  else if (level === 'warn') console.warn(prefix, msg);
-  else console.log(prefix, msg);
-
-  // Also append to debug panel if open
-  const el = document.getElementById('debug-log-container');
+  const el = document.getElementById('debug-output');
   if (!el) return;
   const row = document.createElement('div');
   row.className = 'debug-entry';
-  const lvlIcons = { evt: '[EVT]', ok: '[OK]', warn: '[WARN]', err: '[ERR]' };
-  const lvlColors = { evt: '#89b4fa', ok: '#a6e3a1', warn: '#f9e2af', err: '#f38ba8' };
-  const color = lvlColors[level] || '#cdd6f4';
-  const icon = lvlIcons[level] || '[INFO]';
-  row.innerHTML = `<span class="debug-ts">${ts}</span><span style="color:${color};font-weight:bold;margin:0 6px">${icon}</span><span>${esc(msg)}</span>`;
+  row.innerHTML = `<span class="debug-ts">${ts}</span><span class="debug-${level}">[${level.toUpperCase()}]</span> ${msg}`;
   el.appendChild(row);
   el.scrollTop = el.scrollHeight;
   const cnt = document.getElementById('debug-count');
-  if (cnt) cnt.textContent = `(${debugLog.length})`;
+  if (cnt) cnt.textContent = `(${debugLog.length} entries)`;
 }
 function toggleDebugConsole() {
   const el = document.getElementById('debug-console');
@@ -79,20 +67,23 @@ function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
     document.addEventListener('DOMContentLoaded', init);
     return;
   }
-  // Show version first — must not depend on anything else succeeding
-  const verEl = document.getElementById('header-version');
-  if (verEl) verEl.textContent = 'v' + APP_VERSION;
-  try { checkWebUSB(); } catch(e) { console.error('checkWebUSB failed:', e); }
+  checkWebUSB();
+  // iterateKeys() is an async generator (returns AsyncGenerator, not Promise),
+  // so .catch() is undefined. Wrap in an IIFE that returns a Promise.
   (async () => {
     try {
       for await (const _ of credentialStore.iterateKeys()) {
+        // we just want to verify access works; the keys themselves are unused here
         break;
       }
     } catch (e) {
       try { await credentialStore.generateKey(); } catch (_) {}
     }
   })();
-  try { applyFontSize(); } catch(e) {}
+  applyFontSize();
+  // Show version in header
+  const verEl = document.getElementById('header-version');
+  if (verEl) verEl.textContent = 'v' + APP_VERSION;
 })();
 
 function checkWebUSB() {
@@ -558,14 +549,9 @@ function renderDeviceList() {
       </div>
       <div class="dev-actions">
         <span class="dev-status-dot" title="Connected"></span>
-        <button class="btn btn-sm btn-disconnect" data-serial="${esc(serial)}" title="Disconnect">Disconnect</button>
+        <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();disconnectOne('${serial}')" title="Disconnect">Disconnect</button>
       </div>`;
       card.onclick = () => selectDevice(serial);
-      // Use event delegation on the button itself to avoid inline onclick quoting issues
-      card.querySelector('.btn-disconnect').onclick = (e) => {
-        e.stopPropagation();
-        disconnectOne(serial);
-      };
       list.appendChild(card);
     }
   }
