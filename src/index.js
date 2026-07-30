@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.30';
+const APP_VERSION = '1.1.31';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -334,13 +334,15 @@ function renderDeviceList() {
     const nick = deviceNicknames[serial] || '';
     const card = document.createElement('div');
     card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
-    card.innerHTML = `<div>
+    card.innerHTML = `<div class="dev-info">
       ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
       <div class="dev-name">${esc(info._displayName || serial)}</div>
       <div class="dev-serial">${esc(serial)}</div>
     </div>
-    <span class="dev-status" data-status="${serial}" style="color:var(--green)">Connected</span>
-    <button class="btn btn-sm" style="margin-left:0.5rem" onclick="event.stopPropagation();disconnectOne('${serial}')">Disconnect</button>`;
+    <div class="dev-actions">
+      <span class="dev-status-dot" title="Connected"></span>
+      <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();disconnectOne('${serial}')" title="Disconnect">Disconnect</button>
+    </div>`;
     card.onclick = () => selectDevice(serial);
     list.appendChild(card);
   }
