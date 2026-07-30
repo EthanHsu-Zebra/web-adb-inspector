@@ -22,6 +22,38 @@ const dataCache = { props: [], features: [], packages: [] };
 const deviceNicknames = (() => { try { return JSON.parse(localStorage.getItem('device-nicknames') || '{}'); } catch { return {}; } })();
 let fontSizeLevel = (() => { try { return parseInt(localStorage.getItem('font-size-level') || '0', 10); } catch { return 0; } })();
 
+// --- Debug Console ---
+const debugLog = [];
+function debugLogPush(msg, level) {
+  level = level || 'evt';
+  const ts = new Date().toLocaleTimeString('en-GB', {hour12:false}) + '.' + String(new Date().getMilliseconds()).padStart(3,'0');
+  debugLog.push({ts, msg, level});
+  const el = document.getElementById('debug-output');
+  if (!el) return;
+  const row = document.createElement('div');
+  row.className = 'debug-entry';
+  row.innerHTML = `<span class="debug-ts">${ts}</span><span class="debug-${level}">[${level.toUpperCase()}]</span> ${msg}`;
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+  const cnt = document.getElementById('debug-count');
+  if (cnt) cnt.textContent = `(${debugLog.length} entries)`;
+}
+function toggleDebugConsole() {
+  const el = document.getElementById('debug-console');
+  if (el) el.classList.toggle('hidden');
+}
+function clearDebugLog() {
+  debugLog.length = 0;
+  const el = document.getElementById('debug-output');
+  if (el) el.innerHTML = '';
+  const cnt = document.getElementById('debug-count');
+  if (cnt) cnt.textContent = '(0 entries)';
+}
+function copyDebugLog() {
+  const text = debugLog.map(d => `${d.ts} [${d.level.toUpperCase()}] ${d.msg}`).join('\n');
+  navigator.clipboard.writeText(text).catch(()=>{});
+}
+
 const SDK_PREFIXES = ['android.hardware.', 'android.software.', 'android.feature.', 'com.google.android.feature.'];
 function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
 
@@ -70,6 +102,7 @@ setTimeout(() => scanAvailableDevices(), 500);
 
 // Listen for new USB devices at any time
 navigator.usb.addEventListener('connect', (e) => {
+  debugLogPush(`USB connect event: VID=${e.device.vendorId} PID=${e.device.productId} Serial=${e.device.serial || '(none)'}`, 'ok');
   console.log('[usb-connect-event] device:', e.device.vendorId, e.device.productId, e.device.serial);
   scanAvailableDevices();
 });
@@ -124,6 +157,7 @@ async function scanDevices() {
 async function scanAvailableDevices() {
   try {
     const granted = await navigator.usb.getDevices();
+    debugLogPush(`scanAvailableDevices: granted=${granted.length} connected=${connectedDevices.size} available=${availableDevices.size}`, 'evt');
     console.log('[scan-available] granted:', granted.length, 'connected:', connectedDevices.size, 'available:', availableDevices.size);
     // Build a set of known vid:pid:serial for O(1) lookup
     const knownConnected = new Set();
@@ -238,9 +272,11 @@ async function connectDevice(usbDevice) {
   try {
     // Guard: ensure we have a valid USBDevice with connect()
     if (!usbDevice || typeof usbDevice.connect !== 'function') {
+      debugLogPush('connectDevice: invalid USBDevice object — missing connect()', 'err');
       setStatus('Invalid device object — please reconnect', 'err');
       return;
     }
+    debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened}`, 'evt');
     setStatus('Connecting...', 'connecting');
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
     const connection = await usbDevice.connect();
@@ -266,9 +302,13 @@ async function connectDevice(usbDevice) {
     }
     if (connection && typeof connection.closed === 'object') {
       connection.closed.then(() => {
+        debugLogPush(`connection.closed: serial=${adbSerial} still_in_map=${connectedDevices.has(adbSerial)}`, 'warn');
         if (connectedDevices.has(adbSerial)) {
           setStatus('Device disconnected: ' + adbSerial, 'warn');
           try { transport.close(); } catch(ex) {}
+          // Stop heartbeat
+          const hbKey2 = 'hb-' + adbSerial;
+          if (window[hbKey2]) { clearInterval(window[hbKey2]); delete window[hbKey2]; }
           connectedDevices.delete(adbSerial);
           availableDevices.delete(adbSerial);
           if (activeSerial === adbSerial) {
@@ -306,6 +346,7 @@ async function connectDevice(usbDevice) {
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
       ]).catch(e => {
         if (!connectedDevices.has(adbSerial)) return;
+        debugLogPush(`heartbeat FAILED: serial=${adbSerial} err=${e.message}`, 'err');
         clearInterval(hbInterval);
         delete window[hbKey];
         const info = connectedDevices.get(adbSerial);
@@ -334,8 +375,9 @@ async function connectDevice(usbDevice) {
 
     if (!_usbDisconnectHandler) {
       _usbDisconnectHandler = (e) => {
-        console.log('[disconnect-event] fired, device:', e.device.vendorId, e.device.productId, e.device.serial);
         const dev = e.device;
+        debugLogPush(`USB disconnect event: VID=${dev.vendorId} PID=${dev.productId} Serial=${dev.serial || '(none)'}`, 'warn');
+        console.log('[disconnect-event] fired, device:', dev.vendorId, dev.productId, dev.serial);
         // Guard: ignore disconnect events for devices we're intentionally disconnecting via button
         if (disconnectingSerial) {
           const info = connectedDevices.get(disconnectingSerial);
@@ -343,6 +385,7 @@ async function connectDevice(usbDevice) {
             const uid = info._usbId;
             if (uid.vendorId === dev.vendorId && uid.productId === dev.productId) {
               if (dev.serial && uid.serial ? dev.serial === uid.serial : true) {
+                debugLogPush(`USB disconnect SUPPRESSED (intentional): serial=${disconnectingSerial}`, 'ok');
                 console.log('[disconnect-event] suppressed (intentional disconnect):', disconnectingSerial);
                 disconnectingSerial = null;
                 return;
@@ -373,11 +416,13 @@ async function connectDevice(usbDevice) {
           if (candidates.length === 1) {
             matchedKey = candidates[0];
           } else if (candidates.length > 1) {
+            debugLogPush(`USB disconnect AMBIGUOUS vid+pid: ${candidates.length} candidates: ${candidates.join(', ')}`, 'warn');
             console.log('[disconnect-event] ambiguous vid+pid match, skipping:', candidates);
           }
         }
         if (matchedKey) {
           const info = connectedDevices.get(matchedKey);
+          debugLogPush(`USB disconnect MATCHED connected: serial=${matchedKey}`, 'err');
           console.log('[disconnect-event] MATCH connected:', matchedKey);
           setStatus('Device disconnected: ' + matchedKey, 'warn');
           try { info.transport.close(); } catch(ex) {}
@@ -446,12 +491,14 @@ async function connectDevice(usbDevice) {
     }
 
     connectedDevices.set(adbSerial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
+    debugLogPush(`connectDevice SUCCESS: serial=${adbSerial} display=${displayName} usb=${usbId.vendorId}:${usbId.productId}:${usbId.serial || '(none)'}`, 'ok');
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adbSerial);
     setStatus('Connected', 'ok');
 
   } catch (err) {
     const msg = err.message || String(err);
+    debugLogPush(`connectDevice FAILED: ${msg}`, 'err');
     if (msg.includes('already in use')) showADBReleaseDialog();
     setStatus('Failed: ' + msg, 'err');
   }
@@ -594,8 +641,10 @@ function selectDevice(serial) {
 }
 
 async function connectAvailable(serial) {
+  debugLogPush(`connectAvailable called: serial=${serial}`, 'evt');
   const info = availableDevices.get(serial);
   if (!info) {
+    debugLogPush(`connectAvailable: NOT found in availableDevices: ${serial}`, 'err');
     setStatus('Device not found in available list: ' + serial, 'err');
     return;
   }
@@ -604,6 +653,7 @@ async function connectAvailable(serial) {
   // STEP 1: Try instant reconnect via getDevices() — no picker if device still granted
   try {
     const granted = await navigator.usb.getDevices();
+    debugLogPush(`connectAvailable: granted=${granted.length} looking for vid+pid=${info._usbId?.vendorId}:${info._usbId?.productId} serial=${info._usbId?.serial || '(none)'}`, 'evt');
     console.log('[connect-available] granted:', granted.length, 'looking for:', info._usbId);
     let usbDevice = null;
     if (info._usbId.serial) {
@@ -613,14 +663,18 @@ async function connectAvailable(serial) {
       usbDevice = granted.find(d => d.vendorId === info._usbId.vendorId && d.productId === info._usbId.productId);
     }
     if (usbDevice) {
+      debugLogPush(`connectAvailable: instant match via getDevices: serial=${usbDevice.serial}`, 'ok');
       console.log('[connect-available] instant match via getDevices:', usbDevice.serial);
       await connectDevice(usbDevice);
       return;
     }
+    debugLogPush(`connectAvailable: no instant match in ${granted.length} granted devices`, 'warn');
   } catch (err) {
+    debugLogPush(`connectAvailable: getDevices() failed: ${err.message}`, 'err');
     console.log('[connect-available] getDevices() failed:', err);
   }
   // STEP 2: Not in granted list — must use picker (unplugged & re-plugged)
+  debugLogPush(`connectAvailable: falling back to picker`, 'warn');
   console.log('[connect-available] no instant match, falling back to picker');
   try {
     const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
@@ -628,8 +682,10 @@ async function connectAvailable(serial) {
     setStatus('Select device to connect...', 'connecting');
     const picked = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
     if (!picked) throw new Error('Device picker cancelled');
+    debugLogPush(`connectAvailable: picker returned: serial=${picked.serial}`, 'evt');
     await connectDevice(picked);
   } catch (err) {
+    debugLogPush(`connectAvailable: picker failed: ${err.message}`, 'err');
     console.log('[connect-available] picker failed:', err);
     setStatus('Connect failed: ' + (err.message || String(err)), 'err');
     availableDevices.set(serial, info);
@@ -637,18 +693,24 @@ async function connectAvailable(serial) {
 }
 
 function disconnectOne(serial) {
+  debugLogPush(`disconnectOne called: serial=${serial}`, 'evt');
   const info = connectedDevices.get(serial);
-  if (!info) return;
+  if (!info) {
+    debugLogPush(`disconnectOne: serial NOT found in connectedDevices: ${serial}`, 'err');
+    return;
+  }
   // Guard: prevent USB disconnect event from deleting this device while we're moving it
   disconnectingSerial = serial;
   // Stop heartbeat before closing transport
   const hbKey = 'hb-' + serial;
   if (window[hbKey]) { clearInterval(window[hbKey]); delete window[hbKey]; }
+  debugLogPush(`disconnectOne: closing transport for ${serial}`, 'evt');
   try { info.transport.close(); } catch(e) {}
   connectedDevices.delete(serial);
   // Move to available — build a clean entry (don't reuse stale usbDevice reference)
   const usbId = info._usbId || {};
   const usbKey = usbId.serial || (usbId.vendorId + ':' + usbId.productId + ':' + Date.now());
+  debugLogPush(`disconnectOne: moved ${serial} to availableDevices as key=${usbKey}`, 'ok');
   // Remove any existing entry for this USB device first (prevent duplicates)
   for (const [akey, ainfo] of availableDevices) {
     if (ainfo._usbId && ainfo._usbId.vendorId === usbId.vendorId && ainfo._usbId.productId === usbId.productId) {

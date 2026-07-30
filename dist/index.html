@@ -458,6 +458,46 @@
     .prop-row { grid-template-columns: 180px 1fr; }
   }
 
+/* Debug Console */
+.debug-console {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 260px;
+  background: var(--bg);
+  border-top: 2px solid var(--yellow);
+  display: flex;
+  flex-direction: column;
+  z-index: 1000;
+}
+.debug-console.hidden { display: none !important; }
+.debug-console-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.35rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: calc(0.75rem * var(--font-scale));
+  color: var(--yellow);
+  font-weight: 600;
+}
+.debug-console-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.4rem 0.75rem;
+  font-family: var(--mono);
+  font-size: calc(0.65rem * var(--font-scale));
+  line-height: 1.6;
+}
+.debug-entry { padding: 0.1rem 0; }
+.debug-ts { color: var(--muted); margin-right: 0.5rem; }
+.debug-evt { color: var(--accent); }
+.debug-warn { color: var(--yellow); }
+.debug-err { color: var(--red); }
+.debug-ok { color: var(--green); }
+
 </style>
 </head>
 <body>
@@ -469,6 +509,7 @@
     <button class="font-btn" onclick="changeFontSize(-1)" title="Decrease font size">A-</button>
     <button class="font-btn" onclick="changeFontSize(1)" title="Increase font size">A+</button>
     <button id="btn-scan" class="btn" onclick="scanDevices()">+ Connect Device</button>
+    <button id="btn-debug" class="btn btn-sm" onclick="toggleDebugConsole()">Debug</button>
   </div>
 </div>
 
@@ -636,6 +677,19 @@
   </div>
 </div>
 
-<script type="module" src="bundle.js?v=2026073011"></script>
+<!-- Debug Console -->
+<div id="debug-console" class="debug-console hidden">
+  <div class="debug-console-header">
+    <span>Debug Console <span id="debug-count" style="color:var(--muted);font-weight:400"></span></span>
+    <div style="display:flex;gap:0.3rem">
+      <button class="btn btn-sm" onclick="clearDebugLog()">Clear</button>
+      <button class="btn btn-sm" onclick="copyDebugLog()">Copy</button>
+      <button class="btn btn-sm" onclick="toggleDebugConsole()">Close</button>
+    </div>
+  </div>
+  <div id="debug-output" class="debug-console-body"></div>
+</div>
+
+<script type="module" src="bundle.js?v=2026073012"></script>
 </body>
 </html>
