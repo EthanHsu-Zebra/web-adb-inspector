@@ -554,79 +554,77 @@ async function connectAvailable(serial) {
   setStatus('Connecting...', 'connecting');
   console.log('[connect-available] attempting reconnect for:', serial, info._displayName, info._usbId);
   try {
-    // CRITICAL: use the stored usbDevice reference — getDevices() returns new objects
-    // whose connect() may be revoked. The original ref from scan is the one with a valid connect().
-    const usbDevice = info.usbDevice;
-    if (!usbDevice || typeof usbDevice.connect !== 'function') {
-      throw new Error('USB device reference lost — please re-pair via +Connect Device button');
+    // Use mgr.requestDevice() — only reliable way to get a valid USB connection
+    // (stored refs lose connect(), getDevices() returns revoked objects)
+    const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
+    if (!mgr) {
+      throw new Error('WebUSB ADB manager not available');
     }
-    console.log('[connect-available] using stored usbDevice:', usbDevice.serial, usbDevice.opened);
-    const connection = await usbDevice.connect();
+    const usbDevice = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
+    if (!usbDevice) {
+      throw new Error('No device selected — please select the correct device');
+    }
+    console.log('[connect-available] picked USBDevice:', usbDevice.serial, usbDevice.vendorId, usbDevice.productId);
     const transport = await AdbDaemonTransport.authenticate({
-      serial: info._usbId.serial || 'usb', connection, credentialStore,
+      serial: usbDevice.serial || 'usb', connection: usbDevice, credentialStore,
       features: ADB_DAEMON_DEFAULT_FEATURES,
       initialDelayedAckBytes: ADB_DAEMON_DEFAULT_INITIAL_PAYLOAD_SIZE,
     });
-    await finishConnect(transport, info, usbDevice);
+    const adb = new Adb(transport);
+    let realSerial = adb.serial;
+    try {
+      const rs = await adb.getProp('ro.serialno');
+      if (rs && rs !== realSerial) realSerial = rs;
+    } catch(e) {}
+    const usbId = {
+      serial: usbDevice.serial,
+      vendorId: usbDevice.vendorId,
+      productId: usbDevice.productId,
+    };
+    let displayName = info._displayName || 'Android Device';
+    try {
+      const model = await adb.getProp('ro.product.model');
+      const brand = await adb.getProp('ro.product.brand');
+      displayName = brand + ' ' + model;
+    } catch(_) {}
+
+    // Heartbeat
+    const hbKey = 'hb-' + realSerial;
+    const hbInterval = setInterval(() => {
+      if (!connectedDevices.has(realSerial)) { clearInterval(hbInterval); delete window[hbKey]; return; }
+      Promise.race([
+        adb.getProp('ro.build.id'),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
+      ]).catch(e => {
+        if (!connectedDevices.has(realSerial)) return;
+        clearInterval(hbInterval); delete window[hbKey];
+        try { transport.close(); } catch(ex) {}
+        connectedDevices.delete(realSerial);
+        if (activeSerial === realSerial) {
+          activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
+        }
+        renderDeviceList();
+        setStatus('Device disconnected: ' + realSerial, 'warn');
+        if (activeSerial) selectDevice(activeSerial);
+        else document.getElementById('inspector-section').classList.add('hidden');
+      });
+    }, 3000);
+    window[hbKey] = hbInterval;
+
+    connectedDevices.set(realSerial, {
+      adb, usbDevice, transport,
+      _displayName: displayName,
+      _usbId: usbId,
+    });
+    renderDeviceList();
+    selectDevice(realSerial);
+    setStatus('Connected', 'ok');
   } catch (err) {
     console.log('[connect-available] failed:', err);
     setStatus('Connect failed: ' + (err.message || String(err)), 'err');
     // Restore to available on failure
     availableDevices.set(serial, info);
   }
-}
-
-// Shared post-connect logic: create Adb, get serial, register heartbeat, render
-async function finishConnect(transport, info, usbDevice) {
-  const adb = new Adb(transport);
-  let realSerial = adb.serial;
-  try {
-    const rs = await adb.getProp('ro.serialno');
-    if (rs && rs !== realSerial) realSerial = rs;
-  } catch(e) {}
-  const usbId = {
-    serial: usbDevice.serial,
-    vendorId: usbDevice.vendorId,
-    productId: usbDevice.productId,
-  };
-  let displayName = info._displayName || 'Android Device';
-  try {
-    const model = await adb.getProp('ro.product.model');
-    const brand = await adb.getProp('ro.product.brand');
-    displayName = brand + ' ' + model;
-  } catch(_) {}
-
-  // Heartbeat
-  const hbKey = 'hb-' + realSerial;
-  const hbInterval = setInterval(() => {
-    if (!connectedDevices.has(realSerial)) { clearInterval(hbInterval); delete window[hbKey]; return; }
-    Promise.race([
-      adb.getProp('ro.build.id'),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
-    ]).catch(e => {
-      if (!connectedDevices.has(realSerial)) return;
-      clearInterval(hbInterval); delete window[hbKey];
-      try { transport.close(); } catch(ex) {}
-      connectedDevices.delete(realSerial);
-      if (activeSerial === realSerial) {
-        activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
-      }
-      renderDeviceList();
-      setStatus('Device disconnected: ' + realSerial, 'warn');
-      if (activeSerial) selectDevice(activeSerial);
-      else document.getElementById('inspector-section').classList.add('hidden');
-    });
-  }, 3000);
-  window[hbKey] = hbInterval;
-
-  connectedDevices.set(realSerial, {
-    adb, usbDevice, transport,
-    _displayName: displayName,
-    _usbId: usbId,
-  });
-  renderDeviceList();
-  selectDevice(realSerial);
-  setStatus('Connected', 'ok');
 }
 
 function disconnectOne(serial) {
@@ -636,9 +634,20 @@ function disconnectOne(serial) {
   // Stop heartbeat
   const hbKey = 'hb-' + serial;
   if (window[hbKey]) { clearInterval(window[hbKey]); delete window[hbKey]; }
-  // Move to available — use USB serial (or vid:pid) as key to match scanAvailableDevices
-  const usbKey = info._usbId?.serial || (info._usbId?.vendorId + ':' + info._usbId?.productId + ':' + Date.now());
+  // Move to available — use SAME key format as scanAvailableDevices
+  // This ensures the disconnect handler can find and remove it
+  const usbId = info._usbId || {};
+  const usbKey = usbId.serial || (usbId.vendorId + ':' + usbId.productId + ':' + Date.now());
   connectedDevices.delete(serial);
+  // Remove any existing entry for this USB device first (prevent duplicates)
+  for (const [akey, ainfo] of availableDevices) {
+    if (ainfo._usbId && ainfo._usbId.vendorId === usbId.vendorId && ainfo._usbId.productId === usbId.productId) {
+      if (!usbId.serial || ainfo._usbId.serial === usbId.serial) {
+        availableDevices.delete(akey);
+        break;
+      }
+    }
+  }
   availableDevices.set(usbKey, info);
   if (activeSerial === serial) {
     activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
