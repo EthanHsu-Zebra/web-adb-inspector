@@ -79,23 +79,20 @@ function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
     document.addEventListener('DOMContentLoaded', init);
     return;
   }
-  checkWebUSB();
-  // iterateKeys() is an async generator (returns AsyncGenerator, not Promise),
-  // so .catch() is undefined. Wrap in an IIFE that returns a Promise.
+  // Show version first — must not depend on anything else succeeding
+  const verEl = document.getElementById('header-version');
+  if (verEl) verEl.textContent = 'v' + APP_VERSION;
+  try { checkWebUSB(); } catch(e) { console.error('checkWebUSB failed:', e); }
   (async () => {
     try {
       for await (const _ of credentialStore.iterateKeys()) {
-        // we just want to verify access works; the keys themselves are unused here
         break;
       }
     } catch (e) {
       try { await credentialStore.generateKey(); } catch (_) {}
     }
   })();
-  applyFontSize();
-  // Show version in header
-  const verEl = document.getElementById('header-version');
-  if (verEl) verEl.textContent = 'v' + APP_VERSION;
+  try { applyFontSize(); } catch(e) {}
 })();
 
 function checkWebUSB() {
