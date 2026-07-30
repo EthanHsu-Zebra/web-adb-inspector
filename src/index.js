@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.40';
+const APP_VERSION = '1.1.42';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -551,78 +551,35 @@ async function connectAvailable(serial) {
     return;
   }
   availableDevices.delete(serial);
-  setStatus('Connecting...', 'connecting');
   console.log('[connect-available] attempting reconnect for:', serial, info._displayName, info._usbId);
   try {
-    // Use mgr.requestDevice() — only reliable way to get a valid USB connection
-    // (stored refs lose connect(), getDevices() returns revoked objects)
-    const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
-    if (!mgr) {
-      throw new Error('WebUSB ADB manager not available');
+    // STEP 1: Try instant reconnect via getDevices() — no picker if device still granted
+    const granted = await navigator.usb.getDevices();
+    console.log('[connect-available] granted:', granted.length, 'looking for:', info._usbId);
+    let usbDevice = null;
+    if (info._usbId.serial) {
+      usbDevice = granted.find(d => d.serial === info._usbId.serial && d.vendorId === info._usbId.vendorId && d.productId === info._usbId.productId);
     }
-    const usbDevice = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
     if (!usbDevice) {
-      throw new Error('No device selected — please select the correct device');
+      usbDevice = granted.find(d => d.vendorId === info._usbId.vendorId && d.productId === info._usbId.productId);
     }
-    console.log('[connect-available] picked USBDevice:', usbDevice.serial, usbDevice.vendorId, usbDevice.productId);
-    const transport = await AdbDaemonTransport.authenticate({
-      serial: usbDevice.serial || 'usb', connection: usbDevice, credentialStore,
-      features: ADB_DAEMON_DEFAULT_FEATURES,
-      initialDelayedAckBytes: ADB_DAEMON_DEFAULT_INITIAL_PAYLOAD_SIZE,
-    });
-    const adb = new Adb(transport);
-    let realSerial = adb.serial;
-    try {
-      const rs = await adb.getProp('ro.serialno');
-      if (rs && rs !== realSerial) realSerial = rs;
-    } catch(e) {}
-    const usbId = {
-      serial: usbDevice.serial,
-      vendorId: usbDevice.vendorId,
-      productId: usbDevice.productId,
-    };
-    let displayName = info._displayName || 'Android Device';
-    try {
-      const model = await adb.getProp('ro.product.model');
-      const brand = await adb.getProp('ro.product.brand');
-      displayName = brand + ' ' + model;
-    } catch(_) {}
-
-    // Heartbeat
-    const hbKey = 'hb-' + realSerial;
-    const hbInterval = setInterval(() => {
-      if (!connectedDevices.has(realSerial)) { clearInterval(hbInterval); delete window[hbKey]; return; }
-      Promise.race([
-        adb.getProp('ro.build.id'),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))
-      ]).catch(e => {
-        if (!connectedDevices.has(realSerial)) return;
-        clearInterval(hbInterval); delete window[hbKey];
-        try { transport.close(); } catch(ex) {}
-        connectedDevices.delete(realSerial);
-        if (activeSerial === realSerial) {
-          activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
-        }
-        renderDeviceList();
-        setStatus('Device disconnected: ' + realSerial, 'warn');
-        if (activeSerial) selectDevice(activeSerial);
-        else document.getElementById('inspector-section').classList.add('hidden');
-      });
-    }, 3000);
-    window[hbKey] = hbInterval;
-
-    connectedDevices.set(realSerial, {
-      adb, usbDevice, transport,
-      _displayName: displayName,
-      _usbId: usbId,
-    });
-    renderDeviceList();
-    selectDevice(realSerial);
-    setStatus('Connected', 'ok');
+    if (usbDevice) {
+      console.log('[connect-available] instant match via getDevices:', usbDevice.serial);
+      // Pass directly to connectDevice — it handles connect(), authenticate, heartbeat, etc.
+      await connectDevice(usbDevice);
+      return;
+    }
+    // STEP 2: Not in granted list — must use picker (unplugged & re-plugged)
+    console.log('[connect-available] no instant match, falling back to picker');
+    const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
+    if (!mgr) throw new Error('WebUSB ADB manager not available');
+    setStatus('Select device to connect...', 'connecting');
+    const picked = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
+    if (!picked) throw new Error('Device picker cancelled');
+    await connectDevice(picked);
   } catch (err) {
     console.log('[connect-available] failed:', err);
     setStatus('Connect failed: ' + (err.message || String(err)), 'err');
-    // Restore to available on failure
     availableDevices.set(serial, info);
   }
 }
