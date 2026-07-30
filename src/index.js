@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.37';
+const APP_VERSION = '1.1.38';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -126,25 +126,30 @@ async function scanAvailableDevices() {
     console.log('[scan-available] granted:', granted.length, 'connected:', connectedDevices.size, 'available:', availableDevices.size);
     for (const usbDevice of granted) {
       const uid = { vendorId: usbDevice.vendorId, productId: usbDevice.productId, serial: usbDevice.serial };
-      // Skip if already connected (match by vendorId+productId)
+      // Build unique key — prefer USB serial for uniqueness across identical models
+      const key = usbDevice.serial || (uid.vendorId + ':' + uid.productId + ':' + Date.now());
+      // Skip if already connected — match by vid+pid+serial (serial must match if present)
       let skip = false;
       for (const [, ci] of connectedDevices) {
-        if (ci._usbId && ci._usbId.vendorId === uid.vendorId && ci._usbId.productId === uid.productId) { skip = true; break; }
+        if (ci._usbId && ci._usbId.vendorId === uid.vendorId && ci._usbId.productId === uid.productId) {
+          if (!uid.serial || ci._usbId.serial === uid.serial) { skip = true; break; }
+        }
       }
       if (skip) continue;
-      // Skip if already available
+      // Skip if already available — match by vid+pid+serial
       for (const [, ai] of availableDevices) {
-        if (ai._usbId && ai._usbId.vendorId === uid.vendorId && ai._usbId.productId === uid.productId) { skip = true; break; }
+        if (ai._usbId && ai._usbId.vendorId === uid.vendorId && ai._usbId.productId === uid.productId) {
+          if (!uid.serial || ai._usbId.serial === uid.serial) { skip = true; break; }
+        }
       }
       if (skip) continue;
-      // Add as available — use usbDevice directly for reconnect
-      const key = usbDevice.serial || (uid.vendorId + ':' + uid.productId + ':unknown');
+      // Add as available
       availableDevices.set(key, {
         adb: null, usbDevice, transport: null,
         _displayName: usbDevice.productName || ('USB Device ' + uid.vendorId + ':' + uid.productId),
         _usbId: uid,
       });
-      console.log('[scan-available] added:', key);
+      console.log('[scan-available] added:', key, 'vid:', uid.vendorId, 'pid:', uid.productId, 'serial:', uid.serial);
     }
     renderDeviceList();
   } catch (err) {
@@ -327,12 +332,18 @@ async function connectDevice(usbDevice) {
           if (!uid) continue;
           const match = uid.vendorId === dev.vendorId && uid.productId === dev.productId;
           if (match) {
-            console.log('[disconnect-event] MATCH:', serial);
-            // Also remove from available (physically gone)
-            availableDevices.delete(serial);
+            console.log('[disconnect-event] MATCH connected:', serial);
             setStatus('Device disconnected: ' + serial, 'warn');
             try { info.transport.close(); } catch(ex) {}
             connectedDevices.delete(serial);
+            // Also remove from availableDevices — match by usbId
+            for (const [akey, ainfo] of availableDevices) {
+              if (ainfo._usbId && ainfo._usbId.vendorId === dev.vendorId && ainfo._usbId.productId === dev.productId) {
+                console.log('[disconnect-event] removing from available:', akey);
+                availableDevices.delete(akey);
+                break;
+              }
+            }
             if (activeSerial === serial) {
               activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
             }
@@ -345,6 +356,17 @@ async function connectDevice(usbDevice) {
             break;
           }
         }
+        // If no match in connected, also check availableDevices (unconnected device unplugged)
+        let removedAvailable = false;
+        for (const [akey, ainfo] of availableDevices) {
+          if (ainfo._usbId && ainfo._usbId.vendorId === dev.vendorId && ainfo._usbId.productId === dev.productId) {
+            console.log('[disconnect-event] removing from available (no match in connected):', akey);
+            availableDevices.delete(akey);
+            removedAvailable = true;
+            break;
+          }
+        }
+        if (removedAvailable) renderDeviceList();
       };
       navigator.usb.addEventListener('disconnect', _usbDisconnectHandler);
     }
@@ -1473,6 +1495,7 @@ window.runAttestationProbe = runAttestationProbe;
 window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;
+window.connectAvailable = connectAvailable;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 async function fetchRKP() {
