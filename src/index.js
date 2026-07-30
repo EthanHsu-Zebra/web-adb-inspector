@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.36';
+const APP_VERSION = '1.1.37';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -64,10 +64,14 @@ function checkWebUSB() {
   b.textContent = 'WebUSB: ready';
   b.className = 'badge ok';
 }
-checkWebUSBStatus();
-
 // Scan for previously granted USB devices on page load
 setTimeout(() => scanAvailableDevices(), 500);
+
+// Listen for new USB devices at any time
+navigator.usb.addEventListener('connect', (e) => {
+  console.log('[usb-connect-event] device:', e.device.vendorId, e.device.productId, e.device.serial);
+  scanAvailableDevices();
+});
 
 function getOS() {
   const u = navigator.userAgent;
@@ -113,8 +117,7 @@ async function scanDevices() {
   }
 }
 
-// Scan for previously granted USB devices and populate the "Ready to Connect" section
-async // Populate "Ready to Connect" section from previously granted USB devices.
+// Populate "Ready to Connect" section from previously granted USB devices.
 // Only adds devices that are NOT already in connectedDevices or availableDevices.
 // Called on page init and on USB connect events.
 async function scanAvailableDevices() {
@@ -344,11 +347,6 @@ async function connectDevice(usbDevice) {
         }
       };
       navigator.usb.addEventListener('disconnect', _usbDisconnectHandler);
-    // On USB connect — rescan available devices
-    navigator.usb.addEventListener('connect', (e) => {
-      console.log('[usb-connect-event] device:', e.device.vendorId, e.device.productId, e.device.serial);
-      scanAvailableDevices();
-    });
     }
 
     connectedDevices.set(adbSerial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
