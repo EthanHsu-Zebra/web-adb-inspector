@@ -120,6 +120,47 @@
   }
   .device-card:hover { border-color: var(--accent); }
   .device-card.active { border-color: var(--accent); background: rgba(88,166,255,0.06); }
+  .section-divider {
+    display: flex;
+    align-items: center;
+    margin: 1.25rem 0 0.75rem;
+  }
+  .section-divider::before,
+  .section-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+  .section-label {
+    padding: 0 0.75rem;
+    font-size: calc(0.7rem * var(--font-scale));
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+  .device-card.available {
+    opacity: 0.7;
+    border-style: dashed;
+  }
+  .device-card.available:hover {
+    opacity: 1;
+  }
+  .btn-connect {
+    background: transparent;
+    color: var(--green);
+    border: 1px solid var(--green);
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    font-size: calc(0.7rem * var(--font-scale));
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-connect:hover {
+    background: rgba(63,185,80,0.15);
+  }
   .dev-info {
     flex: 1 1 auto;
     min-width: 0;
@@ -148,6 +189,10 @@
     border-radius: 50%;
     background: var(--green);
     box-shadow: 0 0 6px rgba(63,185,80,0.4);
+  }
+  .dev-status-dot-gray {
+    background: var(--muted);
+    box-shadow: none;
   }
   .btn-disconnect {
     background: transparent;
@@ -435,6 +480,12 @@
       <p style="margin-top:0.5rem;font-size:calc(0.75rem * var(--font-scale))">Click <strong>+ Connect Device</strong> to connect via USB</p>
     </div>
     <div id="device-list"></div>
+    <div id="available-section" class="hidden">
+      <div class="section-divider">
+        <span class="section-label">Ready to Connect</span>
+      </div>
+      <div id="available-list"></div>
+    </div>
   </div>
 
   <div class="content">

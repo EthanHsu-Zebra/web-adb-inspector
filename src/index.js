@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.33';
+const APP_VERSION = '1.1.34';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -15,6 +15,7 @@ import AdbWebCredentialStore from '@yume-chan/adb-credential-web';
 // --- Global State ---
 const credentialStore = new AdbWebCredentialStore('web-adb-inspector');
 const connectedDevices = new Map();
+const availableDevices = new Map(); // Button-disconnected devices (still physically present)
 let activeSerial = null;
 const dataCache = { props: [], features: [], packages: [] };
 const deviceNicknames = (() => { try { return JSON.parse(localStorage.getItem('device-nicknames') || '{}'); } catch { return {}; } })();
@@ -210,6 +211,7 @@ async function connectDevice(usbDevice) {
           setStatus('Device disconnected: ' + adbSerial, 'warn');
           try { transport.close(); } catch(ex) {}
           connectedDevices.delete(adbSerial);
+          availableDevices.delete(adbSerial);
           if (activeSerial === adbSerial) {
             activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
           }
@@ -247,8 +249,11 @@ async function connectDevice(usbDevice) {
         if (!connectedDevices.has(adbSerial)) return;
         clearInterval(hbInterval);
         delete window[hbKey];
+        const info = connectedDevices.get(adbSerial);
         try { transport.close(); } catch(ex) {}
+        // Physical disconnect — delete entirely (not available)
         connectedDevices.delete(adbSerial);
+        availableDevices.delete(adbSerial);
         if (activeSerial === adbSerial) {
           activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
         }
@@ -279,6 +284,8 @@ async function connectDevice(usbDevice) {
           const match = uid.vendorId === dev.vendorId && uid.productId === dev.productId;
           if (match) {
             console.log('[disconnect-event] MATCH:', serial);
+            // Also remove from available (physically gone)
+            availableDevices.delete(serial);
             setStatus('Device disconnected: ' + serial, 'warn');
             try { info.transport.close(); } catch(ex) {}
             connectedDevices.delete(serial);
@@ -330,23 +337,59 @@ async function readDeviceFile(adb, path) {
 function renderDeviceList() {
   const list = document.getElementById('device-list');
   const welcome = document.getElementById('welcome-msg');
-  if (connectedDevices.size === 0) { list.classList.add('hidden'); welcome.classList.remove('hidden'); return; }
-  welcome.classList.add('hidden'); list.classList.remove('hidden'); list.innerHTML = '';
-  for (const [serial, info] of connectedDevices) {
-    const nick = deviceNicknames[serial] || '';
-    const card = document.createElement('div');
-    card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
-    card.innerHTML = `<div class="dev-info">
-      ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
-      <div class="dev-name">${esc(info._displayName || serial)}</div>
-      <div class="dev-serial">${esc(serial)}</div>
-    </div>
-    <div class="dev-actions">
-      <span class="dev-status-dot" title="Connected"></span>
-      <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();disconnectOne('${serial}')" title="Disconnect">Disconnect</button>
-    </div>`;
-    card.onclick = () => selectDevice(serial);
-    list.appendChild(card);
+  const availSection = document.getElementById('available-section');
+  const hasAny = connectedDevices.size > 0 || availableDevices.size > 0;
+  if (!hasAny) {
+    list.classList.add('hidden');
+    welcome.classList.remove('hidden');
+    availSection.classList.add('hidden');
+    return;
+  }
+  welcome.classList.add('hidden');
+  list.innerHTML = '';
+  if (connectedDevices.size === 0) {
+    list.classList.add('hidden');
+  } else {
+    list.classList.remove('hidden');
+    for (const [serial, info] of connectedDevices) {
+      const nick = deviceNicknames[serial] || '';
+      const card = document.createElement('div');
+      card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
+      card.innerHTML = `<div class="dev-info">
+        ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
+        <div class="dev-name">${esc(info._displayName || serial)}</div>
+        <div class="dev-serial">${esc(serial)}</div>
+      </div>
+      <div class="dev-actions">
+        <span class="dev-status-dot" title="Connected"></span>
+        <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();disconnectOne('${serial}')" title="Disconnect">Disconnect</button>
+      </div>`;
+      card.onclick = () => selectDevice(serial);
+      list.appendChild(card);
+    }
+  }
+  // Render available (button-disconnected) devices
+  if (availableDevices.size === 0) {
+    availSection.classList.add('hidden');
+  } else {
+    availSection.classList.remove('hidden');
+    const availList = document.getElementById('available-list');
+    availList.innerHTML = '';
+    for (const [serial, info] of availableDevices) {
+      const nick = deviceNicknames[serial] || '';
+      const card = document.createElement('div');
+      card.className = 'device-card available';
+      card.innerHTML = `<div class="dev-info">
+        ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
+        <div class="dev-name">${esc(info._displayName || serial)}</div>
+        <div class="dev-serial">${esc(serial)}</div>
+      </div>
+      <div class="dev-actions">
+        <span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
+        <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>
+      </div>`;
+      availList.appendChild(card);
+    }
   }
 }
 
@@ -409,11 +452,43 @@ function selectDevice(serial) {
   fetchRKP();
 }
 
-async function disconnectOne(serial) {
+async function connectAvailable(serial) {
+  const info = availableDevices.get(serial);
+  if (!info) return;
+  availableDevices.delete(serial);
+  // Re-open USB device and reconnect
+  info.usbDevice.connect().then(connection => {
+    return AdbDaemonTransport.authenticate({
+      serial: info.usbDevice.serial || 'usb', connection, credentialStore,
+      features: ADB_DAEMON_DEFAULT_FEATURES,
+      initialDelayedAckBytes: ADB_DAEMON_DEFAULT_INITIAL_PAYLOAD_SIZE,
+    });
+  }).then(transport => {
+    const adb = new Adb(transport);
+    info.adb = adb;
+    info.transport = transport;
+    // Use stored serial — no need to re-query
+    connectedDevices.set(serial, info);
+    availableDevices.delete(serial);
+    renderDeviceList();
+    selectDevice(serial);
+    setStatus('Connected', 'ok');
+  }).catch(err => {
+    console.log('[connectAvailable] failed:', err.message);
+    setStatus('Reconnect failed: ' + err.message, 'err');
+  });
+}
+
+function disconnectOne(serial) {
   const info = connectedDevices.get(serial);
   if (!info) return;
   try { info.transport.close(); } catch(e) {}
+  // Move to available — physically still present
   connectedDevices.delete(serial);
+  availableDevices.set(serial, info);
+  // Stop heartbeat
+  const hbKey = 'hb-' + serial;
+  if (window[hbKey]) { clearInterval(window[hbKey]); delete window[hbKey]; }
   if (activeSerial === serial) {
     activeSerial = connectedDevices.size > 0 ? connectedDevices.keys().next().value : null;
   }

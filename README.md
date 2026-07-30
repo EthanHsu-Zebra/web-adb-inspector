@@ -50,11 +50,39 @@ This project is deployed to GitHub Pages via CI/CD pipeline:
 
 ## Version
 
-**Current:** 1.1.26
+**Current:** 1.1.34
 
 ### Changelog
 
-- **1.1.26** — Heartbeat: replaced `usbDevice.opened` check (never fires on cable removal) with `usbDevice.controlTransferOut()` ping every 2s — throws immediately on physical disconnect. Visible heartbeat counter `(hbt:N)` in device card. scanDevices: always use native WebUSB picker (removed broken custom picker). Bumped APP_VERSION 1.1.25 -> 1.1.26.
+- **1.1.34** — Two-panel sidebar: Connected devices (top) + Ready to Connect (bottom). Disconnect button moves device to "Ready" section instead of removing it. Physical unplug removes it entirely. Available devices have a Connect button to re-establish.
+- **1.1.33** — Disconnect event logging for debugging.
+- **1.1.32** — Fix serial override: `connectedDevices.set()` and `selectDevice()` now use `adbSerial` (from `ro.serialno`) instead of `adb.serial` directly.
+- **1.1.31** — Redesigned device card layout with flex info/actions sections.
+- **1.1.30** — Added `ro.serialno` override, removed heartbeat counter.
+- **1.1.29** — Fixed heartbeat: replaced invalid `controlTransferOut` with `adb.getProp()`.
+- **1.1.28** — Attempted heartbeat fix (incomplete).
+- **1.1.27** — Fixed heartbeat counter text + added ping timing.
+- **1.1.26** — Heartbeat: `usbDevice.controlTransferOut` ping + visible counter.
+- **1.1.25** — Fix "connect is not a function": added type guard in `connectDevice()`. Custom picker: skip already-connected devices.
+- **1.1.24** — Fix heartbeat: `adb.getProp` hangs forever on USB disconnect, use `usbDevice.opened` instead. Custom device picker to show available devices without re-polling.
+- **1.1.23** — Polling heartbeat (3s interval, `adb.getProp`) as last-resort disconnect detection.
+- **1.1.22** — Fix `connection.closed` browser compatibility + multi-device support.
+- **1.1.21** — Fix disconnect detection: `connection.closed` now uses `adb.serial` matching, per-card Disconnect button, handle "transfer was cancelled" errors.
+- **1.1.20** — Event-driven disconnect: replaced unreliable heartbeat with `USBConnection.closed` promise.
+- **1.1.19** — Fix: `navigator.usb.requestDevice()` in connectDevice, filter connected devices.
+- **1.1.18** — Multi-device support: device list sidebar, select to inspect, per-device disconnect.
+- **1.1.17** — Fix WebUSB error handling.
+- **1.1.16** — Add device nickname feature.
+- **1.1.15** — Fix: WebUSB device picker, credential store, font scaling.
+- **1.1.14** — Add font size controls (A-/A+).
+- **1.1.13** — Fix: WebUSB device picker for multi-device.
+- **1.1.12** — Fix: credential store persistence, WebUSB device picker.
+- **1.1.11** — Add WebUSB status badge, fix credential store.
+- **1.1.10** — Fix: ADB transport, credential store, device picker.
+- **1.1.9** — Add device info panel, fix transport.
+- **1.1.8** — Fix: ADB transport, credential store.
+- **1.1.7** — Add WebUSB support, credential store.
+- **1.1.6** — Initial release.
 - **1.1.19** — USB disconnect detection: added heartbeat ping every 5s as fallback for browsers where `navigator.usb` disconnect event fires but serial/vendorId match fails. Bumped APP_VERSION 1.1.18 -> 1.1.19.
 - **1.1.17** — Probe results now persist per device (dataCache.probeBySerial) — switching away and back restores previous probe output. Shell tab: removed Quick Checks and per-button consoles — back to single ADB Shell with input + Run + Clear. Bumped APP_VERSION 1.1.16 -> 1.1.17.
 - **1.1.14** — Shell tab: per-button independent console outputs (Android Ver, Model, Hardware, Battery, Display, WiFi each has their own output panel — no more mixed output). Added "Clear All" button to clear all panels at once. RKP tab: filter out invalid/unset items (empty, "Not set", "Not found", "Not installed" rows are hidden). HW Trust tab: `fetchCSR` now properly detects `cmd identity` errors ("Can't find service", etc.) and shows clean error message instead of crashing with atob decode error. Removed dead APK probe constants. Bumped APP_VERSION 1.1.13 -> 1.1.14.
