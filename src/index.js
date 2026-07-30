@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.31';
+const APP_VERSION = '1.1.32';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -296,9 +296,9 @@ async function connectDevice(usbDevice) {
       navigator.usb.addEventListener('disconnect', _usbDisconnectHandler);
     }
 
-    connectedDevices.set(adb.serial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
+    connectedDevices.set(adbSerial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
     renderDeviceList();
-    if (connectedDevices.size === 1) selectDevice(adb.serial);
+    if (connectedDevices.size === 1) selectDevice(adbSerial);
     setStatus('Connected', 'ok');
 
   } catch (err) {
