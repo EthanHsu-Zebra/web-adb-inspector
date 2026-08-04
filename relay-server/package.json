@@ -1,0 +1,17 @@
+{
+  "name": "web-adb-inspector-relay",
+  "version": "1.0.0",
+  "description": "Self-hosted WebRTC signaling relay for web-adb-inspector's remote sessions (replaces public Nostr relays, which proved unreliable for 1:1 rendezvous - see PROJECT_CONTEXT.md section 12).",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@trystero-p2p/ws-relay": "^0.25.3"
+  }
+}

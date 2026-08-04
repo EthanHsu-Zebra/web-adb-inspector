@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: web-adb-inspector-relay
+    runtime: node
+    plan: free
+    rootDir: relay-server
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
