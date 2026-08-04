@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -806,6 +806,21 @@ function makeRemoteActions(room) {
   };
 }
 
+// joinRoom()'s 3rd-argument callbacks (onJoinError/onPeerHandshake) were never wired up
+// before — meaning any WebRTC handshake failure (e.g. a password/key mismatch, SDP
+// decrypt failure) was being silently swallowed with zero visibility, while everything
+// else (relay connectivity, topic/signaling) checked out fine. This surfaces those.
+function makeJoinCallbacks(label) {
+  return {
+    onJoinError: (err) => {
+      debugLogPush(`remote (${label}): JOIN ERROR: ${JSON.stringify(err)}`, 'err');
+    },
+    onPeerHandshake: (peerId) => {
+      debugLogPush(`remote (${label}): peer handshake completed: peerId=${peerId}`, 'ok');
+    },
+  };
+}
+
 // Diagnostic: inspect the raw RTCPeerConnection state for any in-progress peer, even
 // before trystero's onPeerJoin fires. Distinguishes "signaling never even started a
 // connection attempt" (getPeers() stays empty) from "found each other but ICE is stuck"
@@ -838,7 +853,7 @@ function startShareSession() {
   if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
   const roomId = genRoomId();
   const password = genPassword();
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room);
   remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
   pollIceState(room, 'host', 60);
@@ -982,7 +997,7 @@ function initRemoteViewerIfLinked() {
 
 function joinAsViewer(roomId, password) {
   debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('viewer'));
   const actions = makeRemoteActions(room);
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
