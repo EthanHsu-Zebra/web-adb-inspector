@@ -1,0 +1,20 @@
+v1.2.6: fix text-encoding corruption + pin remote-session relays to guarantee host/viewer overlap
+
+- Fixed mojibake (garbled em-dashes, e.g. em-dash -> â€”) introduced by an
+  earlier PowerShell text-replace command that read the file with the wrong
+  encoding. Affected some code comments and a few user-visible strings
+  (Share modal copy, HW Trust CSR panel headers/errors, a debug log line).
+  No functional/logic impact, but real garbled text was live on the site.
+- Root cause found for the cross-network connection failures: trystero's
+  joinRoom() has each side independently pick 5 random relays out of its
+  ~47-relay pool. Two peers need at least one relay in common to find each
+  other, and independent random draws have roughly a 50%+ chance of zero
+  overlap - which is what was actually causing the inconsistent behavior
+  throughout this investigation (confirmed via matching relay failures in
+  both host and viewer browser consoles pointing at the same two dead
+  relays, ruling out a firewall block).
+- Fix: pin both host and viewer to the same fixed list of 8 relays across
+  different operators (REMOTE_RELAY_URLS), with redundancy set to try all
+  8 - guarantees overlap while tolerating a few being flaky/rate-limited.
+
+Full debugging history documented in PROJECT_CONTEXT.md section 12.
