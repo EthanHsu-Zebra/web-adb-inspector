@@ -1,5 +1,5 @@
-// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.4';
+﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
+const APP_VERSION = '1.2.5';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -25,7 +25,7 @@ let fontSizeLevel = (() => { try { return parseInt(localStorage.getItem('font-si
 
 // --- Remote Session (WebRTC sharing, host or viewer role) ---
 const REMOTE_APP_ID = 'web-adb-inspector-v1';
-// Free/shared public TURN relay (Open Relay Project) — fallback for when direct
+// Free/shared public TURN relay (Open Relay Project) â€” fallback for when direct
 // STUN-only P2P fails (symmetric NAT, restrictive corporate firewalls that block
 // UDP). Port 443/TCP variant is included specifically so TURN traffic can blend
 // in with ordinary HTTPS on networks that block other UDP/TCP ports outright.
@@ -34,16 +34,12 @@ const REMOTE_TURN_CONFIG = [
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
-// trystero-nostr's default pool is ~47 relays (mostly small self-hosted boxes) and picks
-// 5 at random per join. Restrictive corporate web filters often block obscure/uncategorized
-// domains like those wholesale, so pin to a handful of the most established, long-running
-// public relays instead and try ALL of them (redundancy = urls.length) rather than a random 5.
-const REMOTE_RELAY_URLS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.nostr.band',
-  'wss://relay.snort.social',
-];
+// NOTE: trystero-nostr's default relay pool is ~47 relays, 5 picked at random per join â€”
+// deliberately left as the library default. An earlier attempt pinned this to 4 well-known
+// relays, which backfired: repeated test cycles concentrated load onto those same 4 and
+// triggered rate-limiting (confirmed via console: "Trystero: relay failure from
+// wss://relay.damus.io/ - rate-limited"). The random-47 default spreads connection load
+// far better and is not worth overriding.
 let remoteSession = null;
 function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
 // host:   { role:'host', room, roomId, password, trusted:false, viewers:Set<peerId>,
@@ -88,7 +84,7 @@ const SDK_PREFIXES = ['android.hardware.', 'android.software.', 'android.feature
 function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
 
 // --- Init ---
-// Module scripts are deferred — they execute AFTER DOMContentLoaded fires.
+// Module scripts are deferred â€” they execute AFTER DOMContentLoaded fires.
 // Wrapping init in DOMContentLoaded would mean it never runs.
 // Use IIFE that runs immediately + a fallback for non-deferred contexts.
 (function init() {
@@ -128,7 +124,7 @@ function checkWebUSB() {
   b.textContent = 'WebUSB: ready';
   b.className = 'badge ok';
 }
-// Scan for previously granted USB devices on page load (skipped in remote-viewer mode — viewer never touches WebUSB)
+// Scan for previously granted USB devices on page load (skipped in remote-viewer mode â€” viewer never touches WebUSB)
 if (!isViewerMode()) setTimeout(() => scanAvailableDevices(), 500);
 
 // Listen for new USB devices at any time
@@ -158,7 +154,7 @@ function showADBReleaseDialog() {
 }
 
 // --- Device Discovery ---
-// Connect device — always use native WebUSB picker, filter connected after selection
+// Connect device â€” always use native WebUSB picker, filter connected after selection
 async function scanDevices() {
   try {
     const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
@@ -276,7 +272,7 @@ async function showDevicePicker(devices) {
 }
 
 // Helper: handle "transfer was cancelled" errors from WebUSB
-// These fire when USB drops mid-operation — treat as disconnect
+// These fire when USB drops mid-operation â€” treat as disconnect
 function handleUsbError(err, serial) {
   if (err && typeof err === 'object' && 'message' in err && err.message && err.message.includes('transfer was cancelled')) {
     if (connectedDevices.has(serial)) {
@@ -305,8 +301,8 @@ async function connectDevice(usbDevice) {
   try {
     // Guard: ensure we have a valid USBDevice with connect()
     if (!usbDevice || typeof usbDevice.connect !== 'function') {
-      debugLogPush('connectDevice: invalid USBDevice object — missing connect()', 'err');
-      setStatus('Invalid device object — please reconnect', 'err');
+      debugLogPush('connectDevice: invalid USBDevice object â€” missing connect()', 'err');
+      setStatus('Invalid device object â€” please reconnect', 'err');
       return;
     }
     debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened}`, 'evt');
@@ -322,7 +318,7 @@ async function connectDevice(usbDevice) {
 
     const adb = new Adb(transport);
 
-    // Get REAL serial from device property — adb.serial may fall back to USB vendor:product
+    // Get REAL serial from device property â€” adb.serial may fall back to USB vendor:product
     let adbSerial = adb.serial;
     try {
       const realSerial = await adb.getProp('ro.serialno');
@@ -372,7 +368,7 @@ async function connectDevice(usbDevice) {
         delete window[hbKey];
         return;
       }
-      // Silent heartbeat — no UI counter
+      // Silent heartbeat â€” no UI counter
       // adb.getProp throws immediately when USB physically disconnected
       Promise.race([
         adb.getProp('ro.build.id'),
@@ -384,7 +380,7 @@ async function connectDevice(usbDevice) {
         delete window[hbKey];
         const info = connectedDevices.get(adbSerial);
         try { transport.close(); } catch(ex) {}
-        // Physical disconnect — delete entirely (not available)
+        // Physical disconnect â€” delete entirely (not available)
         connectedDevices.delete(adbSerial);
         availableDevices.delete(adbSerial);
         if (activeSerial === adbSerial) {
@@ -437,7 +433,7 @@ async function connectDevice(usbDevice) {
             matchedKey = key; break;
           }
         }
-        // Pass 2: vid+pid fallback — only if exactly one match
+        // Pass 2: vid+pid fallback â€” only if exactly one match
         if (!matchedKey) {
           const candidates = [];
           for (const [key, info] of connectedDevices) {
@@ -490,7 +486,7 @@ async function connectDevice(usbDevice) {
           }
           return;
         }
-        // No match in connected — check availableDevices (unconnected device unplugged)
+        // No match in connected â€” check availableDevices (unconnected device unplugged)
         // Match by serial first, then vid+pid only if unambiguous
         for (const [akey, ainfo] of availableDevices) {
           const au = ainfo._usbId;
@@ -546,7 +542,7 @@ async function adbShell(adb, cmd) {
 
 // --- ADB Sync: read large files from device ---
 async function readDeviceFile(adb, path) {
-  // Use shell 'cat' rather than the documented adb.sync() — it works
+  // Use shell 'cat' rather than the documented adb.sync() â€” it works
   // for any path adb shell can read (/data/local/tmp/, /sdcard/, etc.) and
   // doesn't need the user to wire up a sync protocol wrapper. Suitable
   // for small text files (dumpsys output, probe JSON, etc.).
@@ -684,7 +680,7 @@ async function connectAvailable(serial) {
   }
   availableDevices.delete(serial);
   console.log('[connect-available] attempting reconnect for:', serial, info._displayName, info._usbId);
-  // STEP 1: Try instant reconnect via getDevices() — no picker if device still granted
+  // STEP 1: Try instant reconnect via getDevices() â€” no picker if device still granted
   try {
     const granted = await navigator.usb.getDevices();
     debugLogPush(`connectAvailable: granted=${granted.length} looking for vid+pid=${info._usbId?.vendorId}:${info._usbId?.productId} serial=${info._usbId?.serial || '(none)'}`, 'evt');
@@ -707,7 +703,7 @@ async function connectAvailable(serial) {
     debugLogPush(`connectAvailable: getDevices() failed: ${err.message}`, 'err');
     console.log('[connect-available] getDevices() failed:', err);
   }
-  // STEP 2: Not in granted list — must use picker (unplugged & re-plugged)
+  // STEP 2: Not in granted list â€” must use picker (unplugged & re-plugged)
   debugLogPush(`connectAvailable: falling back to picker`, 'warn');
   console.log('[connect-available] no instant match, falling back to picker');
   try {
@@ -741,7 +737,7 @@ function disconnectOne(serial) {
   debugLogPush(`disconnectOne: closing transport for ${serial}`, 'evt');
   try { info.transport.close(); } catch(e) {}
   connectedDevices.delete(serial);
-  // Move to available — build a clean entry (don't reuse stale usbDevice reference)
+  // Move to available â€” build a clean entry (don't reuse stale usbDevice reference)
   const usbId = info._usbId || {};
   const usbKey = usbId.serial || (usbId.vendorId + ':' + usbId.productId + ':' + Date.now());
   debugLogPush(`disconnectOne: moved ${serial} to availableDevices as key=${usbKey}`, 'ok');
@@ -754,7 +750,7 @@ function disconnectOne(serial) {
       }
     }
   }
-  // Store without stale usbDevice — connectAvailable() will get a fresh one from getDevices()
+  // Store without stale usbDevice â€” connectAvailable() will get a fresh one from getDevices()
   availableDevices.set(usbKey, {
     adb: null, usbDevice: null, transport: null,
     _displayName: info._displayName,
@@ -814,7 +810,7 @@ function startShareSession() {
   if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
   const roomId = genRoomId();
   const password = genPassword();
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
 
@@ -889,7 +885,7 @@ function showShareModal() {
   box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">Share Remote Session</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and, once trusted, run shell commands on it. Treat it like a password — use "Regenerate Link" if it leaks.</p>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and, once trusted, run shell commands on it. Treat it like a password â€” use "Regenerate Link" if it leaks.</p>' +
     '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
     '<input id="share-link-input" type="text" readonly value="' + esc(link) + '" style="flex:1;background:#11111b;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;">' +
     '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
@@ -957,7 +953,7 @@ function initRemoteViewerIfLinked() {
 
 function joinAsViewer(roomId, password) {
   debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
@@ -988,7 +984,7 @@ function joinAsViewer(roomId, password) {
 
   setTimeout(() => {
     if (remoteSession && remoteSession.role === 'viewer' && !remoteSession.hostPeerId) {
-      debugLogPush('remote (viewer): no WebRTC peer joined within 15s — check relay/network connectivity (see README known limitations)', 'err');
+      debugLogPush('remote (viewer): no WebRTC peer joined within 15s â€” check relay/network connectivity (see README known limitations)', 'err');
       setViewerStatus('Still connecting... network may be blocking P2P (see Debug)', 'warn');
     }
   }, 15000);
@@ -1178,7 +1174,7 @@ async function fetchPackages() {
   showLoading('packages', true);
   let method = 'fallback';
   try {
-    // Stream dumpsys output directly via shell protocol — no temp file needed.
+    // Stream dumpsys output directly via shell protocol â€” no temp file needed.
     const text = await adbShell(info.adb, 'dumpsys package 2>&1');
     const packages = parseDumpsysPackage(text);
     document.getElementById('packages-count').textContent = '(' + packages.length + ')';
@@ -1241,7 +1237,7 @@ function renderPackages(packages, fallback, method) {
     else if (p.system) badges += '<span class="pkg-badge sys">sys</span> ';
     const verStr = p.version_name ? ' ' + esc(p.version_name) : '';
     // Always allow expansion if package has any detail-worthy data.
-    // Previously: only expanded if version_name OR permissions present —
+    // Previously: only expanded if version_name OR permissions present â€”
     // but if version_name failed to parse, the user couldn't see permissions.
     const hasDetail = true;
     return '<div class="pkg-item" data-pkg-idx="' + realIdx + '" onclick="togglePkgDetail(' + realIdx + ')">' +
@@ -1263,7 +1259,7 @@ function renderPackageDetail(p) {
   if (p.requested_permissions && p.requested_permissions.length > 0) {
     h += '<div class="pkg-detail-row"><span class="pkg-detail-label">Permissions</span>(' + p.requested_permissions.length + ')</div><div class="pkg-perms">';
     for (const pm of p.requested_permissions.slice(0, 15)) {
-      const g = pm.is_granted !== undefined ? (pm.is_granted ? '✓' : '✗') : '';
+      const g = pm.is_granted !== undefined ? (pm.is_granted ? 'âœ“' : 'âœ—') : '';
       h += '<div class="pkg-perm-item">' + esc(pm.name) + ' <span class="pkg-perm-status">' + g + '</span></div>';
     }
     if (p.requested_permissions.length > 15) h += '<div class="pkg-perm-more">...+' + (p.requested_permissions.length - 15) + ' more</div>';
@@ -1278,7 +1274,7 @@ window.togglePkgDetail = function(idx) {
   const isHidden = el.classList.contains('hidden');
   el.classList.toggle('hidden');
   // Update toggle button in the package row (find by data-attr, not sibling
-  // — sibling lookup can break if browsers insert text nodes between elements)
+  // â€” sibling lookup can break if browsers insert text nodes between elements)
   const pkgRow = document.querySelector('.pkg-item[data-pkg-idx="' + idx + '"]');
   if (pkgRow) {
     const toggle = pkgRow.querySelector('.pkg-toggle');
@@ -1311,7 +1307,7 @@ function parseDumpsysPackage(text) {
   const SIG_RAW   = /^\d+\s*:\s+([0-9A-Fa-f]{40,})$/;
   const SIG_SHA   = /^\d+\s*:\s+SHA256\s*=\s*([0-9A-Fa-f:]{16,})$/;
   const PACKAGE_HEADER = /^Package\s+\[([^\]]+)\]/;
-  // No ^ anchor — must let /g flag walk through line for multi-KV matching
+  // No ^ anchor â€” must let /g flag walk through line for multi-KV matching
   const PKG_FIELD = /(\w+)\s*=/g;
   const PERM_NAME = /^(android\.permission\.|com\.|org\.|app\.)/;
   const PERM_ATTR = /^(granted|flags|protectionLevel|protection_level|protection_level_flags|type|group|maxTargetSdk|label)\s*=/;
@@ -1445,7 +1441,7 @@ function parseDumpsysPackage(text) {
       current.has_default_notification_access = true; continue;
     }
     if (lower.indexOf('accessibility') === 0 && lower.indexOf('service') >= 0) {
-      // "Accessibility Service: com.foo.bar" — parse later
+      // "Accessibility Service: com.foo.bar" â€” parse later
     }
 
     // 3) Inside certs section
@@ -1725,14 +1721,14 @@ async function checkHalService(adb, halName) {
 // RKP: verify provisioned attestation keys actually work, not just network reachability.
 // Real RKP attestation test: ask KeyMint to actually sign with attestation ID 100 (Basic),
 // then check whether a certificate chain was produced. Network ping alone does not prove
-// Google provisioned keys — this does.
+// Google provisioned keys â€” this does.
 async function checkAttestationCapability(adb) {
   try {
     // Step 1: KeyMint attestation ID/version list (proves HAL supports attestation)
     const verOut = await adbShell(adb,
       'cmd key_attestation 2>&1; echo "EXIT:$?"');
 
-    // Step 2: Attempt real attestation via KeyMint — write a tiny Java helper that
+    // Step 2: Attempt real attestation via KeyMint â€” write a tiny Java helper that
     // generates an attestation key and reports whether KeyMint returned a cert chain.
     // We use a one-shot `app process` if available, else fall back to a Java reflection
     // via `cmd statsd` is not available; the cleanest path is `pm path` to check that
@@ -1751,7 +1747,7 @@ async function checkAttestationCapability(adb) {
     const hasVersion100 = /KeyMint Attestation Version:\s*[1-9]/i.test(verOut) ||
                           /attestation_version\s*=\s*[1-9]/i.test(verOut);
 
-    // TLS handshake: nc to play.googleapis.com:443 — open + immediate EOF exit 0 = reachable
+    // TLS handshake: nc to play.googleapis.com:443 â€” open + immediate EOF exit 0 = reachable
     const tlsExitMatch = tlsOut.match(/TLS_EXIT:(\d+)/);
     const tlsExit = tlsExitMatch ? tlsExitMatch[1] : '1';
     const tlsReachable = tlsExit === '0';
@@ -1934,7 +1930,7 @@ function exportJSON(type) {
     }
 
     json = {
-      shared_uid_allowlist: [],  // populated by CTS — empty unless multiple packages share UID
+      shared_uid_allowlist: [],  // populated by CTS â€” empty unless multiple packages share UID
       package: dataCache.packages.map(p => ({
         name: p.name,
         version_name: p.version_name || '(not parsed)',
@@ -2106,7 +2102,7 @@ async function fetchRKP() {
       checkHalService(info.adb, 'android.hardware.biometrics.fingerprint'),
     ]);
 
-    // 5) Boot security (standard AOSP props — work on ALL Android 12+ devices)
+    // 5) Boot security (standard AOSP props â€” work on ALL Android 12+ devices)
     const props = await Promise.allSettled([
       safeGetProp(info.adb, 'ro.boot.flash.locked'),
       safeGetProp(info.adb, 'ro.boot.verifiedbootstate'),
@@ -2126,7 +2122,7 @@ async function fetchRKP() {
                 : `Limited (HAL v${attest.attestationVersion}, TLS: ${attest.tlsReachable ? 'OK' : 'FAIL'})`,
       attest.ok ? 'ok' : 'warn',
       'cmd key_attestation + nc play.googleapis.com:443',
-      'Real attestation test: queries KeyMint HAL for attestation versions (proves HAL supports attestation) + TLS handshake to play.googleapis.com:443 (proves device can reach Google attestation servers). Network ping alone does NOT prove RKP — this combination verifies the prerequisite paths.'
+      'Real attestation test: queries KeyMint HAL for attestation versions (proves HAL supports attestation) + TLS handshake to play.googleapis.com:443 (proves device can reach Google attestation servers). Network ping alone does NOT prove RKP â€” this combination verifies the prerequisite paths.'
     ]);
 
     // KeyMint
@@ -2189,7 +2185,7 @@ async function fetchRKP() {
       'getprop ro.boot.veritymode',
       'DM-Verity mode. enforce=active protection, logging=degraded.']);
 
-    // Filter out invalid/unset rows — only show rows with real data
+    // Filter out invalid/unset rows â€” only show rows with real data
     const validRows = rows.filter(r => {
       const val = (r[1] || '').toString().trim().toLowerCase();
       return val !== '' && val !== 'not set' && val !== 'not found' && val !== 'not installed' && val !== 'not reported';
@@ -2212,7 +2208,7 @@ async function fetchCSR(slot) {
     try {
       csrText = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
     } catch (e) {
-      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:#ff5252">Command failed: ' + esc(String(e.message || e)) + '</div></div>';
+      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR â€” ' + esc(slot) + '</h4></div><div style="color:#ff5252">Command failed: ' + esc(String(e.message || e)) + '</div></div>';
       out.insertAdjacentHTML('beforeend', errHtml);
       showLoading('hwtrust', false);
       return;
@@ -2221,7 +2217,7 @@ async function fetchCSR(slot) {
 
     // Check for error messages (Identity service not available on many devices)
     if (!csrText || /can.t find service|error|failed|usage|invalid/i.test(csrText)) {
-      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:var(--yellow)">Identity service not available on this device</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText) + '</div></div>';
+      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR â€” ' + esc(slot) + '</h4></div><div style="color:var(--yellow)">Identity service not available on this device</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText) + '</div></div>';
       out.insertAdjacentHTML('beforeend', errHtml);
       showLoading('hwtrust', false);
       return;
@@ -2230,7 +2226,7 @@ async function fetchCSR(slot) {
     // Parse PEM (-----BEGIN CERTIFICATE REQUEST----- ... -----END CERTIFICATE REQUEST-----)
     const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
     if (!pemMatch) {
-      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:#ff5252">No PEM certificate found in command output</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText.slice(0, 200)) + '</div></div>';
+      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR â€” ' + esc(slot) + '</h4></div><div style="color:#ff5252">No PEM certificate found in command output</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText.slice(0, 200)) + '</div></div>';
       out.insertAdjacentHTML('beforeend', errHtml);
       showLoading('hwtrust', false);
       return;
@@ -2246,7 +2242,7 @@ async function fetchCSR(slot) {
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       derSha256 = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     } catch (e) {
-      derSha256 = '(unable to compute — ' + (e.message || e) + ')';
+      derSha256 = '(unable to compute â€” ' + (e.message || e) + ')';
     }
 
     // Cache for export
@@ -2262,7 +2258,7 @@ async function fetchCSR(slot) {
     const html =
       '<div class="panel" style="margin-top:0.5rem">' +
       '<div class="panel-header">' +
-      '<h4>CSR — ' + esc(slot) + '</h4>' +
+      '<h4>CSR â€” ' + esc(slot) + '</h4>' +
       '<div class="panel-actions">' +
       '<button class="btn btn-sm" onclick="copyCSR(\'' + esc(slot) + '\')">Copy PEM</button>' +
       '</div>' +
@@ -2292,7 +2288,7 @@ function copyCSR(slot) {
   });
 }
 
-// --- APK probe removed (v1.1.14) — OEM ROMs block shell-launched app processes ---
+// --- APK probe removed (v1.1.14) â€” OEM ROMs block shell-launched app processes ---
 
 async function runAttestationProbe() {
   const info = connectedDevices.get(activeSerial);
