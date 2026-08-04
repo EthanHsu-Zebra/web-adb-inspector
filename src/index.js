@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.7';
+const APP_VERSION = '1.3.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -11,7 +11,7 @@ import {
   AdbDefaultInterfaceFilter,
 } from '@yume-chan/adb-daemon-webusb';
 import AdbWebCredentialStore from '@yume-chan/adb-credential-web';
-import { joinRoom } from '@trystero-p2p/nostr';
+import { joinRoom } from '@trystero-p2p/ws-relay';
 
 // --- Global State ---
 const credentialStore = new AdbWebCredentialStore('web-adb-inspector');
@@ -34,32 +34,13 @@ const REMOTE_TURN_CONFIG = [
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
-// trystero-nostr's default behavior: each joinRoom() call independently picks 5 random
-// relays out of its ~47-relay pool. For two peers to find each other they need at least
-// one relay in COMMON — with independent random 5-of-47 draws on each side, there's
-// roughly a 50%+ chance of zero overlap, which is the real reason connections were
-// inconsistent (sometimes two viewers found each other, sometimes nobody found anybody —
-// confirmed 2026-08-04 via matching console failures on the same dead relays on both sides).
-// Fix: pin both host and viewer to this IDENTICAL list so overlap is guaranteed, sized
-// large enough (8, spread across different operators) that 2-3 being flaky/rate-limited
-// doesn't matter. (An earlier attempt pinned to just 4 popular relays and got rate-limited
-// under our own repeated test cycles — this list is bigger specifically to spread load.)
-const REMOTE_RELAY_URLS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.nostr.band',
-  'wss://relay.snort.social',
-  'wss://relay.primal.net',
-  'wss://purplerelay.com',
-  'wss://communities.nos.social',
-  'wss://relay.mostr.pub',
-];
-// NOTE: trystero-nostr's default relay pool is ~47 relays, 5 picked at random per join —
-// deliberately left as the library default. An earlier attempt pinned this to 4 well-known
-// relays, which backfired: repeated test cycles concentrated load onto those same 4 and
-// triggered rate-limiting (confirmed via console: "Trystero: relay failure from
-// wss://relay.damus.io/ - rate-limited"). The random-47 default spreads connection load
-// far better and is not worth overriding.
+// Signaling: self-hosted relay (relay-server/, deployed on Render), not public Nostr
+// relays. Three rounds of public-relay debugging (2026-08-04, see PROJECT_CONTEXT.md
+// section 12) found they're unreliable for a quick 1:1 host/viewer rendezvous —
+// rate-limiting under repeated use, and independent random relay selection meaning
+// host and viewer often shared no relay in common. A dedicated relay we control removes
+// both problems entirely.
+const REMOTE_RELAY_URLS = ['wss://web-adb-inspector-relay.onrender.com'];
 let remoteSession = null;
 function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
 // host:   { role:'host', room, roomId, password, trusted:false, viewers:Set<peerId>,
