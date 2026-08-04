@@ -1,21 +1,21 @@
 # Web ADB Inspector — Project Context (Complete Handover)
 
-Last updated: 2026-07-30
-Current version: v1.1.42
+Last updated: 2026-08-04
+Current version: v1.2.0
 
 ## 1. Project Overview
 
-Browser-based Android device inspector using **WebUSB + ADB protocol**. Runs 100% client-side — no server, no ADB installed on host.
+Browser-based Android device inspector using **WebUSB + ADB protocol**. Runs 100% client-side — no server, no ADB installed on host. Now also supports **remote-shared sessions** (see §13): a second user, anywhere, with just a browser, can view live device status and run approved shell commands against the host's physically-connected device via WebRTC.
 
-- Source repo: `Ethanhsu/web-adb-inspector` (public)
-- Deploy repo: `Ethanhsu.github.io` (clones source, builds, deploys to GitHub Pages)
-- Live URL: https://Ethanhsu.github.io/
-- Working directory: `/home/ethan/projects/web-adb-inspector`
+- Source repo (upstream): `Ethanhsu/web-adb-inspector` (public)
+- This fork: `EthanHsu-Zebra/web-adb-inspector` — self-deploys directly to its own GitHub Pages (no separate deploy repo)
+- Local working directory: `C:\Users\nqx678\OneDrive - Zebra Technologies\VSCodeProject\web-adb-inspector`
 
 ### Core Dependencies (package.json)
 - `@yume-chan/adb` ^2.6.0 — ADB protocol library
 - `@yume-chan/adb-daemon-webusb` ^2.3.2 — WebUSB transport for ADB daemon
 - `@yume-chan/adb-credential-web` ^2.1.0 — ADB credential store (localStorage-backed)
+- `@trystero-p2p/nostr` ^0.25.3 — serverless WebRTC room signaling (Nostr relays) for remote sessions
 - `esbuild` ^0.20.0 — bundler (devDependency)
 
 ### Build
@@ -127,27 +127,22 @@ Registered ONCE on `navigator.usb.addEventListener('disconnect', ...)`:
 
 ## 4. Deployment Pipeline
 
-### Flow
+### Flow (self-contained — no separate deploy repo, unlike upstream)
 ```
-Ethanhsu/web-adb-inspector (main) --push--> GitHub Actions
-  --> clones into Ethanhsu.github.io
+EthanHsu-Zebra/web-adb-inspector (master) --push--> GitHub Actions (.github/workflows/deploy.yml)
   --> npm ci + node build.mjs
-  --> copies dist/* to Ethanhsu.github.io root
-  --> git push --> GitHub Pages serves from Ethanhsu.github.io
+  --> actions/upload-pages-artifact (dist/)
+  --> actions/deploy-pages --> GitHub Pages serves this repo's own Pages site
 ```
+Live URL: `https://ethanhsu-zebra.github.io/web-adb-inspector/`
+One manual, non-code prerequisite: repo Settings → Pages → Source = "GitHub Actions".
 
 ### Trigger deployment
-```bash
-gh workflow run --repo Ethanhsu/Ethanhsu.github.io "Build and deploy from web-adb-tool"
-```
-Deployment takes ~30-60 seconds total.
+Just push to `master` (or `workflow_dispatch` from the Actions tab). No cross-repo `gh workflow run` needed anymore.
 
 ### Verify deployment
 ```bash
-# Check HTML version
-curl -sL "https://Ethanhsu.github.io/index.html" | grep -oP 'bundle\.js\?[^\"]+'
-# Check bundle contains specific code
-curl -s "https://Ethanhsu.github.io/bundle.js?v=..." | grep -oP 'search term'
+curl -sL "https://ethanhsu-zebra.github.io/web-adb-inspector/index.html" | grep -oP 'bundle\.js\?[^\"]+'
 ```
 
 ### Cache-busting
@@ -156,7 +151,7 @@ curl -s "https://Ethanhsu.github.io/bundle.js?v=..." | grep -oP 'search term'
 - Users must hard refresh (Ctrl+Shift+R) after deployment.
 
 ### Workflow file location
-The workflow lives in `dist/.github/workflows/deploy.yml` (yes, inside the dist folder, because the deploy repo IS the dist folder).
+Top-level `.github/workflows/deploy.yml` in this fork (the legacy `dist/.github/workflows/deploy.yml`, which targeted the old cross-repo flow, has been removed).
 
 ## 5. UI Structure (dist/index.html)
 
@@ -238,22 +233,22 @@ scanAvailableDevices()
 _usbDisconnectHandler !== null
 
 # Deploy
-cd /home/ethan/projects/web-adb-inspector
 node build.mjs
+# then manually bump the ?v= cache-bust param in dist/index.html
 git add -A && git commit -m "message" && git push
-gh workflow run --repo Ethanhsu/Ethanhsu.github.io "Build and deploy from web-adb-tool"
+# GitHub Actions builds + deploys to Pages automatically on push to master
 
 # Verify deployment
 sleep 45
-curl -sL "https://Ethanhsu.github.io/index.html" | grep 'bundle.js?v='
+curl -sL "https://ethanhsu-zebra.github.io/web-adb-inspector/index.html" | grep 'bundle.js?v='
 ```
 
 ## 9. File Structure
 
 ```
-/home/ethan/projects/web-adb-inspector/
+web-adb-inspector/  (this fork)
 ├── .gitignore
-├── .github/           (NOT present — workflow is in dist/.github/)
+├── .github/workflows/deploy.yml  — self-contained Pages CI/CD (checkout -> build -> deploy-pages)
 ├── ATTESTATION_DEBUG_JOURNAL.md  — debug notes for attestation feature
 ├── NOTICE.md          — third-party notices
 ├── PROJECT_CONTEXT.md  — THIS FILE
@@ -261,15 +256,14 @@ curl -sL "https://Ethanhsu.github.io/index.html" | grep 'bundle.js?v='
 ├── apk/               — attestation-test.apk (debug-signed)
 ├── build.mjs          — esbuild config
 ├── dist/
-│   ├── .github/workflows/deploy.yml  — CI/CD pipeline
-│   ├── index.html     — served by GitHub Pages
+│   ├── index.html     — served by GitHub Pages (built dist/ is deployed as the Pages artifact)
 │   ├── bundle.js      — production bundle
 │   └── bundle.js.map  — sourcemap
 ├── node_modules/
 ├── package.json
 ├── package-lock.json
 └── src/
-    └── index.js       — ALL application code (~2050 lines)
+    └── index.js       — ALL application code (~2400+ lines, incl. Remote Session, §12)
 ```
 
 ## 10. Important Conventions
@@ -291,11 +285,34 @@ curl -sL "https://Ethanhsu.github.io/index.html" | grep 'bundle.js?v='
 - `AdbDaemonTransport.authenticate()` — takes `{ serial, connection, credentialStore, features, initialDelayedAckBytes }`. `connection` must be a `USBConnection` from `usbDevice.connect()`, NOT a `USBDevice`.
 - `connection.closed` — Promise that resolves when USB connection closes. Use for disconnect detection.
 
-## 12. Session Recovery Checklist
+## 12. Remote Session (WebRTC sharing)
+
+Lets a second user (viewer), anywhere, with just a browser, join a session a host creates and (once approved/trusted) run adb shell commands against the host's connected device. Fully peer-to-peer — no server of ours; signaling goes over public Nostr relays via `@trystero-p2p/nostr`'s `joinRoom({appId, password}, roomId)`.
+
+### State
+`remoteSession` (module-level, `src/index.js`) — either `null`, a host session (`{role:'host', room, roomId, password, trusted, viewers:Set, actions, pendingApprovals:Map}`), or a viewer session (`{role:'viewer', room, roomId, password, hostPeerId, actions, pendingRequests:Map, mirror:{activeSerial, connected[], available[]}}`).
+
+### Host flow
+1. `startShareSession()` — generates roomId/password (`crypto.getRandomValues`), joins a trystero room, wires up actions, shows the share modal (`showShareModal()`, built at runtime like `showDevicePicker()`).
+2. `renderDeviceList()` has a single hook (`if (remoteSession?.role === 'host') broadcastDeviceState();`) that pushes a serializable device snapshot to all viewers on every state change — this is what keeps requirement "viewer sees live connect/disconnect" in sync, without touching every call site.
+3. Incoming `cmdRequest` from a viewer → `handleRemoteCmdRequest()`. If `remoteSession.trusted` is false (the default, every session), it queues in `pendingApprovals` and shows a banner (`#remote-approval-bar`) with Approve/Deny. Either path funnels into `executeRemoteShell()`, which calls the **same unmodified `adbShell()`** used by the local `runShell()` — no duplicated shell logic.
+
+### Viewer flow
+1. A link `#room=<id>&key=<password>` — the URL fragment is never sent to any server. `initRemoteViewerIfLinked()` (called from `init()`) detects it and calls `joinAsViewer()`, which skips WebUSB entirely (`isViewerMode()` guards the page-load `scanAvailableDevices()` call and the `navigator.usb` `connect` listener).
+2. `renderMirrorDeviceList()` mirrors the host's device list into the same `#device-list`/`#welcome-msg` sidebar elements the host UI uses (read-only, no connect/disconnect buttons) — reuses existing CSS rather than a parallel UI.
+3. `#viewer-shell-section` is a dedicated remote-shell panel; `sendRemoteCommand()` sends a `cmdRequest` to the host and `handleCmdResponse()` renders the result once approved.
+4. All three inbound viewer listeners (`devicePush`, `cmdResponse`, `bye`) check `ctx.peerId === remoteSession.hostPeerId` before acting — without that, a second peer in the same room could spoof messages to another viewer (trystero has no built-in sender-role enforcement).
+
+### Known limitations (v1)
+- No TURN server configured — STUN-only. Some restrictive/symmetric-NAT networks may fail to establish the P2P connection; add a `turnConfig` to `joinRoom()` if real-world testing shows this.
+- "Trust this session" auto-approves commands from *any* peer currently in the room, not just the original viewer — the approval gate, not viewer identity, is the real safety control.
+- Viewer mirror only covers the device list + shell — Properties/Features/Packages/Attestation tabs are not (yet) mirrored to viewers.
+
+## 13. Session Recovery Checklist
 
 When starting a new session on this project:
 1. Read this file first
 2. Check current version: `grep APP_VERSION src/index.js`
 3. Check git status: `git status && git log --oneline -5`
-4. Check deployment status: `curl -sL "https://Ethanhsu.github.io/index.html" | grep 'bundle.js?v='`
-5. If code changes needed: edit `src/index.js` → `node build.mjs` → update cache-bust in `dist/index.html` → commit → push → trigger workflow
+4. Check deployment status: `curl -sL "https://ethanhsu-zebra.github.io/web-adb-inspector/index.html" | grep 'bundle.js?v='`
+5. If code changes needed: edit `src/index.js` → `node build.mjs` → update cache-bust in `dist/index.html` → commit → push (Pages deploys automatically via `.github/workflows/deploy.yml`)

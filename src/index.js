@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.1.43';
+const APP_VERSION = '1.2.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -11,6 +11,7 @@ import {
   AdbDefaultInterfaceFilter,
 } from '@yume-chan/adb-daemon-webusb';
 import AdbWebCredentialStore from '@yume-chan/adb-credential-web';
+import { joinRoom } from '@trystero-p2p/nostr';
 
 // --- Global State ---
 const credentialStore = new AdbWebCredentialStore('web-adb-inspector');
@@ -21,6 +22,16 @@ let disconnectingSerial = null;  // serial currently being intentionally disconn
 const dataCache = { props: [], features: [], packages: [] };
 const deviceNicknames = (() => { try { return JSON.parse(localStorage.getItem('device-nicknames') || '{}'); } catch { return {}; } })();
 let fontSizeLevel = (() => { try { return parseInt(localStorage.getItem('font-size-level') || '0', 10); } catch { return 0; } })();
+
+// --- Remote Session (WebRTC sharing, host or viewer role) ---
+const REMOTE_APP_ID = 'web-adb-inspector-v1';
+let remoteSession = null;
+function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
+// host:   { role:'host', room, roomId, password, trusted:false, viewers:Set<peerId>,
+//           actions:{hello,devicePush,cmdRequest,cmdResponse,bye}, pendingApprovals:Map<requestId,{peerId,serial,command}> }
+// viewer: { role:'viewer', room, roomId, password, hostPeerId:null,
+//           actions:{...}, pendingRequests:Map<requestId,{cmd}>,
+//           mirror:{ activeSerial:null, connected:[], available:[] } }
 
 // --- Debug Console ---
 const debugLog = [];
@@ -68,6 +79,7 @@ function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
     return;
   }
   checkWebUSB();
+  initRemoteViewerIfLinked();
   // iterateKeys() is an async generator (returns AsyncGenerator, not Promise),
   // so .catch() is undefined. Wrap in an IIFE that returns a Promise.
   (async () => {
@@ -97,15 +109,17 @@ function checkWebUSB() {
   b.textContent = 'WebUSB: ready';
   b.className = 'badge ok';
 }
-// Scan for previously granted USB devices on page load
-setTimeout(() => scanAvailableDevices(), 500);
+// Scan for previously granted USB devices on page load (skipped in remote-viewer mode — viewer never touches WebUSB)
+if (!isViewerMode()) setTimeout(() => scanAvailableDevices(), 500);
 
 // Listen for new USB devices at any time
-navigator.usb.addEventListener('connect', (e) => {
-  debugLogPush(`USB connect event: VID=${e.device.vendorId} PID=${e.device.productId} Serial=${e.device.serial || '(none)'}`, 'ok');
-  console.log('[usb-connect-event] device:', e.device.vendorId, e.device.productId, e.device.serial);
-  scanAvailableDevices();
-});
+if (!isViewerMode()) {
+  navigator.usb.addEventListener('connect', (e) => {
+    debugLogPush(`USB connect event: VID=${e.device.vendorId} PID=${e.device.productId} Serial=${e.device.serial || '(none)'}`, 'ok');
+    console.log('[usb-connect-event] device:', e.device.vendorId, e.device.productId, e.device.serial);
+    scanAvailableDevices();
+  });
+}
 
 function getOS() {
   const u = navigator.userAgent;
@@ -579,6 +593,7 @@ function renderDeviceList() {
       availList.appendChild(card);
     }
   }
+  if (remoteSession && remoteSession.role === 'host') broadcastDeviceState();
 }
 
 function selectDevice(serial) {
@@ -756,6 +771,263 @@ async function disconnectDevice() {
     selectDevice(activeSerial);
   }
   renderDeviceList();
+}
+
+// --- Remote Session: shared helpers ---
+function randomToken(byteLen) {
+  const bytes = crypto.getRandomValues(new Uint8Array(byteLen));
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+function genRoomId() { return randomToken(8); }
+function genPassword() { return randomToken(16); }
+function makeRemoteActions(room) {
+  return {
+    hello: room.makeAction('hello'),
+    devicePush: room.makeAction('devicePush'),
+    cmdRequest: room.makeAction('cmdRequest'),
+    cmdResponse: room.makeAction('cmdResponse'),
+    bye: room.makeAction('bye'),
+  };
+}
+
+// --- Remote Session: Host ---
+function startShareSession() {
+  if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
+  const roomId = genRoomId();
+  const password = genPassword();
+  const room = joinRoom({ appId: REMOTE_APP_ID, password }, roomId);
+  const actions = makeRemoteActions(room);
+  remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
+
+  actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
+  actions.cmdRequest.onMessage = (data, ctx) => handleRemoteCmdRequest(data, ctx.peerId);
+  room.onPeerJoin = (peerId) => { remoteSession.viewers.add(peerId); updateShareModalViewerCount(); };
+  room.onPeerLeave = (peerId) => handlePeerLeaveHost(peerId);
+
+  debugLogPush(`remote session started: roomId=${roomId}`, 'ok');
+  showShareModal();
+}
+
+async function stopShareSession() {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  try { remoteSession.actions.bye.send({ reason: 'host_stopped' }); } catch (_) {}
+  try { await remoteSession.room.leave(); } catch (_) {}
+  remoteSession = null;
+  hideShareModal();
+  setStatus('Remote session ended', 'warn');
+}
+
+function buildDeviceSnapshot() {
+  const conn = [];
+  for (const [serial, info] of connectedDevices) {
+    conn.push({ serial, displayName: info._displayName || serial, nickname: deviceNicknames[serial] || '' });
+  }
+  const avail = [];
+  for (const [serial, info] of availableDevices) {
+    avail.push({ serial, displayName: info._displayName || serial, nickname: deviceNicknames[serial] || '' });
+  }
+  return { activeSerial, connected: conn, available: avail };
+}
+
+function broadcastDeviceState() {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  try { remoteSession.actions.devicePush.send(buildDeviceSnapshot()); } catch (_) {}
+}
+
+function handleViewerHello(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  debugLogPush(`remote viewer hello: peerId=${peerId}`, 'evt');
+  remoteSession.viewers.add(peerId);
+  try { remoteSession.actions.devicePush.send(buildDeviceSnapshot(), { target: peerId }); } catch (_) {}
+  updateShareModalViewerCount();
+}
+
+function handlePeerLeaveHost(peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  remoteSession.viewers.delete(peerId);
+  for (const [reqId, req] of remoteSession.pendingApprovals) {
+    if (req.peerId === peerId) { remoteSession.pendingApprovals.delete(reqId); removeApprovalPrompt(reqId); }
+  }
+  updateShareModalViewerCount();
+}
+
+function showShareModal() {
+  hideShareModal();
+  const link = location.origin + location.pathname + '#room=' + remoteSession.roomId + '&key=' + remoteSession.password;
+  const overlay = document.createElement('div');
+  overlay.id = 'share-modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.onclick = (e) => { if (e.target === overlay) hideShareModal(); };
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+  box.innerHTML =
+    '<h3 style="margin:0 0 12px;font-size:18px;">Share Remote Session</h3>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and, once trusted, run shell commands on it. Treat it like a password — use "Regenerate Link" if it leaks.</p>' +
+    '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
+    '<input id="share-link-input" type="text" readonly value="' + esc(link) + '" style="flex:1;background:#11111b;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;">' +
+    '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
+    '<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;cursor:pointer;">' +
+    '<input type="checkbox" id="share-trust-checkbox"> Trust this session (auto-run commands from any connected viewer, no approval prompt)</label>' +
+    '<div style="font-size:12px;color:#a6adc6;margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
+    '<button class="btn btn-sm" id="share-regen-btn">Regenerate Link</button>' +
+    '<button class="btn btn-sm" id="share-stop-btn" style="color:#f38ba8;">Stop Sharing</button>' +
+    '<button class="btn" id="share-close-btn">Done</button></div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  document.getElementById('share-copy-btn').onclick = () => {
+    navigator.clipboard.writeText(link).then(() => setStatus('Link copied', 'ok')).catch(() => {});
+  };
+  document.getElementById('share-trust-checkbox').onchange = (e) => {
+    if (remoteSession) remoteSession.trusted = e.target.checked;
+  };
+  document.getElementById('share-regen-btn').onclick = async () => { await stopShareSession(); startShareSession(); };
+  document.getElementById('share-stop-btn').onclick = () => stopShareSession();
+  document.getElementById('share-close-btn').onclick = () => hideShareModal();
+  updateShareModalViewerCount();
+}
+
+function hideShareModal() {
+  const el = document.getElementById('share-modal-overlay');
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
+function updateShareModalViewerCount() {
+  const el = document.getElementById('share-viewer-count');
+  if (el && remoteSession && remoteSession.role === 'host') el.textContent = String(remoteSession.viewers.size);
+}
+
+function showApprovalPrompt(requestId, serial, command) {
+  const bar = document.getElementById('remote-approval-bar');
+  if (!bar) return;
+  bar.classList.remove('hidden');
+  const devName = (connectedDevices.get(serial) || {})._displayName || serial;
+  const row = document.createElement('div');
+  row.className = 'approval-row';
+  row.id = 'approval-' + requestId;
+  row.innerHTML = '<span class="approval-text">Remote viewer wants to run <code>' + esc(command) + '</code> on <strong>' + esc(devName) + '</strong></span>' +
+    '<button class="btn btn-sm" onclick="approveRemoteCommand(\'' + requestId + '\')">Approve</button>' +
+    '<button class="btn btn-sm" onclick="denyRemoteCommand(\'' + requestId + '\')" style="color:#f38ba8;">Deny</button>';
+  bar.appendChild(row);
+}
+function removeApprovalPrompt(requestId) {
+  const row = document.getElementById('approval-' + requestId);
+  if (row && row.parentNode) row.parentNode.removeChild(row);
+  const bar = document.getElementById('remote-approval-bar');
+  if (bar && !bar.querySelector('.approval-row')) bar.classList.add('hidden');
+}
+
+// --- Remote Session: Viewer ---
+function initRemoteViewerIfLinked() {
+  const hash = location.hash || '';
+  const rm = hash.match(/room=([^&]+)/);
+  const km = hash.match(/key=([^&]+)/);
+  if (!rm || !km) return false;
+  joinAsViewer(decodeURIComponent(rm[1]), decodeURIComponent(km[1]));
+  return true;
+}
+
+function joinAsViewer(roomId, password) {
+  const room = joinRoom({ appId: REMOTE_APP_ID, password }, roomId);
+  const actions = makeRemoteActions(room);
+  remoteSession = {
+    role: 'viewer', room, roomId, password, hostPeerId: null, actions,
+    pendingRequests: new Map(),
+    mirror: { activeSerial: null, connected: [], available: [] },
+  };
+
+  room.onPeerJoin = (peerId) => {
+    remoteSession.hostPeerId = peerId;
+    try { actions.hello.send({ appVersion: APP_VERSION }, { target: peerId }); } catch (_) {}
+    setViewerStatus('Connected to host', 'ok');
+  };
+  room.onPeerLeave = (peerId) => { if (peerId === remoteSession.hostPeerId) showHostDisconnectedBanner(); };
+  actions.devicePush.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) renderMirrorDeviceList(data); };
+  actions.cmdResponse.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) handleCmdResponse(data); };
+  actions.bye.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) showHostDisconnectedBanner(); };
+
+  renderViewerShell();
+  setViewerStatus('Connecting to host...', 'connecting');
+}
+
+function leaveRemoteSession() {
+  if (!remoteSession || remoteSession.role !== 'viewer') return;
+  try {
+    if (remoteSession.hostPeerId) remoteSession.actions.bye.send({ reason: 'viewer_left' }, { target: remoteSession.hostPeerId });
+  } catch (_) {}
+  try { remoteSession.room.leave(); } catch (_) {}
+  remoteSession = null;
+  location.hash = '';
+  location.reload();
+}
+
+function renderViewerShell() {
+  document.getElementById('btn-scan')?.classList.add('hidden');
+  document.getElementById('btn-share')?.classList.add('hidden');
+  document.getElementById('welcome-msg')?.classList.add('hidden');
+  document.getElementById('available-section')?.classList.add('hidden');
+  document.getElementById('inspector-section')?.classList.add('hidden');
+  document.getElementById('viewer-banner')?.classList.remove('hidden');
+  document.getElementById('viewer-shell-section')?.classList.remove('hidden');
+  renderMirrorDeviceList({ activeSerial: null, connected: [], available: [] });
+}
+
+function setViewerStatus(text, type) {
+  const el = document.getElementById('viewer-status');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'badge ' + (type === 'ok' ? 'ok' : type === 'err' ? 'err' : '');
+}
+
+function showHostDisconnectedBanner() {
+  setViewerStatus('Host disconnected', 'err');
+  const input = document.getElementById('viewer-shell-input');
+  if (input) input.disabled = true;
+}
+
+function renderMirrorDeviceList(snapshot) {
+  if (!remoteSession || remoteSession.role !== 'viewer') return;
+  remoteSession.mirror.connected = snapshot.connected || [];
+  remoteSession.mirror.available = snapshot.available || [];
+  if (!remoteSession.mirror.activeSerial || !remoteSession.mirror.connected.some(d => d.serial === remoteSession.mirror.activeSerial)) {
+    remoteSession.mirror.activeSerial = snapshot.activeSerial || (remoteSession.mirror.connected[0] && remoteSession.mirror.connected[0].serial) || null;
+  }
+  const list = document.getElementById('device-list');
+  const welcome = document.getElementById('welcome-msg');
+  if (!list || !welcome) return;
+  const hasAny = remoteSession.mirror.connected.length > 0 || remoteSession.mirror.available.length > 0;
+  if (!hasAny) {
+    list.classList.add('hidden');
+    welcome.innerHTML = '<div class="icon">&#x1F4F1;</div><p>Waiting for host to connect a device...</p>';
+    welcome.classList.remove('hidden');
+    return;
+  }
+  welcome.classList.add('hidden');
+  list.classList.remove('hidden');
+  list.innerHTML = '';
+  for (const dev of remoteSession.mirror.connected) {
+    const card = document.createElement('div');
+    card.className = 'device-card' + (remoteSession.mirror.activeSerial === dev.serial ? ' active' : '');
+    card.innerHTML = '<div class="dev-info">' +
+      (dev.nickname ? '<div class="dev-nick">' + esc(dev.nickname) + '</div>' : '') +
+      '<div class="dev-name">' + esc(dev.displayName || dev.serial) + '</div>' +
+      '<div class="dev-serial">' + esc(dev.serial) + '</div></div>' +
+      '<div class="dev-actions"><span class="dev-status-dot" title="Connected on host"></span></div>';
+    card.onclick = () => { remoteSession.mirror.activeSerial = dev.serial; renderMirrorDeviceList({ activeSerial: dev.serial, connected: remoteSession.mirror.connected, available: remoteSession.mirror.available }); };
+    list.appendChild(card);
+  }
+  for (const dev of remoteSession.mirror.available) {
+    const card = document.createElement('div');
+    card.className = 'device-card available';
+    card.innerHTML = '<div class="dev-info">' +
+      (dev.nickname ? '<div class="dev-nick">' + esc(dev.nickname) + '</div>' : '') +
+      '<div class="dev-name">' + esc(dev.displayName || dev.serial) + '</div>' +
+      '<div class="dev-serial">' + esc(dev.serial) + '</div></div>' +
+      '<div class="dev-actions"><span class="dev-status-dot dev-status-dot-gray" title="Ready on host (not connected)"></span></div>';
+    list.appendChild(card);
+  }
 }
 
 // --- Nickname ---
@@ -1501,6 +1773,96 @@ async function runShell() {
 }
 function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runShell(); }
 
+// --- Remote Shell: host executes on behalf of a remote viewer, gated by approval ---
+function handleRemoteCmdRequest(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { requestId, serial, command } = data || {};
+  if (!requestId || !command) return;
+  if (!connectedDevices.has(serial)) {
+    try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: 'device not connected' }, { target: peerId }); } catch (_) {}
+    return;
+  }
+  if (remoteSession.trusted) {
+    executeRemoteShell(peerId, { requestId, serial, command });
+    return;
+  }
+  remoteSession.pendingApprovals.set(requestId, { peerId, serial, command });
+  showApprovalPrompt(requestId, serial, command);
+}
+
+function approveRemoteCommand(requestId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const req = remoteSession.pendingApprovals.get(requestId);
+  if (!req) return;
+  remoteSession.pendingApprovals.delete(requestId);
+  removeApprovalPrompt(requestId);
+  executeRemoteShell(req.peerId, { requestId, serial: req.serial, command: req.command });
+}
+
+function denyRemoteCommand(requestId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const req = remoteSession.pendingApprovals.get(requestId);
+  if (!req) return;
+  remoteSession.pendingApprovals.delete(requestId);
+  removeApprovalPrompt(requestId);
+  try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, denied: true }, { target: req.peerId }); } catch (_) {}
+}
+
+async function executeRemoteShell(peerId, { requestId, serial, command }) {
+  const info = connectedDevices.get(serial);
+  if (!info) {
+    try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: 'device not connected' }, { target: peerId }); } catch (_) {}
+    return;
+  }
+  try {
+    const output = await adbShell(info.adb, command);
+    if (activeSerial === serial) {
+      const outEl = document.getElementById('shell-output');
+      if (outEl) { outEl.textContent += '[remote] $ ' + command + '\n' + output + '\n'; outEl.scrollTop = outEl.scrollHeight; }
+    }
+    remoteSession.actions.cmdResponse.send({ requestId, ok: true, output }, { target: peerId });
+  } catch (err) {
+    remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: String(err.message || err) }, { target: peerId });
+  }
+}
+
+// --- Remote Shell: viewer-side driver ---
+function sendRemoteCommand() {
+  const input = document.getElementById('viewer-shell-input');
+  const output = document.getElementById('viewer-shell-output');
+  if (!input || !output || !remoteSession || remoteSession.role !== 'viewer') return;
+  const cmd = input.value.trim();
+  if (!cmd) return;
+  if (!remoteSession.hostPeerId) { output.textContent += '$ ' + cmd + '\nError: not connected to host yet\n'; return; }
+  if (!remoteSession.mirror.activeSerial) { output.textContent += '$ ' + cmd + '\nError: no device selected\n'; return; }
+  input.value = '';
+  const requestId = crypto.randomUUID();
+  remoteSession.pendingRequests.set(requestId, { cmd });
+  output.textContent += '$ ' + cmd + '  (pending host approval...)\n';
+  output.scrollTop = output.scrollHeight;
+  try {
+    remoteSession.actions.cmdRequest.send({ requestId, serial: remoteSession.mirror.activeSerial, command: cmd }, { target: remoteSession.hostPeerId });
+  } catch (err) {
+    output.textContent += 'Error sending command: ' + (err.message || err) + '\n';
+  }
+}
+
+function handleCmdResponse(data) {
+  const output = document.getElementById('viewer-shell-output');
+  if (!output || !remoteSession) return;
+  const { requestId, ok, output: out, error, denied } = data || {};
+  remoteSession.pendingRequests.delete(requestId);
+  if (denied) output.textContent += '(denied by host)\n';
+  else if (ok) output.textContent += (out || '') + '\n';
+  else output.textContent += 'Error: ' + (error || 'unknown error') + '\n';
+  output.scrollTop = output.scrollHeight;
+}
+
+function clearViewerShell() {
+  const el = document.getElementById('viewer-shell-output');
+  if (el) el.textContent = '';
+}
+
 // --- Export JSON ---
 function exportJSON(type) {
   let json, fn;
@@ -1622,6 +1984,13 @@ window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;
 window.connectAvailable = connectAvailable;
+window.startShareSession = startShareSession;
+window.stopShareSession = stopShareSession;
+window.approveRemoteCommand = approveRemoteCommand;
+window.denyRemoteCommand = denyRemoteCommand;
+window.leaveRemoteSession = leaveRemoteSession;
+window.sendRemoteCommand = sendRemoteCommand;
+window.clearViewerShell = clearViewerShell;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 async function fetchRKP() {
