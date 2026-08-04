@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -801,10 +801,17 @@ function startShareSession() {
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
   actions.cmdRequest.onMessage = (data, ctx) => handleRemoteCmdRequest(data, ctx.peerId);
-  room.onPeerJoin = (peerId) => { remoteSession.viewers.add(peerId); updateShareModalViewerCount(); };
-  room.onPeerLeave = (peerId) => handlePeerLeaveHost(peerId);
+  room.onPeerJoin = (peerId) => {
+    debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
+    remoteSession.viewers.add(peerId);
+    updateShareModalViewerCount();
+  };
+  room.onPeerLeave = (peerId) => {
+    debugLogPush(`remote (host): WebRTC peer left: peerId=${peerId}`, 'warn');
+    handlePeerLeaveHost(peerId);
+  };
 
-  debugLogPush(`remote session started: roomId=${roomId}`, 'ok');
+  debugLogPush(`remote session started: roomId=${roomId} appId=${REMOTE_APP_ID}`, 'ok');
   showShareModal();
 }
 
@@ -930,6 +937,7 @@ function initRemoteViewerIfLinked() {
 }
 
 function joinAsViewer(roomId, password) {
+  debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
   const room = joinRoom({ appId: REMOTE_APP_ID, password }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = {
@@ -939,14 +947,32 @@ function joinAsViewer(roomId, password) {
   };
 
   room.onPeerJoin = (peerId) => {
+    debugLogPush(`remote (viewer): WebRTC peer joined: peerId=${peerId}`, 'ok');
     remoteSession.hostPeerId = peerId;
     try { actions.hello.send({ appVersion: APP_VERSION }, { target: peerId }); } catch (_) {}
     setViewerStatus('Connected to host', 'ok');
   };
-  room.onPeerLeave = (peerId) => { if (peerId === remoteSession.hostPeerId) showHostDisconnectedBanner(); };
-  actions.devicePush.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) renderMirrorDeviceList(data); };
-  actions.cmdResponse.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) handleCmdResponse(data); };
+  room.onPeerLeave = (peerId) => {
+    debugLogPush(`remote (viewer): WebRTC peer left: peerId=${peerId}`, 'warn');
+    if (peerId === remoteSession.hostPeerId) showHostDisconnectedBanner();
+  };
+  actions.devicePush.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) { debugLogPush(`remote (viewer): ignored devicePush from non-host peerId=${ctx.peerId}`, 'warn'); return; }
+    renderMirrorDeviceList(data);
+  };
+  actions.cmdResponse.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    debugLogPush(`remote (viewer): cmdResponse received requestId=${data && data.requestId}`, 'evt');
+    handleCmdResponse(data);
+  };
   actions.bye.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) showHostDisconnectedBanner(); };
+
+  setTimeout(() => {
+    if (remoteSession && remoteSession.role === 'viewer' && !remoteSession.hostPeerId) {
+      debugLogPush('remote (viewer): no WebRTC peer joined within 15s — check relay/network connectivity (see README known limitations)', 'err');
+      setViewerStatus('Still connecting... network may be blocking P2P (see Debug)', 'warn');
+    }
+  }, 15000);
 
   renderViewerShell();
   setViewerStatus('Connecting to host...', 'connecting');
@@ -1777,6 +1803,7 @@ function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runSh
 function handleRemoteCmdRequest(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   const { requestId, serial, command } = data || {};
+  debugLogPush(`remote (host): cmdRequest from peerId=${peerId} serial=${serial} command=${command}`, 'evt');
   if (!requestId || !command) return;
   if (!connectedDevices.has(serial)) {
     try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: 'device not connected' }, { target: peerId }); } catch (_) {}
