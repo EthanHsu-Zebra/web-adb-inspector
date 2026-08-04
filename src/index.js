@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.2';
+const APP_VERSION = '1.2.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1824,6 +1824,7 @@ function handleRemoteCmdRequest(data, peerId) {
   }
   remoteSession.pendingApprovals.set(requestId, { peerId, serial, command });
   showApprovalPrompt(requestId, serial, command);
+  debugLogPush(`remote (host): approval prompt shown for requestId=${requestId} (bar present: ${!!document.getElementById('remote-approval-bar')})`, 'evt');
 }
 
 function approveRemoteCommand(requestId) {
@@ -1876,11 +1877,17 @@ function sendRemoteCommand() {
   remoteSession.pendingRequests.set(requestId, { cmd });
   output.textContent += '$ ' + cmd + '  (pending host approval...)\n';
   output.scrollTop = output.scrollHeight;
-  try {
-    remoteSession.actions.cmdRequest.send({ requestId, serial: remoteSession.mirror.activeSerial, command: cmd }, { target: remoteSession.hostPeerId });
-  } catch (err) {
-    output.textContent += 'Error sending command: ' + (err.message || err) + '\n';
-  }
+  debugLogPush(`remote (viewer): sending cmdRequest requestId=${requestId} to hostPeerId=${remoteSession.hostPeerId}`, 'evt');
+  Promise.resolve(
+    remoteSession.actions.cmdRequest.send({ requestId, serial: remoteSession.mirror.activeSerial, command: cmd }, { target: remoteSession.hostPeerId })
+  ).then(() => {
+    debugLogPush(`remote (viewer): cmdRequest send() resolved requestId=${requestId}`, 'ok');
+  }).catch(err => {
+    debugLogPush(`remote (viewer): cmdRequest send() FAILED requestId=${requestId}: ${err && err.message || err}`, 'err');
+    output.textContent += 'Error sending command: ' + (err && err.message || err) + '\n';
+    output.scrollTop = output.scrollHeight;
+    remoteSession.pendingRequests.delete(requestId);
+  });
 }
 
 function handleCmdResponse(data) {
@@ -1997,6 +2004,9 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 
 // Expose to window (HTML onclick/oninput needs globals)
 window.dataCache = dataCache;
+window.toggleDebugConsole = toggleDebugConsole;
+window.clearDebugLog = clearDebugLog;
+window.copyDebugLog = copyDebugLog;
 window.scanDevices = scanDevices;
 window.disconnectDevice = disconnectDevice;
 window.disconnectOne = disconnectOne;
