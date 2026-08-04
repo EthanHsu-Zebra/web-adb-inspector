@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.6';
+const APP_VERSION = '1.2.7';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -825,6 +825,33 @@ function makeRemoteActions(room) {
   };
 }
 
+// Diagnostic: inspect the raw RTCPeerConnection state for any in-progress peer, even
+// before trystero's onPeerJoin fires. Distinguishes "signaling never even started a
+// connection attempt" (getPeers() stays empty) from "found each other but ICE is stuck"
+// (a peer entry exists with iceConnectionState stuck at checking/failed/disconnected) —
+// the latter points at the network blocking the actual media/TURN path, not signaling.
+function pollIceState(room, label, maxTries) {
+  let tries = 0;
+  const iv = setInterval(() => {
+    tries++;
+    try {
+      const peers = room.getPeers();
+      const ids = Object.keys(peers);
+      if (ids.length === 0) {
+        debugLogPush(`remote (${label}): ICE poll #${tries} — no peer connection objects exist yet`, 'warn');
+      } else {
+        for (const id of ids) {
+          const pc = peers[id];
+          debugLogPush(`remote (${label}): ICE poll #${tries} peerId=${id} iceConnectionState=${pc.iceConnectionState} connectionState=${pc.connectionState} iceGatheringState=${pc.iceGatheringState}`, 'evt');
+        }
+      }
+    } catch (err) {
+      debugLogPush(`remote (${label}): ICE poll failed: ${err && err.message || err}`, 'err');
+    }
+    if (tries >= maxTries) clearInterval(iv);
+  }, 3000);
+}
+
 // --- Remote Session: Host ---
 function startShareSession() {
   if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
@@ -833,6 +860,7 @@ function startShareSession() {
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
+  pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
   actions.cmdRequest.onMessage = (data, ctx) => handleRemoteCmdRequest(data, ctx.peerId);
@@ -980,6 +1008,7 @@ function joinAsViewer(roomId, password) {
     pendingRequests: new Map(),
     mirror: { activeSerial: null, connected: [], available: [] },
   };
+  pollIceState(room, 'viewer', 60);
 
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (viewer): WebRTC peer joined: peerId=${peerId}`, 'ok');
