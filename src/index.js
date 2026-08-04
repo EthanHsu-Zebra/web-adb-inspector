@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.3';
+const APP_VERSION = '1.2.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -33,6 +33,16 @@ const REMOTE_TURN_CONFIG = [
   { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+];
+// trystero-nostr's default pool is ~47 relays (mostly small self-hosted boxes) and picks
+// 5 at random per join. Restrictive corporate web filters often block obscure/uncategorized
+// domains like those wholesale, so pin to a handful of the most established, long-running
+// public relays instead and try ALL of them (redundancy = urls.length) rather than a random 5.
+const REMOTE_RELAY_URLS = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.nostr.band',
+  'wss://relay.snort.social',
 ];
 let remoteSession = null;
 function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
@@ -804,7 +814,7 @@ function startShareSession() {
   if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
   const roomId = genRoomId();
   const password = genPassword();
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
 
@@ -947,7 +957,7 @@ function initRemoteViewerIfLinked() {
 
 function joinAsViewer(roomId, password) {
   debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
