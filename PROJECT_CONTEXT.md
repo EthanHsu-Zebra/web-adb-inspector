@@ -304,7 +304,8 @@ Lets a second user (viewer), anywhere, with just a browser, join a session a hos
 4. All three inbound viewer listeners (`devicePush`, `cmdResponse`, `bye`) check `ctx.peerId === remoteSession.hostPeerId` before acting — without that, a second peer in the same room could spoof messages to another viewer (trystero has no built-in sender-role enforcement).
 
 ### Known limitations (v1)
-- No TURN server configured — STUN-only. Some restrictive/symmetric-NAT networks may fail to establish the P2P connection; add a `turnConfig` to `joinRoom()` if real-world testing shows this.
+- `REMOTE_TURN_CONFIG` (near `remoteSession` state) wires in the free/shared Open Relay Project TURN servers (incl. a 443/TCP option to blend in with restrictive corporate firewalls) as a fallback when direct STUN-only P2P fails. First real cross-network test (2026-08-04, two different networks incl. one corporate) failed with "Connected viewers: 0" on the host — i.e. the WebRTC peer connection never formed — before this fix landed; that symptom is consistent with either (a) ICE/STUN failing without a TURN fallback, or (b) the Nostr relay signaling itself being blocked by a firewall. TURN addresses (a); if it still fails after this, the signaling layer (Nostr relay reachability) is the next thing to check — the Debug Console now logs `remote (viewer): joining room=...` at signaling time and `WebRTC peer joined` at the point ICE actually succeeds, so a stall between those two lines points at signaling, not ICE.
+- Open Relay's TURN servers are free/shared and rate-limited — fine for personal/team use, not a production SLA.
 - "Trust this session" auto-approves commands from *any* peer currently in the room, not just the original viewer — the approval gate, not viewer identity, is the real safety control.
 - Viewer mirror only covers the device list + shell — Properties/Features/Packages/Attestation tabs are not (yet) mirrored to viewers.
 

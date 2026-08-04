@@ -1,5 +1,5 @@
 // Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.2.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -25,6 +25,15 @@ let fontSizeLevel = (() => { try { return parseInt(localStorage.getItem('font-si
 
 // --- Remote Session (WebRTC sharing, host or viewer role) ---
 const REMOTE_APP_ID = 'web-adb-inspector-v1';
+// Free/shared public TURN relay (Open Relay Project) — fallback for when direct
+// STUN-only P2P fails (symmetric NAT, restrictive corporate firewalls that block
+// UDP). Port 443/TCP variant is included specifically so TURN traffic can blend
+// in with ordinary HTTPS on networks that block other UDP/TCP ports outright.
+const REMOTE_TURN_CONFIG = [
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+];
 let remoteSession = null;
 function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
 // host:   { role:'host', room, roomId, password, trusted:false, viewers:Set<peerId>,
@@ -795,7 +804,7 @@ function startShareSession() {
   if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
   const roomId = genRoomId();
   const password = genPassword();
-  const room = joinRoom({ appId: REMOTE_APP_ID, password }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
 
@@ -938,7 +947,7 @@ function initRemoteViewerIfLinked() {
 
 function joinAsViewer(roomId, password) {
   debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
-  const room = joinRoom({ appId: REMOTE_APP_ID, password }, roomId);
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG }, roomId);
   const actions = makeRemoteActions(room);
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
