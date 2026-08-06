@@ -194,7 +194,14 @@ Selected device card has highlighted border.
 
 ## 7. Known Bugs and Fixes
 
-### v1.1.42 (current) — FIXED
+### v1.3.2 — FIXED: "invalid USBDevice object — missing connect()" on Ready-to-Connect
+This was actually the same root-cause class of bug as v1.1.41/v1.1.42 below, recurring because that earlier fix's "use `getDevices()`" was ambiguous about *which* `getDevices()`. `connectAvailable()` and `scanAvailableDevices()` were both calling `navigator.usb.getDevices()` — the plain native WebUSB API, which returns bare `USBDevice` objects. `.connect()` is **not** part of the WebUSB spec at all; it only exists on `AdbDaemonWebUsbDevice`, the wrapper type that `AdbDaemonWebUsbDeviceManager.BROWSER`'s own `requestDevice()`/`getDevices()` methods return. The "+Connect Device" button worked because `scanDevices()` already went through `mgr.requestDevice()` (wrapped); the "Ready to Connect" list's `connectAvailable()` went through the native, unwrapped `getDevices()` instead, so its found device lacked `.connect()` and tripped `connectDevice()`'s guard clause.
+
+This same mismatch also explained a second symptom: a device already in `connectedDevices` (recorded via the wrapped `.serial`) kept reappearing as a duplicate "Ready to Connect" ghost entry with a fresh `vid:pid:timestamp` key on every scan — because the *old*, buggy `scanAvailableDevices()` computed its dedup key from the *native* device's `.serial` (empty/undefined for this hardware), which never matched the wrapped device's `.serial` the connected entry was keyed by.
+
+Fix: both functions now call `AdbDaemonWebUsbDeviceManager.BROWSER.getDevices({filters:[AdbDefaultInterfaceFilter]})` instead of `navigator.usb.getDevices()`. Since `AdbDaemonWebUsbDevice` doesn't expose `vendorId`/`productId` directly (only via its `.raw` property, the underlying native `USBDevice`), all vid/pid comparisons in these two functions now go through `d.raw.vendorId`/`d.raw.productId` instead of `d.vendorId`/`d.productId`.
+
+### v1.1.42 — FIXED
 - `pipeTo` error: `connectAvailable()` was passing raw `USBDevice` to `AdbDaemonTransport.authenticate()` as `connection` parameter. Fix: use `getDevices()` + pass matching device to `connectDevice()` which handles `connect()` -> `USBConnection` properly.
 
 ### v1.1.41 — pipeTo error (superseded by 1.1.42)
@@ -207,6 +214,7 @@ Selected device card has highlighted border.
 
 ### Historical patterns
 - **WebUSB device references are transient**: `getDevices()` returns fresh objects each time. Never cache `usbDevice` across connections — always re-acquire via `getDevices()` or `requestDevice()`.
+- **"`getDevices()`" is ambiguous — always mean `AdbDaemonWebUsbDeviceManager.BROWSER.getDevices()`**, never bare `navigator.usb.getDevices()`. Only the manager's version returns the wrapped `AdbDaemonWebUsbDevice` (with `.connect()`); the native one returns plain `USBDevice` objects that will fail `connectDevice()`'s guard clause. See v1.3.2 above — this exact ambiguity is what caused it to recur after v1.1.42.
 - **ADB serial vs USB serial**: `adb.serial` comes from USB device, `ro.serialno` may differ. Always use `adbSerial` (from `ro.serialno` if available) as the Map key in `connectedDevices`.
 - **Heartbeat must use ADB protocol, not raw USB**: `usbDevice.controlTransferOut` was unreliable. Current approach: `adb.getProp('ro.build.id')` with 1s timeout, 3s interval.
 

@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -186,7 +186,16 @@ async function scanDevices() {
 // Called on page init and on USB connect events.
 async function scanAvailableDevices() {
   try {
-    const granted = await navigator.usb.getDevices();
+    // NOTE: must use the yume-chan manager's getDevices(), not navigator.usb.getDevices()
+    // directly — the latter returns plain native USBDevice objects with no .connect()
+    // method at all (that's not part of the WebUSB spec; it's a convenience method the
+    // manager's own wrapped AdbDaemonWebUsbDevice type adds). Storing/matching against
+    // raw native devices here is what made connectAvailable() fail with "invalid USBDevice
+    // object — missing connect()" despite an identical-looking device working fine via the
+    // "+Connect Device" picker (which goes through mgr.requestDevice(), already wrapped).
+    const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
+    if (!mgr) return;
+    const granted = await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] });
     debugLogPush(`scanAvailableDevices: granted=${granted.length} connected=${connectedDevices.size} available=${availableDevices.size}`, 'evt');
     console.log('[scan-available] granted:', granted.length, 'connected:', connectedDevices.size, 'available:', availableDevices.size);
     // Build a set of known vid:pid:serial for O(1) lookup
@@ -205,7 +214,7 @@ async function scanAvailableDevices() {
       }
     }
     for (const usbDevice of granted) {
-      const uid = { vendorId: usbDevice.vendorId, productId: usbDevice.productId, serial: usbDevice.serial };
+      const uid = { vendorId: usbDevice.raw.vendorId, productId: usbDevice.raw.productId, serial: usbDevice.serial };
       const uidKey = uid.vendorId + ':' + uid.productId + ':' + (uid.serial || '');
       // Skip if already connected or available (exact vid+pid+serial match)
       if (knownConnected.has(uidKey)) {
@@ -220,7 +229,7 @@ async function scanAvailableDevices() {
       const key = usbDevice.serial || (uid.vendorId + ':' + uid.productId + ':' + Date.now());
       availableDevices.set(key, {
         adb: null, usbDevice, transport: null,
-        _displayName: usbDevice.productName || ('USB Device ' + uid.vendorId + ':' + uid.productId),
+        _displayName: usbDevice.name || ('USB Device ' + uid.vendorId + ':' + uid.productId),
         _usbId: uid,
       });
       console.log('[scan-available] added:', key, 'vid:', uid.vendorId, 'pid:', uid.productId, 'serial:', uid.serial);
@@ -683,15 +692,19 @@ async function connectAvailable(serial) {
   console.log('[connect-available] attempting reconnect for:', serial, info._displayName, info._usbId);
   // STEP 1: Try instant reconnect via getDevices() — no picker if device still granted
   try {
-    const granted = await navigator.usb.getDevices();
+    // Must use the manager's getDevices() (returns wrapped AdbDaemonWebUsbDevice, with
+    // .connect()), not navigator.usb.getDevices() (plain native USBDevice, no .connect()
+    // at all) — see the matching note in scanAvailableDevices().
+    const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
+    const granted = mgr ? await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] }) : [];
     debugLogPush(`connectAvailable: granted=${granted.length} looking for vid+pid=${info._usbId?.vendorId}:${info._usbId?.productId} serial=${info._usbId?.serial || '(none)'}`, 'evt');
     console.log('[connect-available] granted:', granted.length, 'looking for:', info._usbId);
     let usbDevice = null;
     if (info._usbId.serial) {
-      usbDevice = granted.find(d => d.serial === info._usbId.serial && d.vendorId === info._usbId.vendorId && d.productId === info._usbId.productId);
+      usbDevice = granted.find(d => d.serial === info._usbId.serial && d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
     }
     if (!usbDevice) {
-      usbDevice = granted.find(d => d.vendorId === info._usbId.vendorId && d.productId === info._usbId.productId);
+      usbDevice = granted.find(d => d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
     }
     if (usbDevice) {
       debugLogPush(`connectAvailable: instant match via getDevices: serial=${usbDevice.serial}`, 'ok');
