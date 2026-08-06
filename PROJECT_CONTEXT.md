@@ -197,6 +197,13 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.5.7 — accepted this can't be fixed purely in-page; added a one-click Reload
+v1.5.6's pre-emptive `close()`-before-every-attempt *also* didn't recover it — confirmed the exact same "Failed to execute 'open'... device was disconnected" error persisted through a full 7-attempt retry cycle even with that in place. That result actually rules out the "still open from a previous attempt" theory entirely: an unconditional `close()` before every attempt, including the very first, should clear any such state if that were the real cause, and it didn't.
+
+Revised (final, for now) theory: this is most likely a problem inside the browser's own per-page WebUSB bookkeeping, not in anything our device-object handling can reach. Chrome/Edge's WebUSB implementation is backed by a connection between the page and the browser's internal USB service for each device; if that gets into a bad state, `getDevices()` calls within the *same page* may keep handing back references tied to that same broken internal state no matter how many times it's re-fetched or how carefully `open()`/`close()` are sequenced from script. Only an actual page reload tears down and re-establishes that connection — which matches every observation throughout this entire investigation: hard refresh has been 100% reliable; nothing else has, including several different open/close strategies.
+
+Given that, no further in-page JS retry/cleanup logic is expected to fix this — accepted this needs a real reload, and made that reload one click instead of manual: `showADBReleaseDialog()` is no longer a plain `alert()`; it's a proper modal (matching the existing Share/Help modal style) with a **Reload Page** button (`location.reload()`) alongside the existing troubleshooting guidance, shown whenever `isDeviceBusyError()` matches — which includes the final failure after all of `connectAvailable()`/`scanDevices()`'s retries are exhausted.
+
 ### v1.5.6 — v1.5.5 wasn't sufficient: pre-emptive close-before-open added
 v1.5.5's cleanup only runs when `usbDevice.connect()` itself *succeeds* and a later step (almost always `AdbDaemonTransport.authenticate()`) fails afterward — it does nothing for `Failed to execute 'open' on 'USBDevice': The device was disconnected'`, since that error comes from the `open()` call itself rejecting, meaning `openedConnection` never becomes `true` and there's nothing for that catch-block cleanup to close. Confirmed this exact error still persisted across a full 7-attempt retry cycle (twice) even with v1.5.5 deployed — a hard refresh was still needed to recover.
 

@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.6';
+const APP_VERSION = '1.5.7';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -172,13 +172,42 @@ function isDeviceBusyError(msg) {
     m.includes('access denied');
 }
 
+// A custom modal (not a plain alert()) specifically so it can offer a one-click Reload
+// button — confirmed (2026-08-06, see PROJECT_CONTEXT.md) that once this failure starts
+// recurring within a page, no amount of retrying or closing/reopening the device from our
+// own code recovers it; only an actual page reload does, reliably, every time. Most likely
+// a stuck per-page WebUSB<->browser-service connection that our script has no way to reset
+// short of the page itself reloading.
 function showADBReleaseDialog() {
+  hideADBReleaseDialog();
   const os = getOS();
   let t, b;
-  if (os === 'windows') { t = 'Release the device on Windows'; b = 'Something else on this machine likely has the device open (a background adb.exe/ADB server, Android Studio, or vendor device-management software).\n\n1. Command Prompt: adb kill-server\n2. Or: taskkill /F /IM adb.exe\n3. Also check Task Manager for Android Studio, Zebra device-management tools (e.g. StageNow, 123Scan, device sync utilities), or other apps that talk to this device over USB, and close them.\n4. Refresh this page and try again.'; }
+  if (os === 'windows') { t = 'Release the device on Windows'; b = 'Something else on this machine may have the device open (a background adb.exe/ADB server, Android Studio, or vendor device-management software).\n\n1. Command Prompt: adb kill-server\n2. Or: taskkill /F /IM adb.exe\n3. Also check Task Manager for Android Studio, Zebra device-management tools (e.g. StageNow, 123Scan, device sync utilities), or other apps that talk to this device over USB, and close them.'; }
   else if (os === 'mac') { t = 'Release ADB on macOS'; b = '1. Terminal: adb kill-server\n2. If stuck: pkill -f adb'; }
   else { t = 'Release ADB on Linux'; b = 'echo "BUS-DEV" | sudo tee /sys/bus/usb/drivers/android_usb/unbind'; }
-  alert(t + '\n\n' + b);
+  const overlay = document.createElement('div');
+  overlay.id = 'adb-release-modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.onclick = (e) => { if (e.target === overlay) hideADBReleaseDialog(); };
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+  box.innerHTML =
+    '<h3 style="margin:0 0 12px;font-size:18px;">' + esc(t) + '</h3>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;white-space:pre-wrap;">' + esc(b) + '</p>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;">If none of that helps: reloading this page has reliably fixed this in testing — at the cost of disconnecting any other devices currently connected here.</p>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
+    '<button class="btn btn-sm" id="adb-release-dismiss-btn">Dismiss</button>' +
+    '<button class="btn" id="adb-release-reload-btn" style="background:#f38ba8;">Reload Page</button>' +
+    '</div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  document.getElementById('adb-release-dismiss-btn').onclick = () => hideADBReleaseDialog();
+  document.getElementById('adb-release-reload-btn').onclick = () => location.reload();
+}
+
+function hideADBReleaseDialog() {
+  const el = document.getElementById('adb-release-modal-overlay');
+  if (el && el.parentNode) el.parentNode.removeChild(el);
 }
 
 // --- Device Discovery ---
