@@ -1,4 +1,5 @@
 node_modules/
 *.js.map
+.git-commit-msg.txt
 apk/attestation-test/build/
 apk/attestation-test/build.log
