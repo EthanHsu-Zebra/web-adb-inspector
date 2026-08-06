@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.4.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -19,6 +19,10 @@ const connectedDevices = new Map();
 const availableDevices = new Map(); // Button-disconnected devices (still physically present)
 const selectedConnectedSerials = new Set(); // for bulk Disconnect Selected
 const selectedAvailableSerials = new Set(); // for bulk Connect Selected
+// vid:pid:serial keys currently mid-connectDevice(), so a concurrent scanAvailableDevices()
+// (e.g. triggered by the same native 'connect' event the picker's grant fires) doesn't race
+// ahead and add the device to "Ready to Connect" before connectedDevices.set() runs.
+const connectingUsbIds = new Set();
 let activeSerial = null;
 let disconnectingSerial = null;  // serial currently being intentionally disconnected (suppress USB event)
 const dataCache = { props: [], features: [], packages: [] };
@@ -168,8 +172,9 @@ async function scanDevices() {
     if (!mgr) return;
     const device = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
     if (!device) return;
-    // Check if this device is already connected
-    const key = device.vendorId + ':' + device.productId + ':' + (device.serial || '');
+    // Check if this device is already connected. device is the wrapped AdbDaemonWebUsbDevice —
+    // vendorId/productId only exist via .raw, not directly (see PROJECT_CONTEXT.md v1.3.2/v1.3.3).
+    const key = device.raw.vendorId + ':' + device.raw.productId + ':' + (device.serial || '');
     for (const [, info] of connectedDevices) {
       if (info._usbId) {
         const existing = info._usbId.vendorId + ':' + info._usbId.productId + ':' + (info._usbId.serial || '');
@@ -229,6 +234,10 @@ async function scanAvailableDevices() {
       }
       if (knownAvailable.has(uidKey)) {
         console.log('[scan-available] skip (already available):', uidKey);
+        continue;
+      }
+      if (connectingUsbIds.has(uidKey)) {
+        console.log('[scan-available] skip (connectDevice in progress):', uidKey);
         continue;
       }
       // Add as available
@@ -433,6 +442,7 @@ function handleUsbDisconnect(e) {
 }
 
 async function connectDevice(usbDevice) {
+  let connectingKey = null;
   try {
     // Guard: ensure we have a valid USBDevice with connect()
     if (!usbDevice || typeof usbDevice.connect !== 'function') {
@@ -440,6 +450,12 @@ async function connectDevice(usbDevice) {
       setStatus('Invalid device object — please reconnect', 'err');
       return;
     }
+    // Mark this device "connecting" synchronously, before any awaits — closes the race
+    // where the native 'connect' event (fired by the same requestDevice() grant that got
+    // us here) triggers a concurrent scanAvailableDevices() call that would otherwise see
+    // connectedDevices still empty and add this same device to "Ready to Connect".
+    connectingKey = usbDevice.raw.vendorId + ':' + usbDevice.raw.productId + ':' + (usbDevice.serial || '');
+    connectingUsbIds.add(connectingKey);
     debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened}`, 'evt');
     setStatus('Connecting...', 'connecting');
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
@@ -543,6 +559,16 @@ async function connectDevice(usbDevice) {
     };
 
     connectedDevices.set(adbSerial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
+    // Defensive cleanup: if a "Ready to Connect" entry for this same physical device
+    // still exists (a race the connectingUsbIds guard above didn't fully close, or one
+    // that predates this connection), remove it now rather than showing the device twice.
+    for (const [akey, ainfo] of availableDevices) {
+      const au = ainfo._usbId;
+      if (au && au.vendorId === usbId.vendorId && au.productId === usbId.productId &&
+          (!usbId.serial || !au.serial || au.serial === usbId.serial)) {
+        availableDevices.delete(akey);
+      }
+    }
     debugLogPush(`connectDevice SUCCESS: serial=${adbSerial} display=${displayName} usb=${usbId.vendorId}:${usbId.productId}:${usbId.serial || '(none)'}`, 'ok');
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adbSerial);
@@ -553,6 +579,8 @@ async function connectDevice(usbDevice) {
     debugLogPush(`connectDevice FAILED: ${msg}`, 'err');
     if (msg.includes('already in use')) showADBReleaseDialog();
     setStatus('Failed: ' + msg, 'err');
+  } finally {
+    if (connectingKey) connectingUsbIds.delete(connectingKey);
   }
 }
 
@@ -637,6 +665,7 @@ function renderDeviceList() {
       <div class="dev-actions">
         <span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
         <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>
+        <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();forgetDevice('${serial}')" title="Revoke this device's browser permission (simulate a fresh, never-paired device)">Forget</button>
       </div>`;
       availList.appendChild(card);
     }
@@ -805,6 +834,43 @@ async function connectAvailable(serial) {
     setStatus('Connect failed: ' + (err.message || String(err)), 'err');
     availableDevices.set(serial, info);
   }
+}
+
+// Revokes the browser's USB permission grant for a "Ready to Connect" device, so it stops
+// appearing here entirely and behaves like a never-paired device again (only reachable via
+// the native "+Connect Device" picker from then on). Uses USBDevice.forget() — limited
+// browser support (not yet Baseline per MDN, but works in Chrome) — falls back to just
+// removing it from our own list (without revoking the actual browser grant) if unsupported.
+async function forgetDevice(serial) {
+  debugLogPush(`forgetDevice called: serial=${serial}`, 'evt');
+  const info = availableDevices.get(serial);
+  if (!info) return;
+  try {
+    let usbDevice = info.usbDevice;
+    if (!usbDevice) {
+      const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
+      const granted = mgr ? await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] }) : [];
+      if (info._usbId.serial) {
+        usbDevice = granted.find(d => d.serial === info._usbId.serial && d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
+      }
+      if (!usbDevice) {
+        usbDevice = granted.find(d => d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
+      }
+    }
+    if (usbDevice && usbDevice.raw && typeof usbDevice.raw.forget === 'function') {
+      await usbDevice.raw.forget();
+      debugLogPush(`forgetDevice: revoked browser permission for serial=${serial}`, 'ok');
+      setStatus('Device forgotten', 'ok');
+    } else {
+      debugLogPush(`forgetDevice: forget() unsupported/device not found — removed from list only, browser permission NOT revoked (use the page-info icon > Site settings > USB devices to fully un-pair)`, 'warn');
+      setStatus('Removed from list (forget() unsupported here)', 'warn');
+    }
+  } catch (err) {
+    debugLogPush(`forgetDevice FAILED: ${err.message || err}`, 'err');
+    setStatus('Forget failed: ' + (err.message || err), 'err');
+  }
+  availableDevices.delete(serial);
+  renderDeviceList();
 }
 
 function disconnectOne(serial) {
@@ -2165,6 +2231,7 @@ window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;
 window.connectAvailable = connectAvailable;
+window.forgetDevice = forgetDevice;
 window.toggleDeviceSelection = toggleDeviceSelection;
 window.connectSelected = connectSelected;
 window.disconnectSelected = disconnectSelected;
