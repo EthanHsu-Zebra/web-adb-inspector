@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.8';
+const APP_VERSION = '1.5.9';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -800,8 +800,7 @@ function renderDeviceList() {
       const bottomHtml = connecting
         ? `<span class="loading"></span><span class="connecting-label">${esc(connecting.label)}</span>`
         : `<span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
-        <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>
-        <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();forgetDevice('${serial}')" title="Revoke this device's browser permission (simulate a fresh, never-paired device)">Forget</button>`;
+        <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>`;
       card.innerHTML = `<div class="device-card-top">
         <input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('available','${serial}')" title="Select">
         <div class="dev-info">
@@ -946,8 +945,10 @@ async function findGrantedDevice(mgr, usbId) {
 
 // Widened again (2026-08-06) — a ~19s window still wasn't always enough. The clarifying
 // data point: it's not one specific device that's affected — ANY device, right after being
-// forgetDevice()'d and freshly re-paired, can hit this; an already-established device
-// reconnects reliably. A "hard refresh and try again" was observed to reliably recover it,
+// un-paired (browser-level; see PROJECT_CONTEXT.md — the in-app Forget button was removed
+// after this investigation, since it reliably triggered this) and freshly re-paired, can hit
+// this; an already-established device reconnects reliably. A "hard refresh and try again"
+// was observed to reliably recover it,
 // but that's most likely just because the refresh-and-retry cycle takes 10-30+ real seconds
 // — enough for whatever's transiently holding the device (leading theory: endpoint security
 // software, e.g. CrowdStrike's "Firmware Analysis" module seen installed on this host,
@@ -1058,43 +1059,6 @@ async function connectAvailable(serial) {
   }
 }
 
-// Revokes the browser's USB permission grant for a "Ready to Connect" device, so it stops
-// appearing here entirely and behaves like a never-paired device again (only reachable via
-// the native "+Connect Device" picker from then on). Uses USBDevice.forget() — limited
-// browser support (not yet Baseline per MDN, but works in Chrome) — falls back to just
-// removing it from our own list (without revoking the actual browser grant) if unsupported.
-async function forgetDevice(serial) {
-  debugLogPush(`forgetDevice called: serial=${serial}`, 'evt');
-  const info = availableDevices.get(serial);
-  if (!info) return;
-  try {
-    let usbDevice = info.usbDevice;
-    if (!usbDevice) {
-      const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
-      const granted = mgr ? await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] }) : [];
-      if (info._usbId.serial) {
-        usbDevice = granted.find(d => d.serial === info._usbId.serial && d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
-      }
-      if (!usbDevice) {
-        usbDevice = granted.find(d => d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
-      }
-    }
-    if (usbDevice && usbDevice.raw && typeof usbDevice.raw.forget === 'function') {
-      await usbDevice.raw.forget();
-      debugLogPush(`forgetDevice: revoked browser permission for serial=${serial}`, 'ok');
-      setStatus('Device forgotten', 'ok');
-    } else {
-      debugLogPush(`forgetDevice: forget() unsupported/device not found — removed from list only, browser permission NOT revoked (use the page-info icon > Site settings > USB devices to fully un-pair)`, 'warn');
-      setStatus('Removed from list (forget() unsupported here)', 'warn');
-    }
-  } catch (err) {
-    debugLogPush(`forgetDevice FAILED: ${err.message || err}`, 'err');
-    setStatus('Forget failed: ' + (err.message || err), 'err');
-  }
-  availableDevices.delete(serial);
-  renderDeviceList();
-}
-
 function showHelpModal() {
   hideHelpModal();
   const overlay = document.createElement('div');
@@ -1111,7 +1075,7 @@ function showHelpModal() {
     row('Ready to Connect', 'A device the browser has previously been granted USB permission for ("paired"), but that isn\'t currently connected. Clicking Connect here usually reconnects instantly, with no popup.') +
     row('Connect', 'Reconnects a Ready-to-Connect device. Falls back to the browser\'s native device picker only if the saved permission can\'t instantly find the device (e.g. it was unplugged and replugged).') +
     row('Disconnect', 'Closes the ADB session for a Connected device. It moves to Ready to Connect — the browser permission is kept, so reconnecting is instant.') +
-    row('Forget', 'Revokes the browser\'s USB permission ("pairing") for a Ready-to-Connect device entirely. It disappears from this list, and can only be reconnected via the native "+ Connect Device" picker again — as if it were a brand-new, never-seen device. Use this to test the first-time-connection flow.') +
+    row('Un-pairing a device ("Forget")', 'There\'s no in-app button for this — click the page-info/lock icon in the address bar, then Site settings (or Permissions) → USB devices → remove the device. It then disappears from "Ready to Connect" and can only be reconnected via the native "+ Connect Device" picker again, as if it were brand-new. Heads up: freshly un-pairing and re-pairing a device has, in practice, sometimes led to a connection that fails repeatedly no matter how long it retries, recoverable only by reloading this page (the app will offer a Reload button if that happens) — so only do this if you specifically need to test the first-time-connection flow.') +
     row('+ Connect Device', 'Opens the browser\'s native USB device picker, to grant permission for a new device (or one whose permission needs refreshing).') +
     row('Checkboxes / Connect Selected / Disconnect Selected', 'Select multiple devices in either section to connect or disconnect them all in one action, instead of one at a time.') +
     row('Share', 'Starts a remote session — generates a link you can send to someone else so they can view this device\'s status and (with your approval) run shell commands on it, from anywhere.') +
@@ -2484,7 +2448,6 @@ window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;
 window.connectAvailable = connectAvailable;
-window.forgetDevice = forgetDevice;
 window.showHelpModal = showHelpModal;
 window.toggleDeviceSelection = toggleDeviceSelection;
 window.connectSelected = connectSelected;
