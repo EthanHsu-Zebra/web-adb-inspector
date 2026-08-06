@@ -201,6 +201,9 @@ This same mismatch also explained a second symptom: a device already in `connect
 
 Fix: both functions now call `AdbDaemonWebUsbDeviceManager.BROWSER.getDevices({filters:[AdbDefaultInterfaceFilter]})` instead of `navigator.usb.getDevices()`. Since `AdbDaemonWebUsbDevice` doesn't expose `vendorId`/`productId` directly (only via its `.raw` property, the underlying native `USBDevice`), all vid/pid comparisons in these two functions now go through `d.raw.vendorId`/`d.raw.productId` instead of `d.vendorId`/`d.productId`.
 
+### v1.3.3 — FIXED: same bug, one more spot (`connectDevice()` itself)
+The v1.3.2 fix above wasn't complete. `connectDevice(usbDevice)` — called from *both* the picker path and the reconnect path, always with a wrapped `AdbDaemonWebUsbDevice` — built its stored `_usbId` from `usbDevice.vendorId`/`usbDevice.productId` directly, which are `undefined` on the wrapped type (confirmed live: `connectDevice SUCCESS` logged `usb=undefined:undefined:253085251E0049`). That corrupted `_usbId` then propagated everywhere: `disconnectOne()` copies it verbatim into the "Ready to Connect" entry, so the *next* `connectAvailable()` call looks for `vid+pid=undefined:undefined`, never matches the real device (which has real numbers), and falls back to the native picker dialog every time instead of reconnecting instantly — and the stale duplicate "Ready to Connect" ghost entry persists for the same reason (dedup key mismatch against the corrupted connected entry). Fix: `connectDevice()` now reads `usbDevice.raw.vendorId`/`usbDevice.raw.productId` too, consistent with v1.3.2.
+
 ### v1.1.42 — FIXED
 - `pipeTo` error: `connectAvailable()` was passing raw `USBDevice` to `AdbDaemonTransport.authenticate()` as `connection` parameter. Fix: use `getDevices()` + pass matching device to `connectDevice()` which handles `connect()` -> `USBConnection` properly.
 

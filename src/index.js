@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.3.2';
+const APP_VERSION = '1.3.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -405,11 +405,16 @@ async function connectDevice(usbDevice) {
     window[hbKey] = hbInterval;
 
     // Use global navigator.usb.ondisconnect (reliable across browsers)
-    // Store USB identifiers at connect time for reliable disconnect matching
+    // Store USB identifiers at connect time for reliable disconnect matching.
+    // usbDevice here is always the wrapped AdbDaemonWebUsbDevice (from mgr.requestDevice()
+    // or mgr.getDevices()) — it doesn't expose vendorId/productId directly, only via .raw
+    // (the underlying native USBDevice). Reading usbDevice.vendorId/.productId directly
+    // silently gives undefined, which corrupts every downstream vid+pid match (disconnect
+    // matching, Ready-to-Connect dedup, reconnect-by-vid+pid) — see PROJECT_CONTEXT.md v1.3.2/v1.3.3.
     const usbId = {
       serial: usbDevice.serial,
-      vendorId: usbDevice.vendorId,
-      productId: usbDevice.productId,
+      vendorId: usbDevice.raw.vendorId,
+      productId: usbDevice.raw.productId,
     };
 
     if (!_usbDisconnectHandler) {
