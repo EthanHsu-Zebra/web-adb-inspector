@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.4.4';
+const APP_VERSION = '1.5.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -456,16 +456,20 @@ async function connectDevice(usbDevice) {
     // connectedDevices still empty and add this same device to "Ready to Connect".
     connectingKey = usbDevice.raw.vendorId + ':' + usbDevice.raw.productId + ':' + (usbDevice.serial || '');
     connectingUsbIds.add(connectingKey);
-    debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened}`, 'evt');
+    debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened} otherConnected=${connectedDevices.size}`, 'evt');
     setStatus('Connecting...', 'connecting');
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
+    const t0 = Date.now();
     const connection = await usbDevice.connect();
+    debugLogPush(`connectDevice: usbDevice.connect() resolved after ${Date.now() - t0}ms`, 'evt');
     console.log('[connect] connected, opened:', usbDevice.opened, 'conn.closed:', typeof connection.closed);
+    const t1 = Date.now();
     const transport = await AdbDaemonTransport.authenticate({
       serial: usbDevice.serial || 'usb', connection, credentialStore,
       features: ADB_DAEMON_DEFAULT_FEATURES,
       initialDelayedAckBytes: ADB_DAEMON_DEFAULT_INITIAL_PAYLOAD_SIZE,
     });
+    debugLogPush(`connectDevice: AdbDaemonTransport.authenticate() resolved after ${Date.now() - t1}ms`, 'evt');
 
     const adb = new Adb(transport);
 
@@ -631,13 +635,15 @@ function renderDeviceList() {
       const checked = selectedConnectedSerials.has(serial) ? 'checked' : '';
       const card = document.createElement('div');
       card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
-      card.innerHTML = `<input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('connected','${serial}')" title="Select">
-      <div class="dev-info">
-        ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
-        <div class="dev-name">${esc(info._displayName || serial)}</div>
-        <div class="dev-serial">${esc(serial)}</div>
+      card.innerHTML = `<div class="device-card-top">
+        <input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('connected','${serial}')" title="Select">
+        <div class="dev-info">
+          ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
+          <div class="dev-name">${esc(info._displayName || serial)}</div>
+          <div class="dev-serial">${esc(serial)}</div>
+        </div>
       </div>
-      <div class="dev-actions">
+      <div class="device-card-bottom">
         <span class="dev-status-dot" title="Connected"></span>
         <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();disconnectOne('${serial}')" title="Disconnect">Disconnect</button>
       </div>`;
@@ -658,13 +664,15 @@ function renderDeviceList() {
       const checked = selectedAvailableSerials.has(serial) ? 'checked' : '';
       const card = document.createElement('div');
       card.className = 'device-card available';
-      card.innerHTML = `<input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('available','${serial}')" title="Select">
-      <div class="dev-info">
-        ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
-        <div class="dev-name">${esc(info._displayName || displaySerial)}</div>
-        <div class="dev-serial">${esc(displaySerial)}</div>
+      card.innerHTML = `<div class="device-card-top">
+        <input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('available','${serial}')" title="Select">
+        <div class="dev-info">
+          ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
+          <div class="dev-name">${esc(info._displayName || displaySerial)}</div>
+          <div class="dev-serial">${esc(displaySerial)}</div>
+        </div>
       </div>
-      <div class="dev-actions">
+      <div class="device-card-bottom">
         <span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
         <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>
         <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();forgetDevice('${serial}')" title="Revoke this device's browser permission (simulate a fresh, never-paired device)">Forget</button>
@@ -830,24 +838,30 @@ async function connectAvailable(serial) {
       // connected, and wasn't put back in "Ready to Connect" either — it just vanished
       // until some unrelated event happened to trigger a rescan that rediscovered it.
       let ok = await connectDevice(usbDevice);
-      if (!ok) {
-        // Observed in practice: connecting a second device shortly after a first one
-        // succeeded can fail with "Connection closed unexpectedly" even on physically
-        // separate USB ports (not just hub bandwidth contention) — cause not fully
-        // understood (possibly host-controller/root-hub grouping, or endpoint security
-        // software). One automatic retry, with a fresh device re-fetch, recovers from
-        // this in most observed cases.
-        debugLogPush(`connectAvailable: first attempt failed, retrying once after a short delay: serial=${serial}`, 'warn');
-        await new Promise(r => setTimeout(r, 800));
+      // Observed in practice: connecting a second device shortly after a first one
+      // succeeded can fail with "Connection closed unexpectedly" even on physically
+      // separate USB ports (not just hub bandwidth contention) — cause not fully
+      // understood (possibly host-controller/root-hub grouping, or endpoint security
+      // software). Also observed: the device can take well over a second to actually
+      // physically re-enumerate as "granted" again after this happens (one case took
+      // ~1.86s), so a single short-delay retry isn't always enough — retry with
+      // increasing backoff instead.
+      const RETRY_DELAYS_MS = [1000, 2500, 4000];
+      for (let attempt = 0; !ok && attempt < RETRY_DELAYS_MS.length; attempt++) {
+        const delay = RETRY_DELAYS_MS[attempt];
+        debugLogPush(`connectAvailable: attempt ${attempt + 1} failed, waiting ${delay}ms before retry: serial=${serial}`, 'warn');
+        await new Promise(r => setTimeout(r, delay));
+        const retryStart = Date.now();
         const retry = await findGrantedDevice(mgr, info._usbId);
+        debugLogPush(`connectAvailable: retry #${attempt + 2} findGrantedDevice took ${Date.now() - retryStart}ms, found=${!!retry.usbDevice} among ${retry.count} granted`, 'evt');
         if (retry.usbDevice) {
           ok = await connectDevice(retry.usbDevice);
         } else {
-          debugLogPush(`connectAvailable: retry found no matching granted device`, 'warn');
+          debugLogPush(`connectAvailable: retry #${attempt + 2} found no matching granted device yet`, 'warn');
         }
       }
       if (!ok) {
-        debugLogPush(`connectAvailable: connectDevice failed after retry, restoring to Ready to Connect: serial=${serial}`, 'warn');
+        debugLogPush(`connectAvailable: connectDevice failed after all retries, restoring to Ready to Connect: serial=${serial}`, 'warn');
         availableDevices.set(serial, info);
         renderDeviceList();
       }
@@ -917,6 +931,37 @@ async function forgetDevice(serial) {
   }
   availableDevices.delete(serial);
   renderDeviceList();
+}
+
+function showHelpModal() {
+  hideHelpModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'help-modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.onclick = (e) => { if (e.target === overlay) hideHelpModal(); };
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:560px;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+  const row = (term, def) => '<div style="margin-bottom:10px;"><div style="font-weight:600;color:#89b4fa;">' + esc(term) + '</div><div style="font-size:13px;color:#a6adc6;">' + def + '</div></div>';
+  box.innerHTML =
+    '<h3 style="margin:0 0 14px;font-size:18px;">Device List Help</h3>' +
+    row('Connected', 'Actively connected via ADB right now. Click a card to view its Properties/Features/Packages/Shell.') +
+    row('Ready to Connect', 'A device the browser has previously been granted USB permission for ("paired"), but that isn\'t currently connected. Clicking Connect here usually reconnects instantly, with no popup.') +
+    row('Connect', 'Reconnects a Ready-to-Connect device. Falls back to the browser\'s native device picker only if the saved permission can\'t instantly find the device (e.g. it was unplugged and replugged).') +
+    row('Disconnect', 'Closes the ADB session for a Connected device. It moves to Ready to Connect — the browser permission is kept, so reconnecting is instant.') +
+    row('Forget', 'Revokes the browser\'s USB permission ("pairing") for a Ready-to-Connect device entirely. It disappears from this list, and can only be reconnected via the native "+ Connect Device" picker again — as if it were a brand-new, never-seen device. Use this to test the first-time-connection flow.') +
+    row('+ Connect Device', 'Opens the browser\'s native USB device picker, to grant permission for a new device (or one whose permission needs refreshing).') +
+    row('Checkboxes / Connect Selected / Disconnect Selected', 'Select multiple devices in either section to connect or disconnect them all in one action, instead of one at a time.') +
+    row('Share', 'Starts a remote session — generates a link you can send to someone else so they can view this device\'s status and (with your approval) run shell commands on it, from anywhere.') +
+    '<div style="display:flex;justify-content:flex-end;margin-top:8px;"><button class="btn" id="help-close-btn">Close</button></div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  document.getElementById('help-close-btn').onclick = () => hideHelpModal();
+}
+
+function hideHelpModal() {
+  const el = document.getElementById('help-modal-overlay');
+  if (el && el.parentNode) el.parentNode.removeChild(el);
 }
 
 function disconnectOne(serial) {
@@ -1292,22 +1337,22 @@ function renderMirrorDeviceList(snapshot) {
   for (const dev of remoteSession.mirror.connected) {
     const card = document.createElement('div');
     card.className = 'device-card' + (remoteSession.mirror.activeSerial === dev.serial ? ' active' : '');
-    card.innerHTML = '<div class="dev-info">' +
+    card.innerHTML = '<div class="device-card-top"><div class="dev-info">' +
       (dev.nickname ? '<div class="dev-nick">' + esc(dev.nickname) + '</div>' : '') +
       '<div class="dev-name">' + esc(dev.displayName || dev.serial) + '</div>' +
-      '<div class="dev-serial">' + esc(dev.serial) + '</div></div>' +
-      '<div class="dev-actions"><span class="dev-status-dot" title="Connected on host"></span></div>';
+      '<div class="dev-serial">' + esc(dev.serial) + '</div></div></div>' +
+      '<div class="device-card-bottom"><span class="dev-status-dot" title="Connected on host"></span></div>';
     card.onclick = () => { remoteSession.mirror.activeSerial = dev.serial; renderMirrorDeviceList({ activeSerial: dev.serial, connected: remoteSession.mirror.connected, available: remoteSession.mirror.available }); };
     list.appendChild(card);
   }
   for (const dev of remoteSession.mirror.available) {
     const card = document.createElement('div');
     card.className = 'device-card available';
-    card.innerHTML = '<div class="dev-info">' +
+    card.innerHTML = '<div class="device-card-top"><div class="dev-info">' +
       (dev.nickname ? '<div class="dev-nick">' + esc(dev.nickname) + '</div>' : '') +
       '<div class="dev-name">' + esc(dev.displayName || dev.serial) + '</div>' +
-      '<div class="dev-serial">' + esc(dev.serial) + '</div></div>' +
-      '<div class="dev-actions"><span class="dev-status-dot dev-status-dot-gray" title="Ready on host (not connected)"></span></div>';
+      '<div class="dev-serial">' + esc(dev.serial) + '</div></div></div>' +
+      '<div class="device-card-bottom"><span class="dev-status-dot dev-status-dot-gray" title="Ready on host (not connected)"></span></div>';
     list.appendChild(card);
   }
 }
@@ -2278,6 +2323,7 @@ window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;
 window.connectAvailable = connectAvailable;
 window.forgetDevice = forgetDevice;
+window.showHelpModal = showHelpModal;
 window.toggleDeviceSelection = toggleDeviceSelection;
 window.connectSelected = connectSelected;
 window.disconnectSelected = disconnectSelected;

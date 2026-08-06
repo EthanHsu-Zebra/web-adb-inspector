@@ -95,8 +95,8 @@
 
   /* Sidebar */
   .sidebar {
-    width: 280px;
-    min-width: 280px;
+    width: 320px;
+    min-width: 320px;
     background: var(--surface);
     border-right: 1px solid var(--border);
     padding: 1rem;
@@ -113,10 +113,20 @@
     margin-bottom: 0.5rem;
     cursor: pointer;
     display: flex;
-    justify-content: space-between;
-    align-items: center;
+    flex-direction: column;
     gap: 0.5rem;
     overflow: hidden;
+  }
+  .device-card-top {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  .device-card-bottom {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.4rem;
   }
   .device-card:hover { border-color: var(--accent); }
   .device-card.active { border-color: var(--accent); background: rgba(88,166,255,0.06); }
@@ -190,15 +200,13 @@
     overflow: hidden;
   }
   .dev-nick { font-size: calc(0.7rem * var(--font-scale)); color: var(--yellow); font-style: italic; margin-bottom: 0.15rem; }
-  .dev-name { font-weight: 600; font-size: calc(0.85rem * var(--font-scale)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dev-name { font-weight: 600; font-size: calc(0.85rem * var(--font-scale)); overflow-wrap: break-word; }
   .dev-serial {
     font-size: calc(0.7rem * var(--font-scale));
     color: var(--muted);
     font-family: var(--mono);
     margin-top: 0.1rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    word-break: break-all;
   }
   .dev-actions {
     flex: 0 0 auto;
@@ -566,6 +574,7 @@
     <button id="btn-scan" class="btn" onclick="scanDevices()">+ Connect Device</button>
     <button id="btn-share" class="btn btn-sm" onclick="startShareSession()">Share</button>
     <button id="btn-debug" class="btn btn-sm" onclick="toggleDebugConsole()">Debug</button>
+    <button id="btn-help" class="btn btn-sm" onclick="showHelpModal()" title="What do Paired / Connect / Disconnect / Forget mean?">Help</button>
   </div>
 </div>
 
@@ -780,6 +789,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080417"></script>
+<script type="module" src="bundle.js?v=2026080418"></script>
 </body>
 </html>
