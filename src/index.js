@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.4.3';
+const APP_VERSION = '1.4.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -786,6 +786,22 @@ function selectDevice(serial) {
   fetchRKP();
 }
 
+// Re-fetches the manager's granted-device list fresh and finds the one matching usbId.
+// Always re-fetch rather than reusing a cached device object — WebUSB device references
+// are transient (see PROJECT_CONTEXT.md), and a device object involved in a failed
+// connect() attempt may be unusable even for an immediate retry with the same reference.
+async function findGrantedDevice(mgr, usbId) {
+  const granted = mgr ? await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] }) : [];
+  let usbDevice = null;
+  if (usbId.serial) {
+    usbDevice = granted.find(d => d.serial === usbId.serial && d.raw.vendorId === usbId.vendorId && d.raw.productId === usbId.productId);
+  }
+  if (!usbDevice) {
+    usbDevice = granted.find(d => d.raw.vendorId === usbId.vendorId && d.raw.productId === usbId.productId);
+  }
+  return { usbDevice, count: granted.length };
+}
+
 async function connectAvailable(serial) {
   debugLogPush(`connectAvailable called: serial=${serial}`, 'evt');
   const info = availableDevices.get(serial);
@@ -802,16 +818,9 @@ async function connectAvailable(serial) {
     // .connect()), not navigator.usb.getDevices() (plain native USBDevice, no .connect()
     // at all) — see the matching note in scanAvailableDevices().
     const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
-    const granted = mgr ? await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] }) : [];
-    debugLogPush(`connectAvailable: granted=${granted.length} looking for vid+pid=${info._usbId?.vendorId}:${info._usbId?.productId} serial=${info._usbId?.serial || '(none)'}`, 'evt');
-    console.log('[connect-available] granted:', granted.length, 'looking for:', info._usbId);
-    let usbDevice = null;
-    if (info._usbId.serial) {
-      usbDevice = granted.find(d => d.serial === info._usbId.serial && d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
-    }
-    if (!usbDevice) {
-      usbDevice = granted.find(d => d.raw.vendorId === info._usbId.vendorId && d.raw.productId === info._usbId.productId);
-    }
+    const { usbDevice, count } = await findGrantedDevice(mgr, info._usbId);
+    debugLogPush(`connectAvailable: granted=${count} looking for vid+pid=${info._usbId?.vendorId}:${info._usbId?.productId} serial=${info._usbId?.serial || '(none)'}`, 'evt');
+    console.log('[connect-available] granted:', count, 'looking for:', info._usbId);
     if (usbDevice) {
       debugLogPush(`connectAvailable: instant match via getDevices: serial=${usbDevice.serial}`, 'ok');
       console.log('[connect-available] instant match via getDevices:', usbDevice.serial);
@@ -820,15 +829,31 @@ async function connectAvailable(serial) {
       // a failure here (deleted from availableDevices above) had nowhere to go: it wasn't
       // connected, and wasn't put back in "Ready to Connect" either — it just vanished
       // until some unrelated event happened to trigger a rescan that rediscovered it.
-      const ok = await connectDevice(usbDevice);
+      let ok = await connectDevice(usbDevice);
       if (!ok) {
-        debugLogPush(`connectAvailable: connectDevice failed, restoring to Ready to Connect: serial=${serial}`, 'warn');
+        // Observed in practice: connecting a second device shortly after a first one
+        // succeeded can fail with "Connection closed unexpectedly" even on physically
+        // separate USB ports (not just hub bandwidth contention) — cause not fully
+        // understood (possibly host-controller/root-hub grouping, or endpoint security
+        // software). One automatic retry, with a fresh device re-fetch, recovers from
+        // this in most observed cases.
+        debugLogPush(`connectAvailable: first attempt failed, retrying once after a short delay: serial=${serial}`, 'warn');
+        await new Promise(r => setTimeout(r, 800));
+        const retry = await findGrantedDevice(mgr, info._usbId);
+        if (retry.usbDevice) {
+          ok = await connectDevice(retry.usbDevice);
+        } else {
+          debugLogPush(`connectAvailable: retry found no matching granted device`, 'warn');
+        }
+      }
+      if (!ok) {
+        debugLogPush(`connectAvailable: connectDevice failed after retry, restoring to Ready to Connect: serial=${serial}`, 'warn');
         availableDevices.set(serial, info);
         renderDeviceList();
       }
       return;
     }
-    debugLogPush(`connectAvailable: no instant match in ${granted.length} granted devices`, 'warn');
+    debugLogPush(`connectAvailable: no instant match in ${count} granted devices`, 'warn');
   } catch (err) {
     debugLogPush(`connectAvailable: getDevices() failed: ${err.message}`, 'err');
     console.log('[connect-available] getDevices() failed:', err);
