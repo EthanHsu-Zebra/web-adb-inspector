@@ -120,6 +120,29 @@
   }
   .device-card:hover { border-color: var(--accent); }
   .device-card.active { border-color: var(--accent); background: rgba(88,166,255,0.06); }
+  .device-checkbox {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+  .bulk-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    margin-bottom: 0.5rem;
+    background: rgba(88,166,255,0.08);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+  }
+  .bulk-count {
+    font-size: calc(0.75rem * var(--font-scale));
+    color: var(--accent);
+    font-weight: 600;
+  }
   .section-divider {
     display: flex;
     align-items: center;
@@ -561,10 +584,18 @@
       <p>No devices connected</p>
       <p style="margin-top:0.5rem;font-size:calc(0.75rem * var(--font-scale))">Click <strong>+ Connect Device</strong> to connect via USB</p>
     </div>
+    <div id="connected-bulk-bar" class="bulk-bar hidden">
+      <span id="connected-selected-count" class="bulk-count"></span>
+      <button class="btn btn-sm btn-disconnect" onclick="disconnectSelected()">Disconnect Selected</button>
+    </div>
     <div id="device-list"></div>
     <div id="available-section" class="hidden">
       <div class="section-divider">
         <span class="section-label">Ready to Connect</span>
+      </div>
+      <div id="available-bulk-bar" class="bulk-bar hidden">
+        <span id="available-selected-count" class="bulk-count"></span>
+        <button class="btn btn-sm btn-connect" onclick="connectSelected()">Connect Selected</button>
       </div>
       <div id="available-list"></div>
     </div>
@@ -749,6 +780,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080412"></script>
+<script type="module" src="bundle.js?v=2026080413"></script>
 </body>
 </html>

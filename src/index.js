@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.3.3';
+const APP_VERSION = '1.4.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -17,6 +17,8 @@ import { joinRoom } from '@trystero-p2p/ws-relay';
 const credentialStore = new AdbWebCredentialStore('web-adb-inspector');
 const connectedDevices = new Map();
 const availableDevices = new Map(); // Button-disconnected devices (still physically present)
+const selectedConnectedSerials = new Set(); // for bulk Disconnect Selected
+const selectedAvailableSerials = new Set(); // for bulk Connect Selected
 let activeSerial = null;
 let disconnectingSerial = null;  // serial currently being intentionally disconnected (suppress USB event)
 const dataCache = { props: [], features: [], packages: [] };
@@ -566,6 +568,11 @@ async function readDeviceFile(adb, path) {
 
 // --- UI ---
 function renderDeviceList() {
+  // Prune selections for devices that no longer exist in their respective map
+  // (disconnected/removed since the last render) so stale counts never show.
+  for (const s of Array.from(selectedConnectedSerials)) if (!connectedDevices.has(s)) selectedConnectedSerials.delete(s);
+  for (const s of Array.from(selectedAvailableSerials)) if (!availableDevices.has(s)) selectedAvailableSerials.delete(s);
+
   const list = document.getElementById('device-list');
   const welcome = document.getElementById('welcome-msg');
   const availSection = document.getElementById('available-section');
@@ -574,6 +581,7 @@ function renderDeviceList() {
     list.classList.add('hidden');
     welcome.classList.remove('hidden');
     availSection.classList.add('hidden');
+    updateBulkBars();
     return;
   }
   welcome.classList.add('hidden');
@@ -584,9 +592,11 @@ function renderDeviceList() {
     list.classList.remove('hidden');
     for (const [serial, info] of connectedDevices) {
       const nick = deviceNicknames[serial] || '';
+      const checked = selectedConnectedSerials.has(serial) ? 'checked' : '';
       const card = document.createElement('div');
       card.className = 'device-card' + (activeSerial === serial ? ' active' : '');
-      card.innerHTML = `<div class="dev-info">
+      card.innerHTML = `<input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('connected','${serial}')" title="Select">
+      <div class="dev-info">
         ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
         <div class="dev-name">${esc(info._displayName || serial)}</div>
         <div class="dev-serial">${esc(serial)}</div>
@@ -609,9 +619,11 @@ function renderDeviceList() {
     for (const [serial, info] of availableDevices) {
       const nick = deviceNicknames[serial] || '';
       const displaySerial = info._usbId && info._usbId.serial ? info._usbId.serial : serial;
+      const checked = selectedAvailableSerials.has(serial) ? 'checked' : '';
       const card = document.createElement('div');
       card.className = 'device-card available';
-      card.innerHTML = `<div class="dev-info">
+      card.innerHTML = `<input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('available','${serial}')" title="Select">
+      <div class="dev-info">
         ${nick ? '<div class="dev-nick">' + esc(nick) + '</div>' : ''}
         <div class="dev-name">${esc(info._displayName || displaySerial)}</div>
         <div class="dev-serial">${esc(displaySerial)}</div>
@@ -623,7 +635,55 @@ function renderDeviceList() {
       availList.appendChild(card);
     }
   }
+  updateBulkBars();
   if (remoteSession && remoteSession.role === 'host') broadcastDeviceState();
+}
+
+function toggleDeviceSelection(kind, serial) {
+  const set = kind === 'connected' ? selectedConnectedSerials : selectedAvailableSerials;
+  if (set.has(serial)) set.delete(serial); else set.add(serial);
+  updateBulkBars();
+}
+
+function updateBulkBars() {
+  const cBar = document.getElementById('connected-bulk-bar');
+  const cCount = document.getElementById('connected-selected-count');
+  if (cBar) {
+    if (selectedConnectedSerials.size > 0) {
+      cBar.classList.remove('hidden');
+      if (cCount) cCount.textContent = selectedConnectedSerials.size + ' selected';
+    } else {
+      cBar.classList.add('hidden');
+    }
+  }
+  const aBar = document.getElementById('available-bulk-bar');
+  const aCount = document.getElementById('available-selected-count');
+  if (aBar) {
+    if (selectedAvailableSerials.size > 0) {
+      aBar.classList.remove('hidden');
+      if (aCount) aCount.textContent = selectedAvailableSerials.size + ' selected';
+    } else {
+      aBar.classList.add('hidden');
+    }
+  }
+}
+
+async function connectSelected() {
+  const serials = Array.from(selectedAvailableSerials);
+  selectedAvailableSerials.clear();
+  updateBulkBars();
+  for (const serial of serials) {
+    await connectAvailable(serial);
+  }
+}
+
+function disconnectSelected() {
+  const serials = Array.from(selectedConnectedSerials);
+  selectedConnectedSerials.clear();
+  updateBulkBars();
+  for (const serial of serials) {
+    disconnectOne(serial);
+  }
 }
 
 function selectDevice(serial) {
@@ -2099,6 +2159,9 @@ window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;
 window.connectAvailable = connectAvailable;
+window.toggleDeviceSelection = toggleDeviceSelection;
+window.connectSelected = connectSelected;
+window.disconnectSelected = disconnectSelected;
 window.startShareSession = startShareSession;
 window.stopShareSession = stopShareSession;
 window.approveRemoteCommand = approveRemoteCommand;

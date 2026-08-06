@@ -172,9 +172,12 @@ Key DOM elements:
 - `#font-size-controls` — A-/A+ buttons
 
 ### Device card layout
-Connected: `[Device Name] [Serial] [Disconnect button]`
-Available:  `[Device Name] [Serial] [Connect button]`
+Connected: `[checkbox] [Device Name] [Serial] [Disconnect button]`
+Available:  `[checkbox] [Device Name] [Serial] [Connect button]`
 Selected device card has highlighted border.
+
+### Bulk select (v1.4.0)
+Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial)`), tracked in two independent `Set`s: `selectedConnectedSerials`, `selectedAvailableSerials`. When either has 1+ entries, its section's bulk bar (`#connected-bulk-bar` / `#available-bulk-bar`) shows a count and a "Disconnect Selected"/"Connect Selected" button (`disconnectSelected()`/`connectSelected()`), which just loop `disconnectOne()`/`connectAvailable()` over the selected serials — no new connect/disconnect logic, just batches the existing per-device functions. `renderDeviceList()` prunes both sets of any serial no longer present in its map (e.g. after a physical unplug) before rendering, so counts never go stale, and calls `updateBulkBars()` at the end of every render.
 
 ## 6. Features
 
