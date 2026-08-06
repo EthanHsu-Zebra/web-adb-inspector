@@ -197,6 +197,15 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.5.6 — v1.5.5 wasn't sufficient: pre-emptive close-before-open added
+v1.5.5's cleanup only runs when `usbDevice.connect()` itself *succeeds* and a later step (almost always `AdbDaemonTransport.authenticate()`) fails afterward — it does nothing for `Failed to execute 'open' on 'USBDevice': The device was disconnected'`, since that error comes from the `open()` call itself rejecting, meaning `openedConnection` never becomes `true` and there's nothing for that catch-block cleanup to close. Confirmed this exact error still persisted across a full 7-attempt retry cycle (twice) even with v1.5.5 deployed — a hard refresh was still needed to recover.
+
+Leading theory: the underlying `@yume-chan/adb-daemon-webusb` library's `connect()` sequence can partially succeed (the native `open()` call) before failing at a later *internal* step (e.g. claiming the interface) — without ever handing our code a connection object to close ourselves, since the overall `connect()` promise it returns still just rejects. That would leave the *native* device open from a previous attempt's perspective, and Chrome/Edge's WebUSB implementation apparently doesn't tolerate a second `open()` from the same page while that lingering state exists — causing the next attempt's `open()` to reject immediately with the same "disconnected"-sounding message. Only a full page reload (forcing the browser to release everything the page held) recovers, matching what's been observed throughout.
+
+Fix: `connectDevice()` now unconditionally calls `await usbDevice.raw.close()` (ignoring any error) *before* every attempt, not just in a catch block after one already failed — clearing any lingering native-open state a previous attempt might have left, regardless of exactly which internal step that attempt failed at. This is a more defensive, "always start from a known-closed state" strategy layered on top of (not replacing) v1.5.5's after-the-fact cleanup.
+
+If this *still* doesn't fully resolve it, the next step would be to test with `AdbDaemonWebUsbConnection`-level instrumentation (patching/logging inside `@yume-chan/adb-daemon-webusb` itself, or filing an upstream issue) to find exactly which internal step is leaking — this is about as much as can be fixed from the outside of that library without forking it.
+
 ### v1.5.5 — FIXED (likely the real root cause all along): leaked USB claim on failed connect never released
 The actual smoking gun (2026-08-06): re-toggling "USB debugging" on the device (which re-triggers Android's authorization prompt, confirmed accepted) and re-pairing still failed all 7 retries (~44.5s) — but a hard refresh right after immediately succeeded. If the underlying block were external/timing-based (e.g. the CrowdStrike scan-window theory), more retrying *within the same page* should work just as well as after a refresh — external systems don't care whether the page reloaded. But a hard refresh does exactly one relevant thing: it force-releases every WebUSB claim held by that page. That pointed back at our own code.
 

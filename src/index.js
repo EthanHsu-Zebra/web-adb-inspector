@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.5';
+const APP_VERSION = '1.5.6';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -504,6 +504,20 @@ async function connectDevice(usbDevice, opts = {}) {
     connectingKey = usbDevice.raw.vendorId + ':' + usbDevice.raw.productId + ':' + (usbDevice.serial || '');
     connectingUsbIds.add(connectingKey);
     debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened} otherConnected=${connectedDevices.size}`, 'evt');
+    // Defensive pre-emptive close: v1.5.5's catch-block cleanup only runs when
+    // usbDevice.connect() itself *succeeds* and a later step fails. It does nothing for
+    // "Failed to execute 'open' on 'USBDevice': The device was disconnected" — that error
+    // comes from the open() call itself rejecting, so openedConnection never becomes true
+    // and there's nothing for that cleanup to close. Confirmed this exact error still
+    // persisted across retries even with v1.5.5's fix in place. Leading theory: the
+    // underlying library's connect() sequence can partially succeed (native open()) before
+    // failing at a later internal step (e.g. claiming the interface), without ever handing
+    // us a connection object to close ourselves — leaving the *native* device open from a
+    // previous attempt, which then makes the *next* attempt's open() call fail outright.
+    // Unconditionally closing first, before every attempt, clears that regardless of what
+    // state a previous attempt left behind. Ignore any error — most of the time there's
+    // nothing to close, and that's fine.
+    try { await usbDevice.raw.close(); } catch (_) {}
     setStatus('Connecting...', 'connecting');
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
     const t0 = Date.now();
