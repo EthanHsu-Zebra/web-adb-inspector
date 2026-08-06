@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.6.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1402,7 +1402,7 @@ function joinAsViewer(roomId, password) {
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
     pendingRequests: new Map(),
-    mirror: { activeSerial: null, connected: [], available: [] },
+    mirror: { activeSerial: null, connected: [], available: [], shellBySerial: {} },
   };
   pollIceState(room, 'viewer', 60);
 
@@ -1473,12 +1473,34 @@ function showHostDisconnectedBanner() {
   if (input) input.disabled = true;
 }
 
+// Each device gets its own persisted shell console (mirrors dataCache.shellBySerial
+// on the host side). Swaps the visible #viewer-shell-output content when the
+// active target changes, so switching devices never shows/appends to the wrong console.
+function switchMirrorShellOutput(oldSerial, newSerial) {
+  if (oldSerial === newSerial) return;
+  const output = document.getElementById('viewer-shell-output');
+  if (!output) return;
+  if (!remoteSession.mirror.shellBySerial) remoteSession.mirror.shellBySerial = {};
+  if (oldSerial) remoteSession.mirror.shellBySerial[oldSerial] = output.textContent;
+  output.textContent = newSerial ? (remoteSession.mirror.shellBySerial[newSerial] || '') : '';
+  output.scrollTop = output.scrollHeight;
+}
+
+function selectMirrorDevice(serial) {
+  if (!remoteSession || remoteSession.role !== 'viewer' || serial === remoteSession.mirror.activeSerial) return;
+  switchMirrorShellOutput(remoteSession.mirror.activeSerial, serial);
+  remoteSession.mirror.activeSerial = serial;
+  renderMirrorDeviceList({ activeSerial: serial, connected: remoteSession.mirror.connected, available: remoteSession.mirror.available });
+}
+
 function renderMirrorDeviceList(snapshot) {
   if (!remoteSession || remoteSession.role !== 'viewer') return;
   remoteSession.mirror.connected = snapshot.connected || [];
   remoteSession.mirror.available = snapshot.available || [];
   if (!remoteSession.mirror.activeSerial || !remoteSession.mirror.connected.some(d => d.serial === remoteSession.mirror.activeSerial)) {
-    remoteSession.mirror.activeSerial = snapshot.activeSerial || (remoteSession.mirror.connected[0] && remoteSession.mirror.connected[0].serial) || null;
+    const fallback = snapshot.activeSerial || (remoteSession.mirror.connected[0] && remoteSession.mirror.connected[0].serial) || null;
+    if (fallback !== remoteSession.mirror.activeSerial) switchMirrorShellOutput(remoteSession.mirror.activeSerial, fallback);
+    remoteSession.mirror.activeSerial = fallback;
   }
   const targetEl = document.getElementById('viewer-shell-target');
   if (targetEl) {
@@ -1506,7 +1528,7 @@ function renderMirrorDeviceList(snapshot) {
       '<div class="dev-name">' + esc(dev.displayName || dev.serial) + '</div>' +
       '<div class="dev-serial">' + esc(dev.serial) + '</div></div></div>' +
       '<div class="device-card-bottom"><span class="dev-status-dot" title="Connected on host"></span></div>';
-    card.onclick = () => { remoteSession.mirror.activeSerial = dev.serial; renderMirrorDeviceList({ activeSerial: dev.serial, connected: remoteSession.mirror.connected, available: remoteSession.mirror.available }); };
+    card.onclick = () => selectMirrorDevice(dev.serial);
     list.appendChild(card);
   }
   for (const dev of remoteSession.mirror.available) {
@@ -2309,9 +2331,12 @@ async function executeRemoteShell(peerId, { requestId, serial, command }) {
   }
   try {
     const output = await adbShellTimed(info.adb, command, 20000);
+    const entry = '[remote] $ ' + command + '\n' + output + '\n';
+    if (!dataCache.shellBySerial) dataCache.shellBySerial = {};
+    dataCache.shellBySerial[serial] = (dataCache.shellBySerial[serial] || '') + entry;
     if (activeSerial === serial) {
       const outEl = document.getElementById('shell-output');
-      if (outEl) { outEl.textContent += '[remote] $ ' + command + '\n' + output + '\n'; outEl.scrollTop = outEl.scrollHeight; }
+      if (outEl) { outEl.textContent += entry; outEl.scrollTop = outEl.scrollHeight; }
     }
     remoteSession.actions.cmdResponse.send({ requestId, ok: true, output }, { target: peerId });
   } catch (err) {
@@ -2333,7 +2358,7 @@ function sendRemoteCommand() {
   const targetSerial = remoteSession.mirror.activeSerial;
   const targetDev = remoteSession.mirror.connected.find(d => d.serial === targetSerial);
   const targetLabel = targetDev ? (targetDev.nickname || targetDev.displayName || targetDev.serial) : targetSerial;
-  remoteSession.pendingRequests.set(requestId, { cmd });
+  remoteSession.pendingRequests.set(requestId, { cmd, serial: targetSerial });
   output.textContent += '[' + targetLabel + '] $ ' + cmd + '\n';
   output.scrollTop = output.scrollHeight;
   debugLogPush(`remote (viewer): sending cmdRequest requestId=${requestId} to hostPeerId=${remoteSession.hostPeerId}`, 'evt');
@@ -2350,19 +2375,29 @@ function sendRemoteCommand() {
 }
 
 function handleCmdResponse(data) {
-  const output = document.getElementById('viewer-shell-output');
-  if (!output || !remoteSession) return;
+  if (!remoteSession) return;
   const { requestId, ok, output: out, error, denied } = data || {};
+  const req = remoteSession.pendingRequests.get(requestId);
   remoteSession.pendingRequests.delete(requestId);
-  if (denied) output.textContent += '(denied by host)\n';
-  else if (ok) output.textContent += (out || '') + '\n';
-  else output.textContent += 'Error: ' + (error || 'unknown error') + '\n';
-  output.scrollTop = output.scrollHeight;
+  const serial = req ? req.serial : remoteSession.mirror.activeSerial;
+  const text = denied ? '(denied by host)\n' : ok ? (out || '') + '\n' : 'Error: ' + (error || 'unknown error') + '\n';
+  if (serial && serial === remoteSession.mirror.activeSerial) {
+    const output = document.getElementById('viewer-shell-output');
+    if (output) { output.textContent += text; output.scrollTop = output.scrollHeight; }
+  } else if (serial) {
+    // Response arrived for a device the viewer has since switched away from —
+    // stash it in that device's own console instead of the currently visible one.
+    if (!remoteSession.mirror.shellBySerial) remoteSession.mirror.shellBySerial = {};
+    remoteSession.mirror.shellBySerial[serial] = (remoteSession.mirror.shellBySerial[serial] || '') + text;
+  }
 }
 
 function clearViewerShell() {
   const el = document.getElementById('viewer-shell-output');
   if (el) el.textContent = '';
+  if (remoteSession && remoteSession.mirror.shellBySerial && remoteSession.mirror.activeSerial) {
+    delete remoteSession.mirror.shellBySerial[remoteSession.mirror.activeSerial];
+  }
 }
 
 // --- Export JSON ---

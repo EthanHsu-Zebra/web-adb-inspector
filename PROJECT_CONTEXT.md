@@ -197,6 +197,16 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.6.1 — per-device shell consoles on both host and viewer
+Following up on v1.6.0's "no state bug found" conclusion for the device-switch report: the user clarified what they actually wanted — each device should have its *own* console (matching what the host's local Shell tab already did via `dataCache.shellBySerial`), not one shared scrolling log that all devices write into. The host side already worked this way (`selectDevice()` saves/restores `dataCache.shellBySerial[serial]` on switch); the viewer side never had it — `#viewer-shell-output` was one continuous buffer regardless of which mirrored device was active.
+
+Added the same pattern to the viewer:
+- `remoteSession.mirror.shellBySerial` (per-viewer-session object, keyed by serial) mirrors `dataCache.shellBySerial`.
+- `switchMirrorShellOutput(oldSerial, newSerial)` saves the outgoing device's visible `#viewer-shell-output` text into its slot and loads the incoming device's slot (or empty, if none yet) — called from the new `selectMirrorDevice(serial)` (now what the device-card `onclick` calls) and from `renderMirrorDeviceList()`'s existing auto-fallback branch (covers the initial pick and the "active device disappeared" case, not just explicit clicks).
+- `sendRemoteCommand()` now records the target `serial` alongside `cmd` in `pendingRequests`, so `handleCmdResponse()` can route a late-arriving response to the *device it was actually for* — if the viewer already switched away by the time the response arrives, it's stashed straight into that device's `shellBySerial` slot instead of bleeding into whatever's currently on screen.
+- `clearViewerShell()` only clears the currently active device's slot, not the others.
+- Host side got the equivalent fix for remote-issued commands: `executeRemoteShell()` used to only append `[remote] $ ...` output to `#shell-output` if the targeted device happened to be the host's *currently selected* one — otherwise that history was dropped entirely. Now every remote command's output is appended to `dataCache.shellBySerial[serial]` unconditionally (and to the live DOM too, if that device happens to be selected), so switching to that device's Shell tab later still shows what the remote viewer ran against it.
+
 ### v1.6.0 — remote sessions default to trusted; fixed non-terminating commands (e.g. bare `logcat`) hanging forever
 Three changes, all in the remote-shell path:
 - **Trust by default.** `remoteSession.trusted` now starts `true` (was `false`), and the share modal's "Auto-run commands" checkbox is checked by default. The per-command approval gate (`showApprovalPrompt`/`approveRemoteCommand`/`denyRemoteCommand`) still exists — unchecking the box re-enables it — but the user only shares the link with people they already trust, so requiring a click per command added friction with no real safety benefit for that use case.

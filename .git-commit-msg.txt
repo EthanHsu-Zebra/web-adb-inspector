@@ -1,0 +1,27 @@
+v1.6.1: per-device shell consoles on host and viewer
+
+The host's local Shell tab already saved/restored console output per
+device (dataCache.shellBySerial) when switching between connected devices.
+The viewer side never had this: #viewer-shell-output was one shared,
+continuously-appended buffer no matter which mirrored device was selected,
+so switching devices in the viewer looked like it "resumed" the previous
+device's console instead of showing that device's own history.
+
+- Added remoteSession.mirror.shellBySerial (viewer-side), the same pattern
+  as the host's dataCache.shellBySerial.
+- Added switchMirrorShellOutput(oldSerial, newSerial) to save the outgoing
+  device's visible output and load the incoming device's, and
+  selectMirrorDevice(serial) which the device-card onclick now calls
+  instead of mutating mirror.activeSerial directly. renderMirrorDeviceList's
+  existing auto-fallback branch (active device disappearing) now also goes
+  through the swap so that path doesn't bypass it.
+- sendRemoteCommand() now records the target serial with each pending
+  request; handleCmdResponse() uses it to route a response to the device
+  it was actually for, so a response arriving after the viewer has already
+  switched devices lands in that device's own console instead of the one
+  currently on screen.
+- clearViewerShell() only clears the active device's console now.
+- executeRemoteShell() (host side) now always appends remote-issued command
+  output to dataCache.shellBySerial[serial], not only when that device
+  happens to be the host's currently selected one — previously that output
+  was silently dropped from the host's history if it wasn't selected.
