@@ -776,6 +776,7 @@
         <div class="panel-header">
           <h3>Run a command on the host's connected device</h3>
         </div>
+        <div style="padding:4px 16px;font-size:13px;color:#a6adc6;">Target device: <strong id="viewer-shell-target">none selected</strong></div>
         <div class="shell-bar">
           <input id="viewer-shell-input" type="text" placeholder="adb shell command..." onkeydown="if(event.key==='Enter')sendRemoteCommand()">
           <button class="btn" onclick="sendRemoteCommand()">Run</button>
@@ -800,6 +801,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080427"></script>
+<script type="module" src="bundle.js?v=2026080601"></script>
 </body>
 </html>

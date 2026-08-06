@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.9';
+const APP_VERSION = '1.6.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -11,6 +11,7 @@ import {
   AdbDefaultInterfaceFilter,
 } from '@yume-chan/adb-daemon-webusb';
 import AdbWebCredentialStore from '@yume-chan/adb-credential-web';
+import { TextDecoderStream, ConcatStringStream } from '@yume-chan/stream-extra';
 import { joinRoom } from '@trystero-p2p/ws-relay';
 
 // --- Global State ---
@@ -729,6 +730,38 @@ async function adbShell(adb, cmd) {
   throw new Error('Shell protocol not supported');
 }
 
+// Like adbShell(), but kills the process and throws if it doesn't exit within
+// timeoutMs. Needed for the remote-shell path: a viewer can request any
+// command, including non-terminating ones (bare "logcat", "top", "tail -f"),
+// which would otherwise hang the wait-for-exit call forever.
+async function adbShellTimed(adb, cmd, timeoutMs) {
+  const sp = adb.subprocess.shellProtocol;
+  if (!sp || !sp.isSupported) throw new Error('Shell protocol not supported');
+  const controller = new AbortController();
+  const process = await sp.spawn(cmd, controller.signal);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    try { process.kill(); } catch (_) {}
+  }, timeoutMs);
+  try {
+    const [stdout] = await Promise.all([
+      process.stdout.pipeThrough(new TextDecoderStream()).pipeThrough(new ConcatStringStream()),
+      process.stderr.pipeThrough(new TextDecoderStream()).pipeThrough(new ConcatStringStream()),
+      process.exited,
+    ]);
+    return stdout;
+  } catch (err) {
+    if (timedOut) {
+      throw new Error(`Command timed out after ${Math.round(timeoutMs / 1000)}s (it never exited). If this was "logcat", it streams forever — use "logcat -d" or "logcat -d -t 200" to dump and exit instead.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // --- ADB Sync: read large files from device ---
 async function readDeviceFile(adb, path) {
   // Use shell 'cat' rather than the documented adb.sync() — it works
@@ -1222,7 +1255,7 @@ function startShareSession() {
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room);
-  remoteSession = { role: 'host', room, roomId, password, trusted: false, viewers: new Set(), actions, pendingApprovals: new Map() };
+  remoteSession = { role: 'host', room, roomId, password, trusted: true, viewers: new Set(), actions, pendingApprovals: new Map() };
   pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
@@ -1296,12 +1329,12 @@ function showShareModal() {
   box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">Share Remote Session</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and, once trusted, run shell commands on it. Treat it like a password — use "Regenerate Link" if it leaks.</p>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and run shell commands on it — commands run immediately, with no approval prompt. Treat it like a password — use "Regenerate Link" if it leaks.</p>' +
     '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
     '<input id="share-link-input" type="text" readonly value="' + esc(link) + '" style="flex:1;background:#11111b;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;">' +
     '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
     '<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;cursor:pointer;">' +
-    '<input type="checkbox" id="share-trust-checkbox"> Trust this session (auto-run commands from any connected viewer, no approval prompt)</label>' +
+    '<input type="checkbox" id="share-trust-checkbox" checked> Auto-run commands from any connected viewer (uncheck to require approval per command)</label>' +
     '<div style="font-size:12px;color:#a6adc6;margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
     '<button class="btn btn-sm" id="share-regen-btn">Regenerate Link</button>' +
@@ -1446,6 +1479,11 @@ function renderMirrorDeviceList(snapshot) {
   remoteSession.mirror.available = snapshot.available || [];
   if (!remoteSession.mirror.activeSerial || !remoteSession.mirror.connected.some(d => d.serial === remoteSession.mirror.activeSerial)) {
     remoteSession.mirror.activeSerial = snapshot.activeSerial || (remoteSession.mirror.connected[0] && remoteSession.mirror.connected[0].serial) || null;
+  }
+  const targetEl = document.getElementById('viewer-shell-target');
+  if (targetEl) {
+    const activeDev = remoteSession.mirror.connected.find(d => d.serial === remoteSession.mirror.activeSerial);
+    targetEl.textContent = activeDev ? (activeDev.nickname || activeDev.displayName || activeDev.serial) : 'none selected';
   }
   const list = document.getElementById('device-list');
   const welcome = document.getElementById('welcome-msg');
@@ -2270,7 +2308,7 @@ async function executeRemoteShell(peerId, { requestId, serial, command }) {
     return;
   }
   try {
-    const output = await adbShell(info.adb, command);
+    const output = await adbShellTimed(info.adb, command, 20000);
     if (activeSerial === serial) {
       const outEl = document.getElementById('shell-output');
       if (outEl) { outEl.textContent += '[remote] $ ' + command + '\n' + output + '\n'; outEl.scrollTop = outEl.scrollHeight; }
@@ -2292,12 +2330,15 @@ function sendRemoteCommand() {
   if (!remoteSession.mirror.activeSerial) { output.textContent += '$ ' + cmd + '\nError: no device selected\n'; return; }
   input.value = '';
   const requestId = crypto.randomUUID();
+  const targetSerial = remoteSession.mirror.activeSerial;
+  const targetDev = remoteSession.mirror.connected.find(d => d.serial === targetSerial);
+  const targetLabel = targetDev ? (targetDev.nickname || targetDev.displayName || targetDev.serial) : targetSerial;
   remoteSession.pendingRequests.set(requestId, { cmd });
-  output.textContent += '$ ' + cmd + '  (pending host approval...)\n';
+  output.textContent += '[' + targetLabel + '] $ ' + cmd + '\n';
   output.scrollTop = output.scrollHeight;
   debugLogPush(`remote (viewer): sending cmdRequest requestId=${requestId} to hostPeerId=${remoteSession.hostPeerId}`, 'evt');
   Promise.resolve(
-    remoteSession.actions.cmdRequest.send({ requestId, serial: remoteSession.mirror.activeSerial, command: cmd }, { target: remoteSession.hostPeerId })
+    remoteSession.actions.cmdRequest.send({ requestId, serial: targetSerial, command: cmd }, { target: remoteSession.hostPeerId })
   ).then(() => {
     debugLogPush(`remote (viewer): cmdRequest send() resolved requestId=${requestId}`, 'ok');
   }).catch(err => {
