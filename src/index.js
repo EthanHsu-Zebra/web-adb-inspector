@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.5.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -427,11 +427,21 @@ function handleUsbDisconnect(e) {
     return;
   }
   // No match in connected — check availableDevices (unconnected device unplugged)
-  // Match by serial first, then vid+pid only if unambiguous
+  // Match by serial first, then vid+pid only if unambiguous.
+  // Skip deletion entirely if connectAvailable() is actively retrying this serial — its own
+  // retry loop already handles "device temporarily not found" (it's what triggers the
+  // backoff wait), and deleting the entry here would orphan the "Retrying..." card from the
+  // UI mid-retry: renderDeviceList() only shows a connectingStatus entry for serials still
+  // present in availableDevices, so removing the map entry hides the card even though the
+  // retry is still running in the background.
   for (const [akey, ainfo] of availableDevices) {
     const au = ainfo._usbId;
     if (!au) continue;
     if (dev.serial && au.serial && au.serial === dev.serial) {
+      if (connectingStatus.has(akey)) {
+        console.log('[disconnect-event] skip removing from available (retry in progress):', akey);
+        return;
+      }
       console.log('[disconnect-event] removing from available (unconnected):', akey);
       availableDevices.delete(akey);
       renderDeviceList();
@@ -447,6 +457,10 @@ function handleUsbDisconnect(e) {
     }
   }
   if (availCandidates.length === 1) {
+    if (connectingStatus.has(availCandidates[0])) {
+      console.log('[disconnect-event] skip removing from available vid+pid (retry in progress):', availCandidates[0]);
+      return;
+    }
     console.log('[disconnect-event] removing from available (vid+pid):', availCandidates[0]);
     availableDevices.delete(availCandidates[0]);
     renderDeviceList();
@@ -458,13 +472,18 @@ function handleUsbDisconnect(e) {
   console.log('[disconnect-event] no match found in connected or available');
 }
 
-async function connectDevice(usbDevice) {
+// opts.silent: skip the global status banner + ADB-release dialog on failure. Used by
+// connectAvailable()'s retry loop, where a raw "Failed: ..." banner on an attempt that's
+// about to be automatically retried is misleading — the caller manages user-facing status
+// for that flow instead, and only surfaces a failure once all retries are exhausted.
+async function connectDevice(usbDevice, opts = {}) {
+  const silent = !!opts.silent;
   let connectingKey = null;
   try {
     // Guard: ensure we have a valid USBDevice with connect()
     if (!usbDevice || typeof usbDevice.connect !== 'function') {
       debugLogPush('connectDevice: invalid USBDevice object — missing connect()', 'err');
-      setStatus('Invalid device object — please reconnect', 'err');
+      if (!silent) setStatus('Invalid device object — please reconnect', 'err');
       return false;
     }
     // Mark this device "connecting" synchronously, before any awaits — closes the race
@@ -599,8 +618,11 @@ async function connectDevice(usbDevice) {
   } catch (err) {
     const msg = err.message || String(err);
     debugLogPush(`connectDevice FAILED: ${msg}`, 'err');
-    if (isDeviceBusyError(msg)) showADBReleaseDialog();
-    setStatus('Failed: ' + msg, 'err');
+    if (opts.onError) opts.onError(msg);
+    if (!silent) {
+      if (isDeviceBusyError(msg)) showADBReleaseDialog();
+      setStatus('Failed: ' + msg, 'err');
+    }
     return false;
   } finally {
     if (connectingKey) connectingUsbIds.delete(connectingKey);
@@ -866,7 +888,13 @@ async function connectAvailable(serial) {
       // a failure here had nowhere to go: it wasn't connected, and (in earlier versions
       // that deleted the entry upfront) wasn't put back in "Ready to Connect" either —
       // it just vanished until some unrelated event happened to trigger a rescan.
-      let ok = await connectDevice(usbDevice);
+      // silent:true — an intermediate attempt about to be automatically retried showing
+      // a hard "Failed: ..." in the global status banner is misleading (it looks
+      // permanent when it usually isn't). The per-card "Retrying..." status above already
+      // gives live feedback; onError just captures the message for the final report below.
+      let lastError = null;
+      const onError = (msg) => { lastError = msg; };
+      let ok = await connectDevice(usbDevice, { silent: true, onError });
       // Observed in practice: connecting a second device shortly after a first one
       // succeeded can fail with "Connection closed unexpectedly" even on physically
       // separate USB ports (not just hub bandwidth contention) — cause not fully
@@ -877,7 +905,7 @@ async function connectAvailable(serial) {
       // increasing backoff instead.
       for (let attempt = 0; !ok && attempt < CONNECT_RETRY_DELAYS_MS.length; attempt++) {
         const delay = CONNECT_RETRY_DELAYS_MS[attempt];
-        debugLogPush(`connectAvailable: attempt ${attempt + 1} failed, waiting ${delay}ms before retry: serial=${serial}`, 'warn');
+        debugLogPush(`connectAvailable: attempt ${attempt + 1} failed (${lastError}), waiting ${delay}ms before retry: serial=${serial}`, 'warn');
         connectingStatus.set(serial, { attempt: attempt + 2, total: CONNECT_TOTAL_ATTEMPTS, label: `Retrying (${attempt + 2}/${CONNECT_TOTAL_ATTEMPTS})...` });
         renderDeviceList();
         await new Promise(r => setTimeout(r, delay));
@@ -885,15 +913,17 @@ async function connectAvailable(serial) {
         const retry = await findGrantedDevice(mgr, info._usbId);
         debugLogPush(`connectAvailable: retry #${attempt + 2} findGrantedDevice took ${Date.now() - retryStart}ms, found=${!!retry.usbDevice} among ${retry.count} granted`, 'evt');
         if (retry.usbDevice) {
-          ok = await connectDevice(retry.usbDevice);
+          ok = await connectDevice(retry.usbDevice, { silent: true, onError });
         } else {
           debugLogPush(`connectAvailable: retry #${attempt + 2} found no matching granted device yet`, 'warn');
         }
       }
+      connectingStatus.delete(serial);
       if (!ok) {
         debugLogPush(`connectAvailable: connectDevice failed after all retries: serial=${serial}`, 'warn');
+        setStatus(`Failed to connect ${info._displayName || serial} after retries` + (lastError ? ': ' + lastError : ''), 'err');
+        if (lastError && isDeviceBusyError(lastError)) showADBReleaseDialog();
       }
-      connectingStatus.delete(serial);
       renderDeviceList();
       return;
     }
