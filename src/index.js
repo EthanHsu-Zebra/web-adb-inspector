@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.4';
+const APP_VERSION = '1.5.5';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -489,6 +489,7 @@ function handleUsbDisconnect(e) {
 async function connectDevice(usbDevice, opts = {}) {
   const silent = !!opts.silent;
   let connectingKey = null;
+  let openedConnection = false;
   try {
     // Guard: ensure we have a valid USBDevice with connect()
     if (!usbDevice || typeof usbDevice.connect !== 'function') {
@@ -507,6 +508,7 @@ async function connectDevice(usbDevice, opts = {}) {
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
     const t0 = Date.now();
     const connection = await usbDevice.connect();
+    openedConnection = true;
     debugLogPush(`connectDevice: usbDevice.connect() resolved after ${Date.now() - t0}ms`, 'evt');
     console.log('[connect] connected, opened:', usbDevice.opened, 'conn.closed:', typeof connection.closed);
     const t1 = Date.now();
@@ -628,6 +630,24 @@ async function connectDevice(usbDevice, opts = {}) {
   } catch (err) {
     const msg = err.message || String(err);
     debugLogPush(`connectDevice FAILED: ${msg}`, 'err');
+    if (openedConnection) {
+      // usbDevice.connect() succeeded (claims the interface) but something after it —
+      // almost always AdbDaemonTransport.authenticate() — failed. If we don't release the
+      // claim here, the browser keeps treating the interface as held by this page for the
+      // rest of the page's lifetime: every subsequent attempt fails the same way, even with
+      // a freshly re-fetched device object from getDevices(), no matter how long we retry —
+      // only a full page reload (which force-releases all of a page's WebUSB claims) clears
+      // it. Confirmed exactly this pattern in practice: ~45s of retries all failing, then an
+      // immediate success right after a hard refresh. See PROJECT_CONTEXT.md. Use the native
+      // USBDevice.close() (via .raw) rather than anything yume-chan-specific, since closing
+      // the device is what actually releases the OS-level claim, standard WebUSB behavior.
+      try {
+        await usbDevice.raw.close();
+        debugLogPush('connectDevice: released USB claim after failure', 'evt');
+      } catch (closeErr) {
+        debugLogPush(`connectDevice: failed to release USB claim: ${closeErr.message || closeErr}`, 'warn');
+      }
+    }
     if (opts.onError) opts.onError(msg);
     if (!silent) {
       if (isDeviceBusyError(msg)) showADBReleaseDialog();

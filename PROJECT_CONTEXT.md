@@ -197,6 +197,13 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.5.5 — FIXED (likely the real root cause all along): leaked USB claim on failed connect never released
+The actual smoking gun (2026-08-06): re-toggling "USB debugging" on the device (which re-triggers Android's authorization prompt, confirmed accepted) and re-pairing still failed all 7 retries (~44.5s) — but a hard refresh right after immediately succeeded. If the underlying block were external/timing-based (e.g. the CrowdStrike scan-window theory), more retrying *within the same page* should work just as well as after a refresh — external systems don't care whether the page reloaded. But a hard refresh does exactly one relevant thing: it force-releases every WebUSB claim held by that page. That pointed back at our own code.
+
+Found it: `connectDevice()`'s catch block never closed the `connection` object (or the device) when `AdbDaemonTransport.authenticate()` failed *after* `usbDevice.connect()` had already succeeded (i.e. already claimed the USB interface). Every failed attempt — and there have been many, across this whole investigation — leaked a claimed interface that the browser kept associated with the page for its entire remaining lifetime. Retrying with a freshly-refetched device object doesn't help, because the leak isn't about *which device object* you hold, it's an OS-level claim the page never released. Only a full reload (which the browser cleans up on unload) clears it — which is the entire explanation for "hard refresh reliably fixes it" observed throughout this investigation, and likely means the CrowdStrike/endpoint-security theory (while plausibly still a contributing factor for the *first* failure in a sequence) was mostly a red herring for why retries kept failing afterward — each retry was doomed by the leak from the *previous* attempt, not by an external block.
+
+Fix: `connectDevice()` now tracks whether `usbDevice.connect()` succeeded (`openedConnection`), and if a later step throws, calls `usbDevice.raw.close()` (the standard native `USBDevice.close()`, not anything yume-chan-specific — closing the device is what actually releases the OS-level claim) before returning `false`, wrapped in its own try/catch so a failure to close doesn't mask the original error.
+
 ### v1.5.4 — retry logic reaches the initial "+Connect Device" picker path too; widened further; confirmed not device-specific
 Follow-up (2026-08-06) to v1.5.3. Two important refinements:
 
