@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.2';
+const APP_VERSION = '1.5.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -851,7 +851,15 @@ async function findGrantedDevice(mgr, usbId) {
   return { usbDevice, count: granted.length };
 }
 
-const CONNECT_RETRY_DELAYS_MS = [1000, 2500, 4000];
+// Widened (2026-08-06) after confirming the same device sometimes connects fine and
+// sometimes doesn't on this host, with the specific error varying between attempts —
+// inconsistent with a hard/permanent block, consistent with something transient of
+// variable duration (leading theory: endpoint security software — e.g. CrowdStrike's
+// "Firmware Analysis" module, seen installed on this host — briefly scanning newly
+// re-paired USB devices before releasing them for normal use). The previous ~7.5s total
+// retry window may simply not have been long enough for a slower scan. See
+// PROJECT_CONTEXT.md for the full investigation.
+const CONNECT_RETRY_DELAYS_MS = [1000, 2000, 3000, 5000, 8000];
 const CONNECT_TOTAL_ATTEMPTS = 1 + CONNECT_RETRY_DELAYS_MS.length; // shown in the card's "Connecting... (N/total)" status
 
 async function connectAvailable(serial) {
