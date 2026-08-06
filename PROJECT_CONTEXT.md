@@ -197,6 +197,17 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.5.4 — retry logic reaches the initial "+Connect Device" picker path too; widened further; confirmed not device-specific
+Follow-up (2026-08-06) to v1.5.3. Two important refinements:
+
+1. **It's not FR55-specific.** Forgetting and freshly re-pairing TC201 (previously 100% reliable) reproduced the exact same failure. The real trigger is "freshly `forgetDevice()`'d + re-paired via the picker" for *any* device, not a policy block on one specific VID — an already-established connection reconnects fine regardless of which device. This is a stronger fit for the CrowdStrike-scan-window theory (a fresh permission grant looks like a "newly attached" event worth (re-)scanning) than a per-VID deny policy (which would fail identically regardless of how long you wait).
+2. **`scanDevices()` (the "+Connect Device" native-picker path) had zero retry logic at all** — only `connectAvailable()` (the "Ready to Connect" reconnect path) retried. So a fresh pairing's first (and only) attempt failing required the user to notice it landed in "Ready to Connect" and manually click Connect there to reach the retry-capable path — observed directly: "it doesn't connect automatically hence I have to click connect button."
+3. **"Hard refresh fixes it" is misleading** — a refresh can't change anything at the USB/OS level (confirmed: VID is fixed hardware descriptor data, doesn't change). The refresh-plus-manual-retry cycle just takes real wall-clock time (10-30+ seconds), which is probably long enough for the transient block to clear on its own — i.e., retrying for that long automatically should have the same effect without the manual refresh.
+
+Fix: extracted the retry-with-backoff loop out of `connectAvailable()` into a shared `connectWithRetries(mgr, usbId, firstDevice, onStatus)`, now used by *both* `scanDevices()` and `connectAvailable()` — `onStatus(label)` lets each caller show progress wherever makes sense (`scanDevices()` has no device card yet, so it updates the global status banner instead of a per-card status). Also widened `CONNECT_RETRY_DELAYS_MS` again, from `[1000, 2000, 3000, 5000, 8000]` (~19s) to `[1500, 3000, 5000, 8000, 12000, 15000]` (~44.5s, 7 total attempts) — closer to the real wall-clock time a manual hard-refresh-and-retry cycle was taking.
+
+Also clarified for the user: `forgetDevice()`'s "Forget" and `showADBReleaseDialog()`'s "Release" are unrelated concepts that happen to share a word — `forget()` only revokes this browser's own WebUSB permission grant; the release dialog is about a *different* problem (something else on the OS holding the device open).
+
 ### v1.5.3 — widened retry window after a deep-dive into "Connection closed unexpectedly" / "device was disconnected"
 Full investigation (2026-08-06) into the two USB connection failure messages that had been intermittently affecting one specific device (Zebra FR55, USB VID `0x05E0` PID `0x2106`) on one specific host, while another device (Zebra TC201, VID `0x05C6`) on the same host worked reliably:
 

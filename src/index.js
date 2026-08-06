@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.3';
+const APP_VERSION = '1.5.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -191,7 +191,8 @@ async function scanDevices() {
     if (!device) return;
     // Check if this device is already connected. device is the wrapped AdbDaemonWebUsbDevice —
     // vendorId/productId only exist via .raw, not directly (see PROJECT_CONTEXT.md v1.3.2/v1.3.3).
-    const key = device.raw.vendorId + ':' + device.raw.productId + ':' + (device.serial || '');
+    const usbId = { vendorId: device.raw.vendorId, productId: device.raw.productId, serial: device.serial };
+    const key = usbId.vendorId + ':' + usbId.productId + ':' + (usbId.serial || '');
     for (const [, info] of connectedDevices) {
       if (info._usbId) {
         const existing = info._usbId.vendorId + ':' + info._usbId.productId + ':' + (info._usbId.serial || '');
@@ -201,7 +202,16 @@ async function scanDevices() {
         }
       }
     }
-    await connectDevice(device);
+    // A freshly-granted device (this is always the case here — scanDevices() only runs off
+    // the native picker) can hit the same transient post-attach delay as a reconnect, so it
+    // gets the same retry treatment via connectWithRetries() — see that function's comment
+    // and PROJECT_CONTEXT.md. There's no device card yet to show per-device status against,
+    // so retries are reflected in the global status banner instead.
+    const { ok, lastError } = await connectWithRetries(mgr, usbId, device, (label) => setStatus(label, 'connecting'));
+    if (!ok) {
+      setStatus('Failed to connect after retries' + (lastError ? ': ' + lastError : ''), 'err');
+      if (lastError && isDeviceBusyError(lastError)) showADBReleaseDialog();
+    }
   } catch (err) {
     const msg = err.message || String(err);
     if (isDeviceBusyError(msg)) showADBReleaseDialog();
@@ -851,16 +861,46 @@ async function findGrantedDevice(mgr, usbId) {
   return { usbDevice, count: granted.length };
 }
 
-// Widened (2026-08-06) after confirming the same device sometimes connects fine and
-// sometimes doesn't on this host, with the specific error varying between attempts —
-// inconsistent with a hard/permanent block, consistent with something transient of
-// variable duration (leading theory: endpoint security software — e.g. CrowdStrike's
-// "Firmware Analysis" module, seen installed on this host — briefly scanning newly
-// re-paired USB devices before releasing them for normal use). The previous ~7.5s total
-// retry window may simply not have been long enough for a slower scan. See
+// Widened again (2026-08-06) — a ~19s window still wasn't always enough. The clarifying
+// data point: it's not one specific device that's affected — ANY device, right after being
+// forgetDevice()'d and freshly re-paired, can hit this; an already-established device
+// reconnects reliably. A "hard refresh and try again" was observed to reliably recover it,
+// but that's most likely just because the refresh-and-retry cycle takes 10-30+ real seconds
+// — enough for whatever's transiently holding the device (leading theory: endpoint security
+// software, e.g. CrowdStrike's "Firmware Analysis" module seen installed on this host,
+// scanning newly-attached-looking USB devices before releasing them) to finish. So: retry
+// for about that long instead of relying on the user to manually reload. See
 // PROJECT_CONTEXT.md for the full investigation.
-const CONNECT_RETRY_DELAYS_MS = [1000, 2000, 3000, 5000, 8000];
+const CONNECT_RETRY_DELAYS_MS = [1500, 3000, 5000, 8000, 12000, 15000];
 const CONNECT_TOTAL_ATTEMPTS = 1 + CONNECT_RETRY_DELAYS_MS.length; // shown in the card's "Connecting... (N/total)" status
+
+// Shared retry-with-backoff loop, used both when reconnecting an already-paired device
+// (connectAvailable()) and right after a fresh pairing grant (scanDevices()) — both can hit
+// the same transient post-attach delay, so both need the same resilience. onStatus(label) is
+// called on every attempt/retry so each caller can show it wherever makes sense (a specific
+// device card vs. the global status banner, since a freshly-granted device from scanDevices()
+// has no card yet to attach a per-device status to).
+async function connectWithRetries(mgr, usbId, firstDevice, onStatus) {
+  let lastError = null;
+  const onError = (msg) => { lastError = msg; };
+  onStatus(`Connecting... (1/${CONNECT_TOTAL_ATTEMPTS})`);
+  let ok = await connectDevice(firstDevice, { silent: true, onError });
+  for (let attempt = 0; !ok && attempt < CONNECT_RETRY_DELAYS_MS.length; attempt++) {
+    const delay = CONNECT_RETRY_DELAYS_MS[attempt];
+    debugLogPush(`connectWithRetries: attempt ${attempt + 1} failed (${lastError}), waiting ${delay}ms before retry`, 'warn');
+    onStatus(`Retrying (${attempt + 2}/${CONNECT_TOTAL_ATTEMPTS})...`);
+    await new Promise(r => setTimeout(r, delay));
+    const retryStart = Date.now();
+    const retry = await findGrantedDevice(mgr, usbId);
+    debugLogPush(`connectWithRetries: retry #${attempt + 2} findGrantedDevice took ${Date.now() - retryStart}ms, found=${!!retry.usbDevice} among ${retry.count} granted`, 'evt');
+    if (retry.usbDevice) {
+      ok = await connectDevice(retry.usbDevice, { silent: true, onError });
+    } else {
+      debugLogPush(`connectWithRetries: retry #${attempt + 2} found no matching granted device yet`, 'warn');
+    }
+  }
+  return { ok, lastError };
+}
 
 async function connectAvailable(serial) {
   if (connectingStatus.has(serial)) return; // already in progress (e.g. double-click) — ignore
@@ -891,41 +931,10 @@ async function connectAvailable(serial) {
     if (usbDevice) {
       debugLogPush(`connectAvailable: instant match via getDevices: serial=${usbDevice.serial}`, 'ok');
       console.log('[connect-available] instant match via getDevices:', usbDevice.serial);
-      // connectDevice() catches its own errors internally and never throws — it now
-      // returns true/false so we can tell whether it actually worked. Without this check,
-      // a failure here had nowhere to go: it wasn't connected, and (in earlier versions
-      // that deleted the entry upfront) wasn't put back in "Ready to Connect" either —
-      // it just vanished until some unrelated event happened to trigger a rescan.
-      // silent:true — an intermediate attempt about to be automatically retried showing
-      // a hard "Failed: ..." in the global status banner is misleading (it looks
-      // permanent when it usually isn't). The per-card "Retrying..." status above already
-      // gives live feedback; onError just captures the message for the final report below.
-      let lastError = null;
-      const onError = (msg) => { lastError = msg; };
-      let ok = await connectDevice(usbDevice, { silent: true, onError });
-      // Observed in practice: connecting a second device shortly after a first one
-      // succeeded can fail with "Connection closed unexpectedly" even on physically
-      // separate USB ports (not just hub bandwidth contention) — cause not fully
-      // understood (possibly host-controller/root-hub grouping, or endpoint security
-      // software). Also observed: the device can take well over a second to actually
-      // physically re-enumerate as "granted" again after this happens (one case took
-      // ~1.86s), so a single short-delay retry isn't always enough — retry with
-      // increasing backoff instead.
-      for (let attempt = 0; !ok && attempt < CONNECT_RETRY_DELAYS_MS.length; attempt++) {
-        const delay = CONNECT_RETRY_DELAYS_MS[attempt];
-        debugLogPush(`connectAvailable: attempt ${attempt + 1} failed (${lastError}), waiting ${delay}ms before retry: serial=${serial}`, 'warn');
-        connectingStatus.set(serial, { attempt: attempt + 2, total: CONNECT_TOTAL_ATTEMPTS, label: `Retrying (${attempt + 2}/${CONNECT_TOTAL_ATTEMPTS})...` });
+      const { ok, lastError } = await connectWithRetries(mgr, info._usbId, usbDevice, (label) => {
+        connectingStatus.set(serial, { total: CONNECT_TOTAL_ATTEMPTS, label });
         renderDeviceList();
-        await new Promise(r => setTimeout(r, delay));
-        const retryStart = Date.now();
-        const retry = await findGrantedDevice(mgr, info._usbId);
-        debugLogPush(`connectAvailable: retry #${attempt + 2} findGrantedDevice took ${Date.now() - retryStart}ms, found=${!!retry.usbDevice} among ${retry.count} granted`, 'evt');
-        if (retry.usbDevice) {
-          ok = await connectDevice(retry.usbDevice, { silent: true, onError });
-        } else {
-          debugLogPush(`connectAvailable: retry #${attempt + 2} found no matching granted device yet`, 'warn');
-        }
-      }
+      });
       connectingStatus.delete(serial);
       if (!ok) {
         debugLogPush(`connectAvailable: connectDevice failed after all retries: serial=${serial}`, 'warn');
