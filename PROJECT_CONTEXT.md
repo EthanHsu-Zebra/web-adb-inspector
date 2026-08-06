@@ -197,6 +197,13 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.5.8 — try USBDevice.reset() (a real bus-level reset) as a cheaper alternative to the iframe-isolation idea
+Before committing to a same-origin-iframe "mini-reload" architecture (a real but complex/uncertain option — discarding any browsing context, not just the top-level page, triggers the same WebUSB cleanup per spec, so a disposable iframe per connection attempt could in principle avoid needing a full page reload), tried the cheaper option first: `USBDevice.reset()`. Unlike `open()`/`close()` (which only manage the *browser's logical claim/handle*), `reset()` performs an actual USB-protocol-level bus reset — the software equivalent of physically unplugging and replugging the device. Added it to both existing cleanup points:
+- The pre-emptive cleanup before every attempt (v1.5.6): now `open()` → `reset()` → `close()` (each independently best-effort; `reset()` requires the device to already be `opened`, hence `open()` first) instead of just `close()`.
+- The post-failure catch-block cleanup (v1.5.5, for when `usbDevice.connect()` succeeds but a later step fails): now `reset()` before `close()`, instead of just `close()`.
+
+Not yet confirmed whether this resolves the issue — if it doesn't, the next step is the iframe-isolation approach, or accepting the v1.5.7 one-click Reload button as the practical answer going forward.
+
 ### v1.5.7 — accepted this can't be fixed purely in-page; added a one-click Reload
 v1.5.6's pre-emptive `close()`-before-every-attempt *also* didn't recover it — confirmed the exact same "Failed to execute 'open'... device was disconnected" error persisted through a full 7-attempt retry cycle even with that in place. That result actually rules out the "still open from a previous attempt" theory entirely: an unconditional `close()` before every attempt, including the very first, should clear any such state if that were the real cause, and it didn't.
 

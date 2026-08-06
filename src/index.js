@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.7';
+const APP_VERSION = '1.5.8';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -546,6 +546,16 @@ async function connectDevice(usbDevice, opts = {}) {
     // Unconditionally closing first, before every attempt, clears that regardless of what
     // state a previous attempt left behind. Ignore any error — most of the time there's
     // nothing to close, and that's fine.
+    //
+    // v1.5.8: also try an actual USBDevice.reset() — a real USB-protocol-level bus reset
+    // (like a real unplug/replug at the electrical level), distinct from open()/close()
+    // (which only manage the browser's logical claim/handle). reset() requires the device
+    // to already be "opened", hence open() first here — this is a deliberately more
+    // aggressive best-effort cleanup than v1.5.6's close()-only attempt, since that alone
+    // didn't recover this failure. Each step is independent and best-effort; if any of
+    // them isn't applicable (e.g. nothing to reset) that's expected, not an error.
+    try { await usbDevice.raw.open(); } catch (_) {}
+    try { await usbDevice.raw.reset(); debugLogPush('connectDevice: pre-emptive USB reset succeeded', 'evt'); } catch (_) {}
     try { await usbDevice.raw.close(); } catch (_) {}
     setStatus('Connecting...', 'connecting');
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
@@ -684,6 +694,16 @@ async function connectDevice(usbDevice, opts = {}) {
       // immediate success right after a hard refresh. See PROJECT_CONTEXT.md. Use the native
       // USBDevice.close() (via .raw) rather than anything yume-chan-specific, since closing
       // the device is what actually releases the OS-level claim, standard WebUSB behavior.
+      // v1.5.8: also try a real bus-level reset() while still open, before closing —
+      // distinct from close() (logical claim release only); reset() asks the OS/hardware
+      // to actually reset the device's USB connection, which might clear stuck state that
+      // close() alone doesn't touch.
+      try {
+        await usbDevice.raw.reset();
+        debugLogPush('connectDevice: reset USB device after failure', 'evt');
+      } catch (resetErr) {
+        debugLogPush(`connectDevice: failed to reset USB device: ${resetErr.message || resetErr}`, 'warn');
+      }
       try {
         await usbDevice.raw.close();
         debugLogPush('connectDevice: released USB claim after failure', 'evt');
