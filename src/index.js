@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.4.2';
+const APP_VERSION = '1.4.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -448,7 +448,7 @@ async function connectDevice(usbDevice) {
     if (!usbDevice || typeof usbDevice.connect !== 'function') {
       debugLogPush('connectDevice: invalid USBDevice object — missing connect()', 'err');
       setStatus('Invalid device object — please reconnect', 'err');
-      return;
+      return false;
     }
     // Mark this device "connecting" synchronously, before any awaits — closes the race
     // where the native 'connect' event (fired by the same requestDevice() grant that got
@@ -573,12 +573,14 @@ async function connectDevice(usbDevice) {
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adbSerial);
     setStatus('Connected', 'ok');
+    return true;
 
   } catch (err) {
     const msg = err.message || String(err);
     debugLogPush(`connectDevice FAILED: ${msg}`, 'err');
     if (msg.includes('already in use')) showADBReleaseDialog();
     setStatus('Failed: ' + msg, 'err');
+    return false;
   } finally {
     if (connectingKey) connectingUsbIds.delete(connectingKey);
   }
@@ -707,8 +709,12 @@ async function connectSelected() {
   const serials = Array.from(selectedAvailableSerials);
   selectedAvailableSerials.clear();
   updateBulkBars();
-  for (const serial of serials) {
-    await connectAvailable(serial);
+  for (let i = 0; i < serials.length; i++) {
+    await connectAvailable(serials[i]);
+    // Small buffer between back-to-back USB connect attempts — observed a device on a
+    // shared hub drop with "Connection closed unexpectedly" when a second device's
+    // connect() fired immediately after the first one succeeded (see PROJECT_CONTEXT.md).
+    if (i < serials.length - 1) await new Promise(r => setTimeout(r, 400));
   }
 }
 
@@ -809,7 +815,17 @@ async function connectAvailable(serial) {
     if (usbDevice) {
       debugLogPush(`connectAvailable: instant match via getDevices: serial=${usbDevice.serial}`, 'ok');
       console.log('[connect-available] instant match via getDevices:', usbDevice.serial);
-      await connectDevice(usbDevice);
+      // connectDevice() catches its own errors internally and never throws — it now
+      // returns true/false so we can tell whether it actually worked. Without this check,
+      // a failure here (deleted from availableDevices above) had nowhere to go: it wasn't
+      // connected, and wasn't put back in "Ready to Connect" either — it just vanished
+      // until some unrelated event happened to trigger a rescan that rediscovered it.
+      const ok = await connectDevice(usbDevice);
+      if (!ok) {
+        debugLogPush(`connectAvailable: connectDevice failed, restoring to Ready to Connect: serial=${serial}`, 'warn');
+        availableDevices.set(serial, info);
+        renderDeviceList();
+      }
       return;
     }
     debugLogPush(`connectAvailable: no instant match in ${granted.length} granted devices`, 'warn');
@@ -827,7 +843,12 @@ async function connectAvailable(serial) {
     const picked = await mgr.requestDevice({ filters: [AdbDefaultInterfaceFilter] });
     if (!picked) throw new Error('Device picker cancelled');
     debugLogPush(`connectAvailable: picker returned: serial=${picked.serial}`, 'evt');
-    await connectDevice(picked);
+    const ok = await connectDevice(picked);
+    if (!ok) {
+      debugLogPush(`connectAvailable: connectDevice (via picker) failed, restoring to Ready to Connect: serial=${serial}`, 'warn');
+      availableDevices.set(serial, info);
+      renderDeviceList();
+    }
   } catch (err) {
     debugLogPush(`connectAvailable: picker failed: ${err.message}`, 'err');
     console.log('[connect-available] picker failed:', err);

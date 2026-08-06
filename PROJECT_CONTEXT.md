@@ -197,6 +197,11 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.4.3 — FIXED: bulk "Connect Selected" — a failed device vanished instead of returning to Ready to Connect
+`connectDevice()` catches all its own errors internally (logs + status message) and never threw — so callers had no way to distinguish success from failure. Hit in practice with bulk-select: connecting two different physical devices back-to-back, the second failed with "Connection closed unexpectedly" (likely USB bus/hub contention from firing a second `connect()` immediately after the first succeeded) — `connectAvailable()` had already deleted it from `availableDevices` before attempting the connection, and since `connectDevice()` didn't signal failure, it never got restored. The device disappeared from both lists until an unrelated spontaneous `'connect'` event happened to trigger a rescan ~2s later — not a reliable recovery path.
+
+Fix: `connectDevice()` now returns `true`/`false`. `connectAvailable()` checks this in both its instant-match and picker-fallback branches and restores the entry to `availableDevices` immediately on failure, instead of just for the outer picker-exception case it already handled. `connectSelected()` (the bulk action) also now waits 400ms between successive connect attempts, to reduce the chance of triggering the same bus contention in the first place.
+
 ### v1.4.2 — added: "Forget" button on Ready to Connect cards
 Calls `USBDevice.forget()` (via `usbDevice.raw.forget()` on our wrapped type) to revoke this site's browser permission grant for that device, so it behaves like a never-paired device again (only reachable via the native picker from then on) — a UI way to simulate a fresh device connection instead of digging through Chrome's page-info → Site settings → USB devices. `forget()` isn't Baseline-supported across all browsers (works in Chrome); falls back to removing the entry from our own list only (with a clear debug-log warning that the browser-level grant wasn't actually revoked) if unsupported. Re-fetches a fresh device reference via `mgr.getDevices()` first if the stored entry's `usbDevice` is `null` (e.g. it arrived via `disconnectOne()`, which deliberately nulls that field per the "never cache usbDevice" convention).
 
