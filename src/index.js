@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.5.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -23,6 +23,9 @@ const selectedAvailableSerials = new Set(); // for bulk Connect Selected
 // (e.g. triggered by the same native 'connect' event the picker's grant fires) doesn't race
 // ahead and add the device to "Ready to Connect" before connectedDevices.set() runs.
 const connectingUsbIds = new Set();
+// serial -> {attempt, total, label} for available devices currently mid-connectAvailable()
+// (including retries) — drives the "Connecting... (2/4)" status shown on their card.
+const connectingStatus = new Map();
 let activeSerial = null;
 let disconnectingSerial = null;  // serial currently being intentionally disconnected (suppress USB event)
 const dataCache = { props: [], features: [], packages: [] };
@@ -155,10 +158,24 @@ function getOS() {
   return 'unknown';
 }
 
+// Broader than a plain "already in use" check: WebUSB surfaces the same underlying
+// problem (something else on the host holding the device — a background adb.exe/ADB
+// server, Android Studio, vendor sync/management software, etc.) under several different
+// error messages depending on exactly where it fails. All of these warrant the same
+// "go free up the device" guidance.
+function isDeviceBusyError(msg) {
+  const m = (msg || '').toLowerCase();
+  return m.includes('already in use') ||
+    m.includes('device was disconnected') ||
+    m.includes("failed to execute 'open'") ||
+    m.includes('unable to claim interface') ||
+    m.includes('access denied');
+}
+
 function showADBReleaseDialog() {
   const os = getOS();
   let t, b;
-  if (os === 'windows') { t = 'Release ADB on Windows'; b = '1. Open Command Prompt\n2. Run: adb kill-server\n3. Or: taskkill /F /IM adb.exe\n4. Refresh page'; }
+  if (os === 'windows') { t = 'Release the device on Windows'; b = 'Something else on this machine likely has the device open (a background adb.exe/ADB server, Android Studio, or vendor device-management software).\n\n1. Command Prompt: adb kill-server\n2. Or: taskkill /F /IM adb.exe\n3. Also check Task Manager for Android Studio, Zebra device-management tools (e.g. StageNow, 123Scan, device sync utilities), or other apps that talk to this device over USB, and close them.\n4. Refresh this page and try again.'; }
   else if (os === 'mac') { t = 'Release ADB on macOS'; b = '1. Terminal: adb kill-server\n2. If stuck: pkill -f adb'; }
   else { t = 'Release ADB on Linux'; b = 'echo "BUS-DEV" | sudo tee /sys/bus/usb/drivers/android_usb/unbind'; }
   alert(t + '\n\n' + b);
@@ -187,7 +204,7 @@ async function scanDevices() {
     await connectDevice(device);
   } catch (err) {
     const msg = err.message || String(err);
-    if (msg.includes('already in use')) showADBReleaseDialog();
+    if (isDeviceBusyError(msg)) showADBReleaseDialog();
     else setStatus('Failed: ' + msg, 'err');
   }
 }
@@ -582,7 +599,7 @@ async function connectDevice(usbDevice) {
   } catch (err) {
     const msg = err.message || String(err);
     debugLogPush(`connectDevice FAILED: ${msg}`, 'err');
-    if (msg.includes('already in use')) showADBReleaseDialog();
+    if (isDeviceBusyError(msg)) showADBReleaseDialog();
     setStatus('Failed: ' + msg, 'err');
     return false;
   } finally {
@@ -662,8 +679,14 @@ function renderDeviceList() {
       const nick = deviceNicknames[serial] || '';
       const displaySerial = info._usbId && info._usbId.serial ? info._usbId.serial : serial;
       const checked = selectedAvailableSerials.has(serial) ? 'checked' : '';
+      const connecting = connectingStatus.get(serial);
       const card = document.createElement('div');
-      card.className = 'device-card available';
+      card.className = 'device-card available' + (connecting ? ' connecting' : '');
+      const bottomHtml = connecting
+        ? `<span class="loading"></span><span class="connecting-label">${esc(connecting.label)}</span>`
+        : `<span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
+        <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>
+        <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();forgetDevice('${serial}')" title="Revoke this device's browser permission (simulate a fresh, never-paired device)">Forget</button>`;
       card.innerHTML = `<div class="device-card-top">
         <input type="checkbox" class="device-checkbox" ${checked} onclick="event.stopPropagation();toggleDeviceSelection('available','${serial}')" title="Select">
         <div class="dev-info">
@@ -672,11 +695,7 @@ function renderDeviceList() {
           <div class="dev-serial">${esc(displaySerial)}</div>
         </div>
       </div>
-      <div class="device-card-bottom">
-        <span class="dev-status-dot dev-status-dot-gray" title="Ready to Connect"></span>
-        <button class="btn btn-sm btn-connect" onclick="event.stopPropagation();connectAvailable('${serial}')" title="Connect">Connect</button>
-        <button class="btn btn-sm btn-disconnect" onclick="event.stopPropagation();forgetDevice('${serial}')" title="Revoke this device's browser permission (simulate a fresh, never-paired device)">Forget</button>
-      </div>`;
+      <div class="device-card-bottom">${bottomHtml}</div>`;
       availList.appendChild(card);
     }
   }
@@ -810,7 +829,11 @@ async function findGrantedDevice(mgr, usbId) {
   return { usbDevice, count: granted.length };
 }
 
+const CONNECT_RETRY_DELAYS_MS = [1000, 2500, 4000];
+const CONNECT_TOTAL_ATTEMPTS = 1 + CONNECT_RETRY_DELAYS_MS.length; // shown in the card's "Connecting... (N/total)" status
+
 async function connectAvailable(serial) {
+  if (connectingStatus.has(serial)) return; // already in progress (e.g. double-click) — ignore
   debugLogPush(`connectAvailable called: serial=${serial}`, 'evt');
   const info = availableDevices.get(serial);
   if (!info) {
@@ -818,7 +841,13 @@ async function connectAvailable(serial) {
     setStatus('Device not found in available list: ' + serial, 'err');
     return;
   }
-  availableDevices.delete(serial);
+  // Deliberately NOT deleting from availableDevices here (unlike earlier versions) — the
+  // card stays visible throughout, showing a live "Connecting..." status via connectingStatus,
+  // instead of vanishing from "Ready to Connect" and only reappearing if every retry fails.
+  // On success, connectDevice()'s own defensive cleanup removes this entry; on failure, it's
+  // simply still here since it was never removed.
+  connectingStatus.set(serial, { attempt: 1, total: CONNECT_TOTAL_ATTEMPTS, label: 'Connecting...' });
+  renderDeviceList();
   console.log('[connect-available] attempting reconnect for:', serial, info._displayName, info._usbId);
   // STEP 1: Try instant reconnect via getDevices() — no picker if device still granted
   try {
@@ -834,9 +863,9 @@ async function connectAvailable(serial) {
       console.log('[connect-available] instant match via getDevices:', usbDevice.serial);
       // connectDevice() catches its own errors internally and never throws — it now
       // returns true/false so we can tell whether it actually worked. Without this check,
-      // a failure here (deleted from availableDevices above) had nowhere to go: it wasn't
-      // connected, and wasn't put back in "Ready to Connect" either — it just vanished
-      // until some unrelated event happened to trigger a rescan that rediscovered it.
+      // a failure here had nowhere to go: it wasn't connected, and (in earlier versions
+      // that deleted the entry upfront) wasn't put back in "Ready to Connect" either —
+      // it just vanished until some unrelated event happened to trigger a rescan.
       let ok = await connectDevice(usbDevice);
       // Observed in practice: connecting a second device shortly after a first one
       // succeeded can fail with "Connection closed unexpectedly" even on physically
@@ -846,10 +875,11 @@ async function connectAvailable(serial) {
       // physically re-enumerate as "granted" again after this happens (one case took
       // ~1.86s), so a single short-delay retry isn't always enough — retry with
       // increasing backoff instead.
-      const RETRY_DELAYS_MS = [1000, 2500, 4000];
-      for (let attempt = 0; !ok && attempt < RETRY_DELAYS_MS.length; attempt++) {
-        const delay = RETRY_DELAYS_MS[attempt];
+      for (let attempt = 0; !ok && attempt < CONNECT_RETRY_DELAYS_MS.length; attempt++) {
+        const delay = CONNECT_RETRY_DELAYS_MS[attempt];
         debugLogPush(`connectAvailable: attempt ${attempt + 1} failed, waiting ${delay}ms before retry: serial=${serial}`, 'warn');
+        connectingStatus.set(serial, { attempt: attempt + 2, total: CONNECT_TOTAL_ATTEMPTS, label: `Retrying (${attempt + 2}/${CONNECT_TOTAL_ATTEMPTS})...` });
+        renderDeviceList();
         await new Promise(r => setTimeout(r, delay));
         const retryStart = Date.now();
         const retry = await findGrantedDevice(mgr, info._usbId);
@@ -861,10 +891,10 @@ async function connectAvailable(serial) {
         }
       }
       if (!ok) {
-        debugLogPush(`connectAvailable: connectDevice failed after all retries, restoring to Ready to Connect: serial=${serial}`, 'warn');
-        availableDevices.set(serial, info);
-        renderDeviceList();
+        debugLogPush(`connectAvailable: connectDevice failed after all retries: serial=${serial}`, 'warn');
       }
+      connectingStatus.delete(serial);
+      renderDeviceList();
       return;
     }
     debugLogPush(`connectAvailable: no instant match in ${count} granted devices`, 'warn');
@@ -875,6 +905,8 @@ async function connectAvailable(serial) {
   // STEP 2: Not in granted list — must use picker (unplugged & re-plugged)
   debugLogPush(`connectAvailable: falling back to picker`, 'warn');
   console.log('[connect-available] no instant match, falling back to picker');
+  connectingStatus.set(serial, { attempt: CONNECT_TOTAL_ATTEMPTS, total: CONNECT_TOTAL_ATTEMPTS, label: 'Waiting for device picker...' });
+  renderDeviceList();
   try {
     const mgr = AdbDaemonWebUsbDeviceManager.BROWSER;
     if (!mgr) throw new Error('WebUSB ADB manager not available');
@@ -884,15 +916,15 @@ async function connectAvailable(serial) {
     debugLogPush(`connectAvailable: picker returned: serial=${picked.serial}`, 'evt');
     const ok = await connectDevice(picked);
     if (!ok) {
-      debugLogPush(`connectAvailable: connectDevice (via picker) failed, restoring to Ready to Connect: serial=${serial}`, 'warn');
-      availableDevices.set(serial, info);
-      renderDeviceList();
+      debugLogPush(`connectAvailable: connectDevice (via picker) failed: serial=${serial}`, 'warn');
     }
   } catch (err) {
     debugLogPush(`connectAvailable: picker failed: ${err.message}`, 'err');
     console.log('[connect-available] picker failed:', err);
     setStatus('Connect failed: ' + (err.message || String(err)), 'err');
-    availableDevices.set(serial, info);
+  } finally {
+    connectingStatus.delete(serial);
+    renderDeviceList();
   }
 }
 

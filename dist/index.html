@@ -180,6 +180,17 @@
   .device-card.available:hover {
     opacity: 1;
   }
+  .device-card.available.connecting {
+    opacity: 1;
+    border-style: solid;
+    border-color: var(--accent);
+    background: rgba(88,166,255,0.06);
+  }
+  .connecting-label {
+    font-size: calc(0.75rem * var(--font-scale));
+    color: var(--accent);
+    font-weight: 500;
+  }
   .btn-connect {
     background: transparent;
     color: var(--green);
@@ -789,6 +800,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080418"></script>
+<script type="module" src="bundle.js?v=2026080419"></script>
 </body>
 </html>
