@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.10.0';
+const APP_VERSION = '1.10.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1333,8 +1333,6 @@ function createFallbackChannel(roomId, password, sessionId, label) {
   };
 }
 
-const REMOTE_ACTION_NAMES = ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'bye'];
-
 // Wraps each trystero action so every send() goes out over BOTH the real P2P data
 // channel (best-effort — silently a no-op if no such peer is connected, same as
 // trystero's own behavior) and the fallback channel, and every onMessage() handler
@@ -1376,7 +1374,7 @@ function makeRemoteActions(room, roomId, password, label) {
   }
 
   const actions = {};
-  for (const name of REMOTE_ACTION_NAMES) actions[name] = wrap(name);
+  for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'bye']) actions[name] = wrap(name);
   actions._fallback = fallback;
   actions._sessionId = sessionId;
   return actions;
