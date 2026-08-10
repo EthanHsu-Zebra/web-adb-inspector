@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.8.1';
+const APP_VERSION = '1.9.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2287,6 +2287,55 @@ async function checkAttestationCapability(adb) {
   }
 }
 
+// RKP: definitive provisioning check. Package/HAL/config presence (rkpd installed,
+// HAL registered, remote_provisioning.* props set) only proves RKP is *supported and
+// configured* — it does NOT prove provisioning material actually exists. The one
+// reliable ADB-level proof is `cmd remote_provisioning certify <component>` returning
+// a real PEM certificate chain. See "Android RKP Provisioning Verification via ADB".
+async function checkRkpProvisioning(adb) {
+  let pkgInstalled = false, pkgEnabled = null, pkgVersion = '';
+  try {
+    const pkgOut = await adbShell(adb, 'pm list packages --apex-only; pm list packages');
+    pkgInstalled = /rkpd/i.test(pkgOut);
+  } catch (_) {}
+  if (pkgInstalled) {
+    try {
+      const dump = await adbShell(adb, 'dumpsys package com.google.android.rkpd');
+      const enabledMatch = dump.match(/enabled=(\w+)/i);
+      pkgEnabled = enabledMatch ? /true/i.test(enabledMatch[1]) : null;
+      const verMatch = dump.match(/versionCode=(\d+)/);
+      pkgVersion = verMatch ? verMatch[1] : '';
+    } catch (_) {}
+  }
+
+  let components = [];
+  try {
+    const listOut = await adbShell(adb, 'cmd remote_provisioning list');
+    components = listOut.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch (_) {}
+
+  let hostname = '', teeRkpOnly = '';
+  try { hostname = (await adbShell(adb, 'getprop remote_provisioning.hostname')).trim(); } catch (_) {}
+  try { teeRkpOnly = (await adbShell(adb, 'getprop remote_provisioning.tee.rkp_only')).trim(); } catch (_) {}
+
+  // The definitive check: try to certify every enumerated component and see whether
+  // a real certificate chain comes back. Do NOT infer "provisioned" from anything else.
+  const certified = [];
+  for (const name of components) {
+    let provisioned = false, note = '';
+    try {
+      const cert = await adbShell(adb, 'cmd remote_provisioning certify ' + name);
+      provisioned = cert.includes('-----BEGIN CERTIFICATE-----');
+      if (!provisioned) note = (cert.trim().split('\n')[0] || 'No certificate chain returned').slice(0, 100);
+    } catch (err) {
+      note = String(err.message || err).slice(0, 100);
+    }
+    certified.push({ name, provisioned, note });
+  }
+
+  return { pkgInstalled, pkgEnabled, pkgVersion, components, hostname, teeRkpOnly, certified };
+}
+
 function renderStatusTable(rows) {
   return '<table class="status-table"><thead><tr><th>Check</th><th>Value</th><th>Status</th></tr></thead><tbody>' +
     rows.map(([check, value, status, tip]) => {
@@ -2753,6 +2802,9 @@ async function fetchRKP() {
   if (!info) return;
   showLoading('rkp', true);
   try {
+    // 0) Definitive RKP provisioning check (cmd remote_provisioning certify <name>)
+    const rkp = await checkRkpProvisioning(info.adb);
+
     // 1) Real attestation capability test (HAL version + TLS handshake, not just ping)
     const attest = await checkAttestationCapability(info.adb);
 
@@ -2817,6 +2869,43 @@ async function fetchRKP() {
 
     // Build rows: [Check, Value, Status, Source, Tooltip]
     const rows = [];
+
+    // --- Definitive RKP provisioning evidence (put first — this is the headline result) ---
+    if (rkp.pkgInstalled) {
+      rows.push(['RKP Package', 'Installed' + (rkp.pkgVersion ? ' (versionCode ' + rkp.pkgVersion + ')' : ''),
+        'ok', 'pm list packages | grep rkpd',
+        'RKP Mainline module presence. Installed alone does NOT prove provisioning — see the "RKP Provisioned" rows below.']);
+      if (rkp.pkgEnabled !== null) {
+        rows.push(['RKP Package Enabled', rkp.pkgEnabled ? 'true' : 'false',
+          rkp.pkgEnabled ? 'ok' : 'warn', 'dumpsys package com.google.android.rkpd',
+          'Whether the RKP daemon package is currently enabled.']);
+      }
+    }
+    if (rkp.components.length) {
+      rows.push(['RKP Components', rkp.components.join(', '), 'ok', 'cmd remote_provisioning list',
+        'IRemotelyProvisionedComponent instances exposed by the device (e.g. default = TEE, strongbox = StrongBox dedicated secure element).']);
+    } else {
+      rows.push(['RKP Components', 'None found', 'unknown', 'cmd remote_provisioning list',
+        'Either this device does not expose the Remote Provisioning shell command, or it has no RKP-capable components.']);
+    }
+    if (rkp.hostname) {
+      rows.push(['RKP Backend', rkp.hostname, 'ok', 'getprop remote_provisioning.hostname',
+        'Configured remote provisioning server.']);
+    }
+    if (rkp.teeRkpOnly) {
+      rows.push(['TEE RKP-Only', rkp.teeRkpOnly, rkp.teeRkpOnly === 'true' ? 'ok' : 'unknown',
+        'getprop remote_provisioning.tee.rkp_only',
+        'true = the TEE attestation configuration relies solely on remote provisioning (no factory-provisioned fallback keys).']);
+    }
+    for (const c of rkp.certified) {
+      rows.push([
+        'RKP Provisioned (' + c.name + ')',
+        c.provisioned ? 'PROVISIONED — certificate chain present' : 'NOT CONFIRMED' + (c.note ? ': ' + c.note : ''),
+        c.provisioned ? 'ok' : 'fail',
+        'cmd remote_provisioning certify ' + c.name,
+        'The definitive evidence: a successful PEM certificate chain from `certify` proves provisioning material actually exists for this component. This is the only ADB-level check that confirms provisioning rather than mere support/configuration.'
+      ]);
+    }
 
     // Attestation capability row (HAL attestation ID/version + TLS reach to Google)
     rows.push([

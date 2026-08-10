@@ -197,6 +197,17 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.9.0 — definitive RKP provisioning check (cmd remote_provisioning certify)
+The existing RKP tab (`fetchRKP()`) checked KeyMint/HAL/GMS/boot-security signals but never actually confirmed *provisioning* — it inferred RKP health from `cmd keystore`, HAL service registration, and a TLS reachability probe to Google, none of which prove that provisioning certificate material exists on the device. Per a reference procedure the user provided ("Android RKP Provisioning Verification via ADB"): package/HAL/config presence only proves RKP is *supported and configured*; the only reliable ADB-level proof is `cmd remote_provisioning certify <component>` returning a real PEM certificate chain.
+
+Added `checkRkpProvisioning(adb)` (`src/index.js`, next to `checkAttestationCapability`) implementing that procedure's decision hierarchy:
+1. RKP package presence + enabled state (`pm list packages | grep rkpd`, `dumpsys package com.google.android.rkpd`).
+2. Enumerate components (`cmd remote_provisioning list` — typically `default`/`strongbox`).
+3. Config (`remote_provisioning.hostname`, `remote_provisioning.tee.rkp_only`).
+4. **The definitive step**: for every enumerated component, run `cmd remote_provisioning certify <name>` and check the response actually contains `-----BEGIN CERTIFICATE-----`. Only this is reported as `PROVISIONED`; anything else is `NOT CONFIRMED` with whatever the device returned as a note.
+
+Wired into `fetchRKP()` as new rows placed *first* in the table (ahead of the existing Attestation Capability / KeyMint / HAL rows) since it's the headline result the other checks were only proxying for. Did not touch the existing checks — they're still useful supporting context, just no longer the strongest evidence available.
+
 ### v1.8.1 — Tab completion now escapes names with spaces (and re-completing across them)
 v1.8.0's completion inserted matched names raw. For a directory named e.g. "Quick Share", completing `cd Quick` inserted the unquoted `cd Quick Share/` — which, once actually run, is `cd` given two arguments ("Quick" and "Share/"), so it silently fails and the tracked directory never changes. This isn't specific to our tool — a real unquoted `adb shell "cd Quick Share/"` behaves identically — but a real terminal's tab-complete backslash-escapes the space when it inserts the name, and ours didn't.
 
