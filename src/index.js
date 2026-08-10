@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.9.2';
+const APP_VERSION = '1.9.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1272,11 +1272,17 @@ function makeJoinCallbacks(label) {
   };
 }
 
-// Diagnostic: inspect the raw RTCPeerConnection state for any in-progress peer, even
-// before trystero's onPeerJoin fires. Distinguishes "signaling never even started a
-// connection attempt" (getPeers() stays empty) from "found each other but ICE is stuck"
-// (a peer entry exists with iceConnectionState stuck at checking/failed/disconnected) —
-// the latter points at the network blocking the actual media/TURN path, not signaling.
+// Diagnostic (2026-08-10 TURN investigation, superseded — kept for the ongoing-health
+// signal it still gives on an ALREADY-successful connection): this was written assuming
+// room.getPeers() would show an in-progress peer stuck mid-negotiation. Reading
+// @trystero-p2p/core's actual source (room.mjs) disproved that: a peer is only inserted
+// into activePeerMap — the map getPeers() reads — inside handshakeManager's onActivate
+// callback, which fires at the exact same moment as onPeerJoin. There is no public
+// trystero API that exposes a peer before it has already fully succeeded. That's why
+// every "ICE poll" log for a failing connection has always read "no peer connection
+// objects exist yet" — not because nothing was happening, but because this diagnostic
+// is structurally blind to anything that hasn't already succeeded. See
+// makeDiagnosticRTCPeerConnection() below for the replacement that actually sees failures.
 function pollIceState(room, label, maxTries) {
   let tries = 0;
   const iv = setInterval(() => {
@@ -1299,12 +1305,48 @@ function pollIceState(room, label, maxTries) {
   }, 3000);
 }
 
+// Real failure diagnostic: trystero's peer.mjs does `new (rtcPolyfill ?? RTCPeerConnection)(...)`,
+// so passing our own class via `rtcPolyfill` lets us observe every ICE candidate and every
+// state transition for every connection attempt — successful or not — completely independent
+// of trystero's own bookkeeping (which, per the note on pollIceState above, only ever shows
+// already-successful peers). In particular `icecandidateerror` fires with a real error code/
+// text when a STUN/TURN server can't be reached or rejects a request (e.g. bad credentials,
+// server down, blocked by a firewall) — this is the one signal that can directly distinguish
+// "our TURN server is the problem" from "the network won't let TURN traffic through at all".
+let rtcDiagCounter = 0;
+function makeDiagnosticRTCPeerConnection(label) {
+  return class extends RTCPeerConnection {
+    constructor(config) {
+      super(config);
+      const connId = ++rtcDiagCounter;
+      debugLogPush(`remote (${label}): [rtc#${connId}] connection object created`, 'evt');
+      this.addEventListener('icecandidate', (e) => {
+        if (!e.candidate) { debugLogPush(`remote (${label}): [rtc#${connId}] ICE candidate gathering complete`, 'evt'); return; }
+        const typeMatch = /typ (\w+)/.exec(e.candidate.candidate);
+        debugLogPush(`remote (${label}): [rtc#${connId}] ICE candidate gathered: type=${typeMatch ? typeMatch[1] : '?'} proto=${e.candidate.protocol || '?'} address=${e.candidate.address || '?'}`, 'evt');
+      });
+      this.addEventListener('icecandidateerror', (e) => {
+        debugLogPush(`remote (${label}): [rtc#${connId}] ICE CANDIDATE ERROR: url=${e.url || '?'} errorCode=${e.errorCode || '?'} errorText=${e.errorText || '?'}`, 'err');
+      });
+      this.addEventListener('icegatheringstatechange', () => {
+        debugLogPush(`remote (${label}): [rtc#${connId}] iceGatheringState=${this.iceGatheringState}`, 'evt');
+      });
+      this.addEventListener('iceconnectionstatechange', () => {
+        debugLogPush(`remote (${label}): [rtc#${connId}] iceConnectionState=${this.iceConnectionState}`, this.iceConnectionState === 'failed' ? 'err' : this.iceConnectionState === 'connected' ? 'ok' : 'evt');
+      });
+      this.addEventListener('connectionstatechange', () => {
+        debugLogPush(`remote (${label}): [rtc#${connId}] connectionState=${this.connectionState}`, this.connectionState === 'failed' ? 'err' : this.connectionState === 'connected' ? 'ok' : 'evt');
+      });
+    }
+  };
+}
+
 // --- Remote Session: Host ---
 function startShareSession() {
   if (remoteSession && remoteSession.role === 'host') { showShareModal(); return; }
   const roomId = genRoomId();
   const password = genPassword();
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room);
   remoteSession = { role: 'host', room, roomId, password, trusted: true, viewers: new Set(), actions, pendingApprovals: new Map() };
   pollIceState(room, 'host', 60);
@@ -1449,7 +1491,7 @@ function initRemoteViewerIfLinked() {
 
 function joinAsViewer(roomId, password) {
   debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
-  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('viewer'));
+  const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('viewer'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('viewer'));
   const actions = makeRemoteActions(room);
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
