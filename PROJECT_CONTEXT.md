@@ -197,6 +197,9 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.7.1 — fixed extractCwdMarker() finding the wrong marker occurrence
+v1.7.0 shipped `cd` tracking that didn't actually track anything: `pwd` after `cd storage` still reported `/`, and the raw `@@ADBWEB_CWD@@<path>` marker text leaked straight into the visible console instead of being stripped. Root cause: `extractCwdMarker()` used `lastIndexOf(CWD_MARKER)` to find "the" marker, but the wrapped command emits *two* adjacent copies of it (`'<MARKER>' "$PWD" '<MARKER>'`, no separator between the path and the closing one) — `lastIndexOf` landed on the closing copy, so the visible "text" slice (everything before that index) still included the opening copy plus the path, and the "cwd" slice (everything after) was just trailing whitespace, which parsed to empty and silently fell back to `null` — so the tracked directory never advanced past its initial state. Fixed by using `indexOf` for the first marker and searching for the second occurrence starting *after* it, so the path between them is what gets extracted and both marker copies are correctly excluded from the visible text.
+
 ### v1.7.0 — persistent-feeling `cd` and a visible current-directory prompt, host + viewer
 Every `adb shell <cmd>` call is a brand-new process with no memory of the last one, so `cd /sdcard` typed into either Shell tab did nothing to the *next* command — a real, longstanding usability gap the user called out directly ("extremely restricts the usage").
 

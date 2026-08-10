@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.7.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -784,11 +784,12 @@ function wrapWithCwdTracking(cwd, cmd) {
 // output. Returns the command's real output plus the resolved cwd (or null
 // if the marker never made it back, e.g. the command was killed by a timeout).
 function extractCwdMarker(output) {
-  const idx = output.lastIndexOf(CWD_MARKER);
+  const idx = output.indexOf(CWD_MARKER);
   if (idx === -1) return { text: output, cwd: null };
-  const rest = output.slice(idx + CWD_MARKER.length);
-  const idx2 = rest.indexOf(CWD_MARKER);
-  const cwd = (idx2 === -1 ? rest : rest.slice(0, idx2)).trim();
+  const afterFirst = idx + CWD_MARKER.length;
+  const idx2 = output.indexOf(CWD_MARKER, afterFirst);
+  if (idx2 === -1) return { text: output, cwd: null };
+  const cwd = output.slice(afterFirst, idx2).trim();
   const text = output.slice(0, idx).replace(/\n+$/, '');
   return { text, cwd: cwd || null };
 }
