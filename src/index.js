@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.9.0';
+const APP_VERSION = '1.9.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1443,18 +1443,36 @@ function joinAsViewer(roomId, password) {
   };
   pollIceState(room, 'viewer', 60);
 
+  // A room can hold more than one viewer (mesh topology — every peer sees every other
+  // peer's onPeerJoin, not just the host's). Whoever connects first used to get blindly
+  // latched onto as "the host," which meant a viewer joining a room that already had
+  // another viewer in it could mistake that fellow viewer for the host — showing
+  // "Connected to host" while the device list stayed empty forever, since only the
+  // real host ever sends devicePush. Identify the host by that signal instead of by
+  // connection order: only devicePush (host-exclusive) sets hostPeerId.
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (viewer): WebRTC peer joined: peerId=${peerId}`, 'ok');
-    remoteSession.hostPeerId = peerId;
     try { actions.hello.send({ appVersion: APP_VERSION }, { target: peerId }); } catch (_) {}
-    setViewerStatus('Connected to host', 'ok');
+    if (!remoteSession.hostPeerId) setViewerStatus('Peer connected, waiting for host...', 'connecting');
   };
   room.onPeerLeave = (peerId) => {
     debugLogPush(`remote (viewer): WebRTC peer left: peerId=${peerId}`, 'warn');
-    if (peerId === remoteSession.hostPeerId) showHostDisconnectedBanner();
+    if (peerId === remoteSession.hostPeerId) {
+      remoteSession.hostPeerId = null;
+      showHostDisconnectedBanner();
+    }
   };
   actions.devicePush.onMessage = (data, ctx) => {
-    if (ctx.peerId !== remoteSession.hostPeerId) { debugLogPush(`remote (viewer): ignored devicePush from non-host peerId=${ctx.peerId}`, 'warn'); return; }
+    if (!remoteSession.hostPeerId) {
+      remoteSession.hostPeerId = ctx.peerId;
+      debugLogPush(`remote (viewer): identified host via devicePush: peerId=${ctx.peerId}`, 'ok');
+      setViewerStatus('Connected to host', 'ok');
+      const input = document.getElementById('viewer-shell-input');
+      if (input) input.disabled = false;
+    } else if (ctx.peerId !== remoteSession.hostPeerId) {
+      debugLogPush(`remote (viewer): ignored devicePush from non-host peerId=${ctx.peerId}`, 'warn');
+      return;
+    }
     renderMirrorDeviceList(data);
   };
   actions.cmdResponse.onMessage = (data, ctx) => {
