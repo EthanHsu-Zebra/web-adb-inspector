@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.9.3';
+const APP_VERSION = '1.10.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1245,16 +1245,141 @@ function randomToken(byteLen) {
 }
 function genRoomId() { return randomToken(8); }
 function genPassword() { return randomToken(16); }
-function makeRemoteActions(room) {
+// --- Remote Session: relay-based fallback data path ---
+// Some networks (confirmed: Zscaler-proxied corporate networks — see
+// TURN_RELIABILITY_ANALYSIS.md) block or break WebRTC's UDP-based ICE/STUN/TURN
+// traffic outright, so the P2P data channel this feature relies on can never come
+// up, no matter which TURN provider is configured. The one thing that HAS worked in
+// every single case so far is the plain WSS connection to our own signaling relay —
+// because it's an ordinary WebSocket, indistinguishable from any other HTTPS-based
+// app traffic. @trystero-p2p/ws-relay's server is a generic topic-based pub/sub (see
+// relay-server/node_modules/@trystero-p2p/ws-relay/dist/server.mjs — subscribe/
+// unsubscribe/publish to an arbitrary topic string), not something WebRTC-signaling-
+// specific, so a second client using that exact same protocol can carry our actual
+// session traffic (device state, shell commands/output) as a fallback, with zero
+// relay-server changes. Payloads are AES-GCM encrypted with a key derived from the
+// room password (the same shared secret already in the share link) since, unlike
+// the P2P path (inherently encrypted end-to-end by WebRTC), this now transits a
+// third-party-hosted (Render) server and shouldn't be readable there.
+async function deriveFallbackKey(password) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password));
+  return crypto.subtle.importKey('raw', hash, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+async function encryptForFallback(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = new TextEncoder().encode(JSON.stringify(obj));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
+  return { iv: Array.from(iv), ct: Array.from(new Uint8Array(cipher)) };
+}
+async function decryptFromFallback(key, payload) {
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(payload.iv) }, key, new Uint8Array(payload.ct)
+  );
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+// Raw WebSocket client speaking @trystero-p2p/ws-relay's subscribe/publish protocol
+// directly, scoped to one room via a derived topic name. Independent of trystero's
+// own use of the same relay for signaling — this never touches WebRTC at all.
+function createFallbackChannel(roomId, password, sessionId, label) {
+  const topic = 'webadb-fallback-' + roomId;
+  const keyPromise = deriveFallbackKey(password);
+  let ws = null, ready = false, closed = false;
+  const outbox = [];
+  let onEnvelope = () => {};
+
+  function flush() {
+    while (ready && outbox.length) {
+      const msg = outbox.shift();
+      try { ws.send(msg); } catch (_) { outbox.unshift(msg); break; }
+    }
+  }
+  function connect() {
+    if (closed) return;
+    try { ws = new WebSocket(REMOTE_RELAY_URLS[0]); } catch (_) { setTimeout(connect, 3000); return; }
+    ws.onopen = () => {
+      ready = true;
+      debugLogPush(`remote (${label}): fallback channel connected (topic=${topic})`, 'ok');
+      try { ws.send(JSON.stringify({ type: 'subscribe', topic })); } catch (_) {}
+      flush();
+    };
+    ws.onmessage = async (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.topic !== topic || !msg.payload) return;
+        const key = await keyPromise;
+        const envelope = await decryptFromFallback(key, msg.payload);
+        if (envelope.from === sessionId) return;
+        onEnvelope(envelope);
+      } catch (_) {}
+    };
+    ws.onclose = () => { ready = false; if (!closed) setTimeout(connect, 3000); };
+    ws.onerror = () => {};
+  }
+  connect();
+
   return {
-    hello: room.makeAction('hello'),
-    devicePush: room.makeAction('devicePush'),
-    cmdRequest: room.makeAction('cmdRequest'),
-    cmdResponse: room.makeAction('cmdResponse'),
-    pathComplete: room.makeAction('pathComplete'),
-    pathCompleteResult: room.makeAction('pathCompleteResult'),
-    bye: room.makeAction('bye'),
+    send: async (envelope) => {
+      try {
+        const key = await keyPromise;
+        const payload = await encryptForFallback(key, envelope);
+        const msg = JSON.stringify({ type: 'publish', topic, payload });
+        if (ready) { try { ws.send(msg); return; } catch (_) {} }
+        outbox.push(msg);
+      } catch (_) {}
+    },
+    onMessage: (handler) => { onEnvelope = handler; },
+    close: () => { closed = true; try { ws && ws.close(); } catch (_) {} },
   };
+}
+
+const REMOTE_ACTION_NAMES = ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'bye'];
+
+// Wraps each trystero action so every send() goes out over BOTH the real P2P data
+// channel (best-effort — silently a no-op if no such peer is connected, same as
+// trystero's own behavior) and the fallback channel, and every onMessage() handler
+// is registered for both. Callers (handleRemoteCmdRequest, sendRemoteCommand, etc.)
+// need no changes — they only ever see {send, onMessage} and a ctx.peerId, which is
+// either a real trystero peerId or (fallback-only) the sender's random sessionId;
+// both are stable, opaque strings for the life of a session, which is all the
+// existing ctx.peerId === remoteSession.hostPeerId-style checks actually need.
+function makeRemoteActions(room, roomId, password, label) {
+  const sessionId = crypto.randomUUID();
+  const fallback = createFallbackChannel(roomId, password, sessionId, label);
+  const seenRequestKeys = new Set();
+  const dispatchers = {};
+
+  fallback.onMessage((envelope) => {
+    const { action, target, data } = envelope;
+    if (target && target !== sessionId) return;
+    if (data && data.requestId) {
+      const key = action + ':' + data.requestId;
+      if (seenRequestKeys.has(key)) return;
+      seenRequestKeys.add(key);
+      if (seenRequestKeys.size > 500) seenRequestKeys.delete(seenRequestKeys.values().next().value);
+    }
+    dispatchers[action]?.(data, { peerId: envelope.from });
+  });
+
+  function wrap(name) {
+    const real = room.makeAction(name);
+    return {
+      send: (data, opts) => {
+        try { real.send(data, opts); } catch (_) {}
+        fallback.send({ action: name, from: sessionId, target: opts?.target, data });
+      },
+      onMessage: (handler) => {
+        real.onMessage(handler);
+        dispatchers[name] = handler;
+      },
+    };
+  }
+
+  const actions = {};
+  for (const name of REMOTE_ACTION_NAMES) actions[name] = wrap(name);
+  actions._fallback = fallback;
+  actions._sessionId = sessionId;
+  return actions;
 }
 
 // joinRoom()'s 3rd-argument callbacks (onJoinError/onPeerHandshake) were never wired up
@@ -1347,7 +1472,7 @@ function startShareSession() {
   const roomId = genRoomId();
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
-  const actions = makeRemoteActions(room);
+  const actions = makeRemoteActions(room, roomId, password, 'host');
   remoteSession = { role: 'host', room, roomId, password, trusted: true, viewers: new Set(), actions, pendingApprovals: new Map() };
   pollIceState(room, 'host', 60);
 
@@ -1371,6 +1496,8 @@ function startShareSession() {
 async function stopShareSession() {
   if (!remoteSession || remoteSession.role !== 'host') return;
   try { remoteSession.actions.bye.send({ reason: 'host_stopped' }); } catch (_) {}
+  await new Promise((res) => setTimeout(res, 200));
+  try { remoteSession.actions._fallback.close(); } catch (_) {}
   try { await remoteSession.room.leave(); } catch (_) {}
   remoteSession = null;
   hideShareModal();
@@ -1492,7 +1619,7 @@ function initRemoteViewerIfLinked() {
 function joinAsViewer(roomId, password) {
   debugLogPush(`remote (viewer): joining room=${roomId} appId=${REMOTE_APP_ID}`, 'evt');
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('viewer'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('viewer'));
-  const actions = makeRemoteActions(room);
+  const actions = makeRemoteActions(room, roomId, password, 'viewer');
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
     pendingRequests: new Map(),
@@ -1500,6 +1627,16 @@ function joinAsViewer(roomId, password) {
     mirror: { activeSerial: null, connected: [], available: [], shellBySerial: {} },
   };
   pollIceState(room, 'viewer', 60);
+
+  // room.onPeerJoin only fires once trystero's P2P connection actually succeeds — on
+  // a network where it never does (see makeRemoteActions' fallback channel above),
+  // that event, and the hello.send() below that normally rides on it, would simply
+  // never happen. Broadcast hello proactively over the fallback channel too (a few
+  // times, since pub/sub doesn't buffer for a subscriber that joins the topic a
+  // moment late) so the host can identify and greet this viewer even with zero P2P.
+  for (let i = 0; i < 4; i++) {
+    setTimeout(() => { try { actions.hello.send({ appVersion: APP_VERSION }); } catch (_) {} }, i * 2000);
+  }
 
   // A room can hold more than one viewer (mesh topology — every peer sees every other
   // peer's onPeerJoin, not just the host's). Whoever connects first used to get blindly
@@ -1562,6 +1699,7 @@ function leaveRemoteSession() {
   try {
     if (remoteSession.hostPeerId) remoteSession.actions.bye.send({ reason: 'viewer_left' }, { target: remoteSession.hostPeerId });
   } catch (_) {}
+  try { remoteSession.actions._fallback.close(); } catch (_) {}
   try { remoteSession.room.leave(); } catch (_) {}
   remoteSession = null;
   location.hash = '';
