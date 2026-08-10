@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.8.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2353,10 +2353,28 @@ function getCompletionTarget(input) {
   const pos = input.selectionStart ?? input.value.length;
   const before = input.value.slice(0, pos);
   const after = input.value.slice(pos);
-  const m = before.match(/(\S*)$/);
-  const partial = m ? m[1] : '';
-  const prefixStart = before.length - partial.length;
-  return { partial, prefixStart, before, after };
+  // Scan back to the start of the current word, but don't stop at whitespace
+  // that's backslash-escaped (part of a name we already completed, e.g.
+  // "Quick\ Sh" is still one word, not "Quick\" + "Sh").
+  let i = before.length;
+  while (i > 0) {
+    if (/\s/.test(before[i - 1]) && before[i - 2] !== '\\') break;
+    i--;
+  }
+  return { partial: before.slice(i), prefixStart: i, before, after };
+}
+
+// Backslash-escapes characters that are special to sh, so a completed name
+// like "Quick Share" is inserted as "Quick\ Share" — one shell word, exactly
+// like a real terminal's tab-complete — instead of splitting into two
+// arguments once the line is actually run. unescapeShellWord() is the
+// inverse, needed because dirPart/namePrefix are read back out of text we
+// (or the user) may have already escaped on an earlier Tab press.
+function escapeCompletionSegment(s) {
+  return s.replace(/[ \t\n"'\\`$&;|<>()[\]{}*?!~#]/g, '\\$&');
+}
+function unescapeShellWord(s) {
+  return s.replace(/\\(.)/g, '$1');
 }
 
 async function runTabCompletion(input, listDir) {
@@ -2366,9 +2384,9 @@ async function runTabCompletion(input, listDir) {
     const { partial, prefixStart, before, after } = getCompletionTarget(input);
     const slashIdx = partial.lastIndexOf('/');
     const dirPart = slashIdx === -1 ? '' : partial.slice(0, slashIdx + 1);
-    const namePrefix = slashIdx === -1 ? partial : partial.slice(slashIdx + 1);
+    const namePrefix = unescapeShellWord(slashIdx === -1 ? partial : partial.slice(slashIdx + 1));
     let entries;
-    try { entries = await listDir(dirPart || '.'); } catch (_) { return; }
+    try { entries = await listDir(dirPart ? unescapeShellWord(dirPart) : '.'); } catch (_) { return; }
     const matches = entries.filter(e => e.startsWith(namePrefix));
     if (matches.length === 0) return;
     let completion;
@@ -2383,7 +2401,8 @@ async function runTabCompletion(input, listDir) {
       if (completion === namePrefix) return;
     }
     const isDir = completion.endsWith('/');
-    const insert = dirPart + completion + (matches.length === 1 && !isDir ? ' ' : '');
+    const escaped = escapeCompletionSegment(completion);
+    const insert = dirPart + escaped + (matches.length === 1 && !isDir ? ' ' : '');
     input.value = before.slice(0, prefixStart) + insert + after;
     const newPos = prefixStart + insert.length;
     input.setSelectionRange(newPos, newPos);

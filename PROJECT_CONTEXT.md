@@ -197,6 +197,13 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.8.1 — Tab completion now escapes names with spaces (and re-completing across them)
+v1.8.0's completion inserted matched names raw. For a directory named e.g. "Quick Share", completing `cd Quick` inserted the unquoted `cd Quick Share/` — which, once actually run, is `cd` given two arguments ("Quick" and "Share/"), so it silently fails and the tracked directory never changes. This isn't specific to our tool — a real unquoted `adb shell "cd Quick Share/"` behaves identically — but a real terminal's tab-complete backslash-escapes the space when it inserts the name, and ours didn't.
+
+Added `escapeCompletionSegment()`, applied to whatever gets inserted, so this now completes to `cd Quick\ Share/` — one shell word once split/rejoined and run. The inverse, `unescapeShellWord()`, is needed when re-deriving `namePrefix`/`dirPart` from text that's already (partially) escaped from an earlier Tab press, so matching against raw `ls` entries still works.
+
+That surfaced a second bug in `getCompletionTarget()`: it found "the current word" via a plain `\S*` (non-whitespace) scan from the caret, which doesn't know a backslash-escaped space isn't a real word boundary — so completing again after `cd Quick\ ` (e.g. typing `Sh` then Tab) only saw `Sh` as the word, losing the `Quick\ ` part. Replaced the regex with a backward character scan that treats whitespace preceded by a backslash as part of the current word.
+
 ### v1.8.0 — Tab-key path completion, host + viewer; clarified the `ls -l` `?????????` question
 Two things came out of the same user report.
 
