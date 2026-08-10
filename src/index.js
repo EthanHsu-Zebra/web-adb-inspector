@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.6.1';
+const APP_VERSION = '1.7.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -762,6 +762,37 @@ async function adbShellTimed(adb, cmd, timeoutMs) {
   }
 }
 
+// --- Shell: persistent-feeling `cd` across one-shot commands ---
+// Each `adb shell <cmd>` invocation is a fresh process with no memory of a
+// previous one, so a bare `cd /sdcard` normally has no effect on the next
+// command. We fake persistence: every command is wrapped so it first `cd`s
+// into the last-known directory, then runs the user's command (which may
+// itself `cd` further), then prints $PWD wrapped in a marker we can parse
+// back out — that becomes the new "last-known directory" for next time.
+const CWD_MARKER = '@@ADBWEB_CWD@@';
+
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+function wrapWithCwdTracking(cwd, cmd) {
+  const cdPrefix = cwd ? `cd ${shQuote(cwd)} 2>/dev/null\n` : '';
+  return `${cdPrefix}${cmd}\nprintf '\\n%s%s%s\\n' '${CWD_MARKER}' "$PWD" '${CWD_MARKER}'`;
+}
+
+// Splits the marker (and the resolved cwd it carries) back out of raw shell
+// output. Returns the command's real output plus the resolved cwd (or null
+// if the marker never made it back, e.g. the command was killed by a timeout).
+function extractCwdMarker(output) {
+  const idx = output.lastIndexOf(CWD_MARKER);
+  if (idx === -1) return { text: output, cwd: null };
+  const rest = output.slice(idx + CWD_MARKER.length);
+  const idx2 = rest.indexOf(CWD_MARKER);
+  const cwd = (idx2 === -1 ? rest : rest.slice(0, idx2)).trim();
+  const text = output.slice(0, idx).replace(/\n+$/, '');
+  return { text, cwd: cwd || null };
+}
+
 // --- ADB Sync: read large files from device ---
 async function readDeviceFile(adb, path) {
   // Use shell 'cat' rather than the documented adb.sync() — it works
@@ -925,6 +956,7 @@ function selectDevice(serial) {
   if (shellEl) {
     shellEl.textContent = dataCache.shellBySerial?.[serial] || '';
   }
+  updateShellCwdLabel();
   document.getElementById('search-props').value = '';
   document.getElementById('search-features').value = '';
   document.getElementById('search-packages').value = '';
@@ -1507,6 +1539,7 @@ function renderMirrorDeviceList(snapshot) {
     const activeDev = remoteSession.mirror.connected.find(d => d.serial === remoteSession.mirror.activeSerial);
     targetEl.textContent = activeDev ? (activeDev.nickname || activeDev.displayName || activeDev.serial) : 'none selected';
   }
+  updateViewerCwdLabel();
   const list = document.getElementById('device-list');
   const welcome = document.getElementById('welcome-msg');
   if (!list || !welcome) return;
@@ -2271,6 +2304,11 @@ function renderRKPTable(rows) {
 }
 
 // --- Shell ---
+function updateShellCwdLabel() {
+  const el = document.getElementById('shell-cwd');
+  if (el) el.textContent = (activeSerial && dataCache.cwdBySerial?.[activeSerial]) || '/';
+}
+
 async function runShell() {
   const input = document.getElementById('shell-input');
   const output = document.getElementById('shell-output');
@@ -2279,9 +2317,18 @@ async function runShell() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
   input.value = '';
-  output.textContent += '$ ' + cmd + '\n';
-  try { output.textContent += (await adbShell(info.adb, cmd)) + '\n'; }
-  catch (err) { output.textContent += 'Error: ' + String(err.message || err) + '\n'; }
+  if (!dataCache.cwdBySerial) dataCache.cwdBySerial = {};
+  const cwd = dataCache.cwdBySerial[activeSerial] || null;
+  output.textContent += (cwd || '/') + ' $ ' + cmd + '\n';
+  try {
+    const raw = await adbShell(info.adb, wrapWithCwdTracking(cwd, cmd));
+    const { text, cwd: newCwd } = extractCwdMarker(raw);
+    if (newCwd) dataCache.cwdBySerial[activeSerial] = newCwd;
+    output.textContent += text + '\n';
+    updateShellCwdLabel();
+  } catch (err) {
+    output.textContent += 'Error: ' + String(err.message || err) + '\n';
+  }
   output.scrollTop = output.scrollHeight;
 }
 function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runShell(); }
@@ -2329,16 +2376,21 @@ async function executeRemoteShell(peerId, { requestId, serial, command }) {
     try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: 'device not connected' }, { target: peerId }); } catch (_) {}
     return;
   }
+  if (!remoteSession.viewerCwd) remoteSession.viewerCwd = new Map();
+  const cwdKey = peerId + ' ' + serial;
+  const cwd = remoteSession.viewerCwd.get(cwdKey) || null;
   try {
-    const output = await adbShellTimed(info.adb, command, 20000);
-    const entry = '[remote] $ ' + command + '\n' + output + '\n';
+    const raw = await adbShellTimed(info.adb, wrapWithCwdTracking(cwd, command), 20000);
+    const { text: output, cwd: newCwd } = extractCwdMarker(raw);
+    if (newCwd) remoteSession.viewerCwd.set(cwdKey, newCwd);
+    const entry = '[remote] ' + (newCwd || cwd || '/') + ' $ ' + command + '\n' + output + '\n';
     if (!dataCache.shellBySerial) dataCache.shellBySerial = {};
     dataCache.shellBySerial[serial] = (dataCache.shellBySerial[serial] || '') + entry;
     if (activeSerial === serial) {
       const outEl = document.getElementById('shell-output');
       if (outEl) { outEl.textContent += entry; outEl.scrollTop = outEl.scrollHeight; }
     }
-    remoteSession.actions.cmdResponse.send({ requestId, ok: true, output }, { target: peerId });
+    remoteSession.actions.cmdResponse.send({ requestId, ok: true, output, cwd: newCwd || cwd || '/' }, { target: peerId });
   } catch (err) {
     remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: String(err.message || err) }, { target: peerId });
   }
@@ -2358,8 +2410,9 @@ function sendRemoteCommand() {
   const targetSerial = remoteSession.mirror.activeSerial;
   const targetDev = remoteSession.mirror.connected.find(d => d.serial === targetSerial);
   const targetLabel = targetDev ? (targetDev.nickname || targetDev.displayName || targetDev.serial) : targetSerial;
+  const targetCwd = remoteSession.mirror.cwdBySerial?.[targetSerial] || '/';
   remoteSession.pendingRequests.set(requestId, { cmd, serial: targetSerial });
-  output.textContent += '[' + targetLabel + '] $ ' + cmd + '\n';
+  output.textContent += '[' + targetLabel + '] ' + targetCwd + ' $ ' + cmd + '\n';
   output.scrollTop = output.scrollHeight;
   debugLogPush(`remote (viewer): sending cmdRequest requestId=${requestId} to hostPeerId=${remoteSession.hostPeerId}`, 'evt');
   Promise.resolve(
@@ -2374,12 +2427,23 @@ function sendRemoteCommand() {
   });
 }
 
+function updateViewerCwdLabel() {
+  const el = document.getElementById('viewer-shell-cwd');
+  if (!el || !remoteSession) return;
+  el.textContent = (remoteSession.mirror.activeSerial && remoteSession.mirror.cwdBySerial?.[remoteSession.mirror.activeSerial]) || '/';
+}
+
 function handleCmdResponse(data) {
   if (!remoteSession) return;
-  const { requestId, ok, output: out, error, denied } = data || {};
+  const { requestId, ok, output: out, error, denied, cwd } = data || {};
   const req = remoteSession.pendingRequests.get(requestId);
   remoteSession.pendingRequests.delete(requestId);
   const serial = req ? req.serial : remoteSession.mirror.activeSerial;
+  if (serial && cwd) {
+    if (!remoteSession.mirror.cwdBySerial) remoteSession.mirror.cwdBySerial = {};
+    remoteSession.mirror.cwdBySerial[serial] = cwd;
+    if (serial === remoteSession.mirror.activeSerial) updateViewerCwdLabel();
+  }
   const text = denied ? '(denied by host)\n' : ok ? (out || '') + '\n' : 'Error: ' + (error || 'unknown error') + '\n';
   if (serial && serial === remoteSession.mirror.activeSerial) {
     const output = document.getElementById('viewer-shell-output');
