@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.9.1';
+const APP_VERSION = '1.9.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -39,10 +39,26 @@ const REMOTE_APP_ID = 'web-adb-inspector-v1';
 // STUN-only P2P fails (symmetric NAT, restrictive corporate firewalls that block
 // UDP). Port 443/TCP variant is included specifically so TURN traffic can blend
 // in with ordinary HTTPS on networks that block other UDP/TCP ports outright.
+// NOTE (2026-08-10 TURN investigation): trystero's peer.mjs already prepends its
+// own defaultIceServers (Google + Cloudflare STUN) ahead of this array — see
+// `iceServers: defaultIceServers.concat(turnConfig ?? [])` in
+// @trystero-p2p/core/dist/peer.mjs — so STUN/srflx gathering was never actually
+// missing. The explicit stun: entry below is therefore likely redundant today;
+// it's kept anyway as a defensive, explicit fallback in case a future trystero
+// version changes that default. The turns: (TURN-over-TLS) entry is speculative:
+// Open Relay's own marketing claims "Support TURNS + SSL to allow connections
+// through deep packet inspection firewalls," but no example configuration found
+// (their docs, blog, or third-party integration guides) actually shows a turns:
+// URL — it may only exist on their paid/API-key dynamic-credential tier, not
+// this free static-credential one. Adding it costs nothing (a browser silently
+// ignores an iceServers entry that doesn't work) so it's included on the chance
+// it helps; do not assume it's confirmed functional. See TURN_RELIABILITY_ANALYSIS.md.
 const REMOTE_TURN_CONFIG = [
+  { urls: 'stun:openrelay.metered.ca:80' },
   { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 // Signaling: self-hosted relay (relay-server/, deployed on Render), not public Nostr
 // relays. Three rounds of public-relay debugging (2026-08-04, see PROJECT_CONTEXT.md
