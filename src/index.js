@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.7.1';
+const APP_VERSION = '1.8.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1235,6 +1235,8 @@ function makeRemoteActions(room) {
     devicePush: room.makeAction('devicePush'),
     cmdRequest: room.makeAction('cmdRequest'),
     cmdResponse: room.makeAction('cmdResponse'),
+    pathComplete: room.makeAction('pathComplete'),
+    pathCompleteResult: room.makeAction('pathCompleteResult'),
     bye: room.makeAction('bye'),
   };
 }
@@ -1293,6 +1295,7 @@ function startShareSession() {
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
   actions.cmdRequest.onMessage = (data, ctx) => handleRemoteCmdRequest(data, ctx.peerId);
+  actions.pathComplete.onMessage = (data, ctx) => handlePathCompleteRequest(data, ctx.peerId);
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
     remoteSession.viewers.add(peerId);
@@ -1435,6 +1438,7 @@ function joinAsViewer(roomId, password) {
   remoteSession = {
     role: 'viewer', room, roomId, password, hostPeerId: null, actions,
     pendingRequests: new Map(),
+    pendingCompletions: new Map(),
     mirror: { activeSerial: null, connected: [], available: [], shellBySerial: {} },
   };
   pollIceState(room, 'viewer', 60);
@@ -1457,6 +1461,12 @@ function joinAsViewer(roomId, password) {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
     debugLogPush(`remote (viewer): cmdResponse received requestId=${data && data.requestId}`, 'evt');
     handleCmdResponse(data);
+  };
+  actions.pathCompleteResult.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    const { requestId, ok, entries } = data || {};
+    const cb = remoteSession.pendingCompletions?.get(requestId);
+    if (cb) { remoteSession.pendingCompletions.delete(requestId); cb(ok ? (entries || []) : []); }
   };
   actions.bye.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) showHostDisconnectedBanner(); };
 
@@ -2334,6 +2344,71 @@ async function runShell() {
 }
 function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runShell(); }
 
+// --- Shell: Tab-key path completion (shared engine, host + viewer) ---
+// Operates on whatever path-looking word sits immediately before the caret.
+// `listDir(dirPath)` is supplied by the caller (direct adb call on the host,
+// a round-trip to the host on the viewer) and must resolve dirPath relative
+// to whatever "current directory" that session is tracking.
+function getCompletionTarget(input) {
+  const pos = input.selectionStart ?? input.value.length;
+  const before = input.value.slice(0, pos);
+  const after = input.value.slice(pos);
+  const m = before.match(/(\S*)$/);
+  const partial = m ? m[1] : '';
+  const prefixStart = before.length - partial.length;
+  return { partial, prefixStart, before, after };
+}
+
+async function runTabCompletion(input, listDir) {
+  if (!input || input._completing) return;
+  input._completing = true;
+  try {
+    const { partial, prefixStart, before, after } = getCompletionTarget(input);
+    const slashIdx = partial.lastIndexOf('/');
+    const dirPart = slashIdx === -1 ? '' : partial.slice(0, slashIdx + 1);
+    const namePrefix = slashIdx === -1 ? partial : partial.slice(slashIdx + 1);
+    let entries;
+    try { entries = await listDir(dirPart || '.'); } catch (_) { return; }
+    const matches = entries.filter(e => e.startsWith(namePrefix));
+    if (matches.length === 0) return;
+    let completion;
+    if (matches.length === 1) {
+      completion = matches[0];
+    } else {
+      completion = matches.reduce((a, b) => {
+        let i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i]) i++;
+        return a.slice(0, i);
+      });
+      if (completion === namePrefix) return;
+    }
+    const isDir = completion.endsWith('/');
+    const insert = dirPart + completion + (matches.length === 1 && !isDir ? ' ' : '');
+    input.value = before.slice(0, prefixStart) + insert + after;
+    const newPos = prefixStart + insert.length;
+    input.setSelectionRange(newPos, newPos);
+  } finally {
+    input._completing = false;
+  }
+}
+
+async function completeShellPath(input) {
+  if (!activeSerial) return;
+  const info = connectedDevices.get(activeSerial);
+  if (!info) return;
+  const cwd = dataCache.cwdBySerial?.[activeSerial] || null;
+  await runTabCompletion(input, async (dir) => {
+    const raw = await adbShellTimed(info.adb, wrapWithCwdTracking(cwd, 'ls -1Ap ' + shQuote(dir)), 6000);
+    const { text } = extractCwdMarker(raw);
+    return text.split('\n').map(s => s.trim()).filter(Boolean);
+  });
+}
+
+function handleShellKeydown(event) {
+  if (event.key === 'Enter') { runShell(); return; }
+  if (event.key === 'Tab') { event.preventDefault(); completeShellPath(event.target); }
+}
+
 // --- Remote Shell: host executes on behalf of a remote viewer, gated by approval ---
 function handleRemoteCmdRequest(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
@@ -2397,7 +2472,57 @@ async function executeRemoteShell(peerId, { requestId, serial, command }) {
   }
 }
 
+// Tab-completion for the remote viewer's shell input: lists a directory on the
+// host's device on the viewer's behalf. Always runs (not gated by the approval/
+// trust setting) since it's a read-only listing, not command execution.
+async function handlePathCompleteRequest(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { requestId, serial, dir } = data || {};
+  if (!requestId) return;
+  if (!connectedDevices.has(serial)) {
+    try { remoteSession.actions.pathCompleteResult.send({ requestId, ok: false }, { target: peerId }); } catch (_) {}
+    return;
+  }
+  const info = connectedDevices.get(serial);
+  if (!remoteSession.viewerCwd) remoteSession.viewerCwd = new Map();
+  const cwd = remoteSession.viewerCwd.get(peerId + ' ' + serial) || null;
+  try {
+    const raw = await adbShellTimed(info.adb, wrapWithCwdTracking(cwd, 'ls -1Ap ' + shQuote(dir || '.')), 6000);
+    const { text } = extractCwdMarker(raw);
+    const entries = text.split('\n').map(s => s.trim()).filter(Boolean);
+    remoteSession.actions.pathCompleteResult.send({ requestId, ok: true, entries }, { target: peerId });
+  } catch (_) {
+    try { remoteSession.actions.pathCompleteResult.send({ requestId, ok: false }, { target: peerId }); } catch (__) {}
+  }
+}
+
 // --- Remote Shell: viewer-side driver ---
+function requestPathComplete(dir) {
+  return new Promise((resolve) => {
+    if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.hostPeerId || !remoteSession.mirror.activeSerial) { resolve([]); return; }
+    const requestId = crypto.randomUUID();
+    const timer = setTimeout(() => { remoteSession.pendingCompletions.delete(requestId); resolve([]); }, 6000);
+    remoteSession.pendingCompletions.set(requestId, (entries) => { clearTimeout(timer); resolve(entries); });
+    try {
+      remoteSession.actions.pathComplete.send({ requestId, serial: remoteSession.mirror.activeSerial, dir }, { target: remoteSession.hostPeerId });
+    } catch (_) {
+      clearTimeout(timer);
+      remoteSession.pendingCompletions.delete(requestId);
+      resolve([]);
+    }
+  });
+}
+
+async function completeViewerShellPath(input) {
+  if (!remoteSession || remoteSession.role !== 'viewer') return;
+  await runTabCompletion(input, (dir) => requestPathComplete(dir));
+}
+
+function handleViewerShellKeydown(event) {
+  if (event.key === 'Enter') { sendRemoteCommand(); return; }
+  if (event.key === 'Tab') { event.preventDefault(); completeViewerShellPath(event.target); }
+}
+
 function sendRemoteCommand() {
   const input = document.getElementById('viewer-shell-input');
   const output = document.getElementById('viewer-shell-output');
@@ -2600,6 +2725,8 @@ window.denyRemoteCommand = denyRemoteCommand;
 window.leaveRemoteSession = leaveRemoteSession;
 window.sendRemoteCommand = sendRemoteCommand;
 window.clearViewerShell = clearViewerShell;
+window.handleShellKeydown = handleShellKeydown;
+window.handleViewerShellKeydown = handleViewerShellKeydown;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 async function fetchRKP() {
