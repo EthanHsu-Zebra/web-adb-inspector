@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.16.1';
+const APP_VERSION = '1.17.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -761,6 +761,10 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
     debugLogPush(`connectDevice SUCCESS: serial=${adbSerial} display=${displayName} usb=${usbId.vendorId}:${usbId.productId}:${usbId.serial || '(none)'}`, 'ok');
     renderDeviceList();
     if (connectedDevices.size === 1) selectDevice(adbSerial);
+    // Second+ device connected while already sharing — it won't get auto-selected (so
+    // nothing would otherwise ever fetch its tab data), but a viewer could pick it right
+    // away. See prefetchTabsForViewers()'s comment.
+    else if (remoteSession && remoteSession.role === 'host') prefetchTabsForViewers(adbSerial);
     setStatus('Connected', 'ok');
     return true;
 
@@ -1681,6 +1685,13 @@ function startShareSession() {
   };
 
   debugLogPush(`remote session started: roomId=${roomId} appId=${REMOTE_APP_ID}`, 'ok');
+  // Any device connected BEFORE sharing started, other than the currently-active one
+  // (which is already fresh from being selected), has never had its tab data fetched —
+  // see prefetchTabsForViewers()'s comment. Fire-and-forget, one per device, concurrently
+  // (each targets a different device's own independent WebUSB/ADB connection).
+  for (const serial of connectedDevices.keys()) {
+    if (serial !== activeSerial) prefetchTabsForViewers(serial);
+  }
   showShareModal();
 }
 
@@ -1730,6 +1741,56 @@ function pushTabHtml(tab, elementId, target) {
   if (!hostTabHtmlCache[activeSerial]) hostTabHtmlCache[activeSerial] = {};
   hostTabHtmlCache[activeSerial][tab] = el.innerHTML;
   try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }, target ? { target } : undefined); } catch (_) {}
+}
+
+// Same caching+broadcast as pushTabHtml(), but for a specific serial directly rather than
+// always "whatever's currently active" — used by prefetchTabsForViewers() below, which
+// computes html for a device that ISN'T necessarily the one on screen right now.
+function cacheAndBroadcastTabHtml(serial, tab, html) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  if (!hostTabHtmlCache[serial]) hostTabHtmlCache[serial] = {};
+  hostTabHtmlCache[serial][tab] = html;
+  try { remoteSession.actions.tabDataPush.send({ serial, tab, html }); } catch (_) {}
+}
+
+// connectDeviceExclusive() only auto-selects the FIRST device it connects
+// (connectedDevices.size === 1) — every device after that just sits connected with
+// NOTHING ever fetched for it (Properties/Features/Packages/Attestation/RKP) unless the
+// host personally clicks its card, since selectDevice() is what triggers those fetches
+// and it also drives the host's own visible tabs. A viewer who selects one of those
+// never-clicked devices correctly (from the code's perspective) saw "Waiting for host
+// data…" permanently — not a transmission bug, just genuinely no data anywhere to send,
+// for a reason invisible from the viewer side. Fetches Properties/Features/Packages (the
+// three cheapest and most commonly needed tabs) directly into hostTabHtmlCache without
+// touching activeSerial, dataCache, or any live DOM element, so it can never disturb
+// whatever the host is actually looking at. Attestation/RKP are deliberately left out —
+// both are slower, real hardware/keystore probes (sometimes several seconds) that aren't
+// worth running automatically for a device nobody may ever look at; those still populate
+// the first time the host (or, going forward, a viewer prompting the host to check) visits
+// that tab locally. Only called when a remote session is actually active as host (see call
+// sites), so purely-local usage never pays this extra background cost.
+async function prefetchTabsForViewers(serial) {
+  const info = connectedDevices.get(serial);
+  if (!info) return;
+  try {
+    const text = await adbShell(info.adb, 'getprop');
+    cacheAndBroadcastTabHtml(serial, 'props', propsToHtml(parseGetprop(text), ''));
+  } catch (_) {}
+  try {
+    const text = await adbShell(info.adb, 'pm list features');
+    cacheAndBroadcastTabHtml(serial, 'features', featuresToHtml(parsePmListFeatures(text), ''));
+  } catch (_) {}
+  try {
+    const text = await adbShell(info.adb, 'dumpsys package 2>&1');
+    let packages = parseDumpsysPackage(text);
+    let fallback = false, method = 'dumpsys';
+    if (packages.length === 0) {
+      const text2 = await adbShell(info.adb, 'pm list packages -f -u');
+      packages = parsePmListPackagesFallback(text2);
+      fallback = true; method = 'pm-list';
+    }
+    if (packages.length > 0) cacheAndBroadcastTabHtml(serial, 'packages', packagesToHtml(packages, fallback, method, ''));
+  } catch (_) {}
 }
 
 function handleViewerHello(data, peerId) {
@@ -2557,16 +2618,21 @@ function applyFontSize() {
 // DATA FETCHING
 // ============================================
 
+function parseGetprop(text) {
+  const props = [];
+  const re = /\[(ro[.\w]+)\]:\s*\[([^\]]*)\]/g;
+  let m;
+  while ((m = re.exec(text)) !== null) props.push({ name: m[1], value: m[2] });
+  return props;
+}
+
 async function fetchProperties() {
   const info = connectedDevices.get(activeSerial);
   if (!info) return;
   showLoading('props', true);
   try {
     const text = await adbShell(info.adb, 'getprop');
-    const props = [];
-    const re = /\[(ro[.\w]+)\]:\s*\[([^\]]*)\]/g;
-    let m;
-    while ((m = re.exec(text)) !== null) props.push({ name: m[1], value: m[2] });
+    const props = parseGetprop(text);
     dataCache.props = props;
     document.getElementById('props-count').textContent = '(' + props.length + ')';
     renderProperties(props);
@@ -2576,12 +2642,36 @@ async function fetchProperties() {
   showLoading('props', false);
 }
 
+// Pure HTML-building, split out of renderProperties() so prefetchTabsForViewers() (below)
+// can compute the same markup for a device that ISN'T the host's own currently-selected
+// one, without writing to the live #props-output element at all.
+function propsToHtml(props, query) {
+  const q = query || '';
+  const filtered = q ? props.filter(p => p.name.toLowerCase().includes(q) || p.value.toLowerCase().includes(q)) : props;
+  return filtered.map(p => '<div class="prop-row"><span class="prop-key">' + esc(p.name) + '</span><span class="prop-val">' + esc(p.value) + '</span></div>').join('') ||
+    (q ? '<div class="empty-hint">No matching properties</div>' : '');
+}
+
 function renderProperties(props) {
   const q = (document.getElementById('search-props')?.value || '').toLowerCase();
-  const filtered = q ? props.filter(p => p.name.toLowerCase().includes(q) || p.value.toLowerCase().includes(q)) : props;
-  document.getElementById('props-output').innerHTML =
-    filtered.map(p => '<div class="prop-row"><span class="prop-key">' + esc(p.name) + '</span><span class="prop-val">' + esc(p.value) + '</span></div>').join('') ||
-    (q ? '<div class="empty-hint">No matching properties</div>' : '');
+  document.getElementById('props-output').innerHTML = propsToHtml(props, q);
+}
+
+function parsePmListFeatures(text) {
+  const features = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let name = t;
+    let version = 0;
+    const vm = t.match(/^feature:(.+?)\s+ver:(\d+)$/);
+    if (vm) { name = vm[1]; version = parseInt(vm[2], 10); }
+    else { name = t.replace(/^feature:/, ''); }
+    name = name.trim();
+    if (!name) continue;
+    features.push({ name, type: isSDKFeature(name) ? 'sdk' : 'other', available: true, version });
+  }
+  return features;
 }
 
 async function fetchFeatures() {
@@ -2590,19 +2680,7 @@ async function fetchFeatures() {
   showLoading('features', true);
   try {
     const text = await adbShell(info.adb, 'pm list features');
-    const features = [];
-    for (const line of text.split('\n')) {
-      const t = line.trim();
-      if (!t) continue;
-      let name = t;
-      let version = 0;
-      const vm = t.match(/^feature:(.+?)\s+ver:(\d+)$/);
-      if (vm) { name = vm[1]; version = parseInt(vm[2], 10); }
-      else { name = t.replace(/^feature:/, ''); }
-      name = name.trim();
-      if (!name) continue;
-      features.push({ name, type: isSDKFeature(name) ? 'sdk' : 'other', available: true, version });
-    }
+    const features = parsePmListFeatures(text);
     dataCache.features = features;
     document.getElementById('features-count').textContent = '(' + features.length + ')';
     renderFeatures(features);
@@ -2612,15 +2690,20 @@ async function fetchFeatures() {
   showLoading('features', false);
 }
 
+// Same split as propsToHtml() above, same reason.
+function featuresToHtml(features, query) {
+  const q = query || '';
+  const filtered = q ? features.filter(f => f.name.toLowerCase().includes(q)) : features;
+  return filtered.map(f => {
+    const tb = f.type === 'sdk' ? '<span class="feat-type">sdk</span>' : '<span class="feat-type other">other</span>';
+    const vs = f.version > 0 ? ' v' + f.version : '';
+    return '<div class="feat-item">' + tb + ' ' + esc(f.name) + '<span class="feat-ver">' + vs + '</span></div>';
+  }).join('') || (q ? '<div class="empty-hint">No matching features</div>' : '');
+}
+
 function renderFeatures(features) {
   const q = (document.getElementById('search-features')?.value || '').toLowerCase();
-  const filtered = q ? features.filter(f => f.name.toLowerCase().includes(q)) : features;
-  document.getElementById('features-output').innerHTML =
-    filtered.map(f => {
-      const tb = f.type === 'sdk' ? '<span class="feat-type">sdk</span>' : '<span class="feat-type other">other</span>';
-      const vs = f.version > 0 ? ' v' + f.version : '';
-      return '<div class="feat-item">' + tb + ' ' + esc(f.name) + '<span class="feat-ver">' + vs + '</span></div>';
-    }).join('') || (q ? '<div class="empty-hint">No matching features</div>' : '');
+  document.getElementById('features-output').innerHTML = featuresToHtml(features, q);
 }
 
 // --- Packages: dumpsys via temp file + sync protocol ---
@@ -2666,8 +2749,13 @@ async function fetchPackages() {
   showLoading('packages', false);
 }
 
-function renderPackages(packages, fallback, method) {
-  const q = (document.getElementById('search-packages')?.value || '').toLowerCase();
+// Same split as propsToHtml()/featuresToHtml() above, same reason. Note: the embedded
+// onclick="togglePkgDetail(idx)" indexes into dataCache.packages (host-only, global) —
+// harmless when this html is broadcast to a viewer, since expanding package details
+// already doesn't work there regardless (pre-existing limitation, dataCache is never
+// mirrored in structured form, only as inert rendered HTML).
+function packagesToHtml(packages, fallback, method, query) {
+  const q = query || '';
   const filtered = q ? packages.filter(p => p.name.toLowerCase().includes(q)) : packages;
   const sys = packages.filter(p => p.system).length;
   const priv = packages.filter(p => p.system_priv).length;
@@ -2692,17 +2780,18 @@ function renderPackages(packages, fallback, method) {
     if (p.system_priv) badges += '<span class="pkg-badge priv">priv</span> ';
     else if (p.system) badges += '<span class="pkg-badge sys">sys</span> ';
     const verStr = p.version_name ? ' ' + esc(p.version_name) : '';
-    // Always allow expansion if package has any detail-worthy data.
-    // Previously: only expanded if version_name OR permissions present —
-    // but if version_name failed to parse, the user couldn't see permissions.
-    const hasDetail = true;
     return '<div class="pkg-item" data-pkg-idx="' + realIdx + '" onclick="togglePkgDetail(' + realIdx + ')">' +
       esc(p.name) + ' <span class="pkg-ver">' + verStr + '</span> ' + badges +
       ' <span class="pkg-toggle">[+]</span></div>' +
       '<div id="pkg-d-' + realIdx + '" class="pkg-detail hidden">' + renderPackageDetail(p) + '</div>';
   }).join('');
 
-  document.getElementById('packages-output').innerHTML = html;
+  return html;
+}
+
+function renderPackages(packages, fallback, method) {
+  const q = (document.getElementById('search-packages')?.value || '').toLowerCase();
+  document.getElementById('packages-output').innerHTML = packagesToHtml(packages, fallback, method, q);
 }
 
 function renderPackageDetail(p) {
