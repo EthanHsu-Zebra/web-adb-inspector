@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.16.0';
+const APP_VERSION = '1.16.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -27,6 +27,19 @@ const connectingUsbIds = new Set();
 // serial -> {attempt, total, label} for available devices currently mid-connectAvailable()
 // (including retries) — drives the "Connecting... (2/4)" status shown on their card.
 const connectingStatus = new Map();
+// Serials to automatically reconnect the next time scanAvailableDevices() sees them show
+// up again — populated by handleUsbDisconnect() whenever it tears down a device that
+// wasn't an explicit user-initiated disconnect (disconnectingSerial). Confirmed via a real
+// Linux multi-device debug log (2026-08-11): connecting a SECOND device on the same
+// physical hub/controller as an already-connected one can trigger a spurious 'disconnect'
+// event for the ALREADY-connected device (almost certainly a bus-level reset ripple from
+// connectDevice()'s own pre-emptive USBDevice.reset() call on the device being newly
+// connected) — a 'USB connect event' for the same device typically follows ~1-2s later,
+// but without this, the app just dropped it into "Ready to Connect" and left it there
+// until the user noticed and manually clicked Connect. Auto-reconnecting costs nothing for
+// a genuine unplug (the attempt just exhausts its retries and it sits in "available" same
+// as before) but fully self-heals the common phantom-disconnect case.
+const pendingAutoReconnect = new Set();
 let activeSerial = null;
 let disconnectingSerial = null;  // serial currently being intentionally disconnected (suppress USB event)
 const dataCache = { props: [], features: [], packages: [] };
@@ -356,6 +369,14 @@ async function scanAvailableDevices() {
         _usbId: uid,
       });
       console.log('[scan-available] added:', key, 'vid:', uid.vendorId, 'pid:', uid.productId, 'serial:', uid.serial);
+      // Self-heal a phantom disconnect (see pendingAutoReconnect's declaration comment) —
+      // this device just reappeared after an unexpected drop, reconnect it automatically
+      // instead of leaving it sitting in "Ready to Connect" until the user notices.
+      if (pendingAutoReconnect.has(key)) {
+        pendingAutoReconnect.delete(key);
+        debugLogPush(`scanAvailableDevices: ${key} reappeared after an unexpected disconnect — auto-reconnecting`, 'ok');
+        connectAvailable(key);
+      }
     }
     renderDeviceList();
   } catch (err) {
@@ -492,6 +513,11 @@ function handleUsbDisconnect(e) {
     if (window[hbKey]) { clearInterval(window[hbKey]); delete window[hbKey]; }
     connectedDevices.delete(matchedKey);
     notifyDeviceRemoved(matchedKey);
+    // Not an explicit user-initiated disconnect (that's handled and returned above) —
+    // give it a chance to self-heal if this was actually a phantom hub-ripple event (see
+    // pendingAutoReconnect's declaration comment) rather than a genuine unplug.
+    pendingAutoReconnect.add(matchedKey);
+    setTimeout(() => pendingAutoReconnect.delete(matchedKey), 20000);
     // Also remove matching entry from availableDevices by serial
     for (const [akey, ainfo] of availableDevices) {
       const au = ainfo._usbId;
@@ -569,7 +595,9 @@ function handleUsbDisconnect(e) {
 // connectAvailable()'s retry loop, where a raw "Failed: ..." banner on an attempt that's
 // about to be automatically retried is misleading — the caller manages user-facing status
 // for that flow instead, and only surfaces a failure once all retries are exhausted.
-async function connectDevice(usbDevice, opts = {}) {
+// Real body, renamed from connectDevice — see the serializing wrapper of the same name
+// right below this function for why.
+async function connectDeviceExclusive(usbDevice, opts = {}) {
   const silent = !!opts.silent;
   let connectingKey = null;
   let openedConnection = false;
@@ -776,6 +804,29 @@ async function connectDevice(usbDevice, opts = {}) {
   } finally {
     if (connectingKey) connectingUsbIds.delete(connectingKey);
   }
+}
+
+// Serializes every actual connectDeviceExclusive() attempt (across ALL devices, not just
+// retries of the same one) behind a simple promise-chain mutex — the backoff WAITS between
+// retries are NOT held under this lock (only each individual attempt is), so two devices
+// being connected around the same time don't block each other for a full ~45s retry cycle,
+// but their risky open()/reset()/close() sequences can also never overlap in time.
+// Confirmed via a real Linux multi-device debug log (2026-08-11): connecting a second
+// device while a first one is already connected (or being connected) can trigger a
+// spurious 'disconnect' for the OTHER device — almost certainly a bus-level reset ripple
+// across a shared hub/controller. That's an inherent USB/hardware quirk this app can't
+// fully prevent, but letting two connectDeviceExclusive() calls run their open/reset/close
+// sequences at the literal same instant only makes it more likely; serializing them is a
+// real (if partial) mitigation, not just a band-aid on the symptom (see
+// pendingAutoReconnect above for the complementary self-healing side of this fix).
+let connectQueue = Promise.resolve();
+function connectDevice(usbDevice, opts = {}) {
+  const run = connectQueue.then(
+    () => connectDeviceExclusive(usbDevice, opts),
+    () => connectDeviceExclusive(usbDevice, opts),
+  );
+  connectQueue = run.then(() => {}, () => {});
+  return run;
 }
 
 // --- Shell ---
