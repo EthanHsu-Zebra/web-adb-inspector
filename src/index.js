@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.14.0';
+const APP_VERSION = '1.14.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1406,9 +1406,9 @@ function createFallbackChannel(roomId, password, sessionId, label) {
 
 // Wraps each trystero action so every send() goes out over BOTH the real P2P data
 // channel (best-effort — silently a no-op if no such peer is connected, same as
-// trystero's own behavior) and the fallback channel (except p2pOnly actions, see
-// below), and every onMessage() handler is registered once and fed by both
-// transports through one funnel. Callers (handleRemoteCmdRequest, sendRemoteCommand,
+// trystero's own behavior) and the fallback channel, and every onMessage() handler
+// is registered once and fed by both transports through one funnel. Callers
+// (handleRemoteCmdRequest, sendRemoteCommand,
 // etc.) need no changes — they only ever see {send, onMessage} and a ctx.peerId,
 // which is either a real trystero peerId or (fallback-only) the sender's random
 // sessionId; both are stable, opaque strings for the life of a session, which is all
@@ -1450,22 +1450,25 @@ function makeRemoteActions(room, roomId, password, label) {
     deliver(action, data, { peerId: envelope.from });
   });
 
-  // screenFrame/inputEvent are high-frequency (multiple per second while a remote-control
-  // session is active) — sending them over the fallback relay too would (a) flood the
-  // shared self-hosted relay used by every session of this app for a marginal benefit,
-  // since (b) a WS-relay round trip is already too slow/jittery to make remote control
-  // usable on a fallback-only (WebRTC-blocked) network anyway. Accepted degradation: no
-  // remote screen control on Zscaler-style networks — the existing text-based Remote
-  // Shell still works there via the normal dual-transport path.
-  const p2pOnlyActions = new Set(['screenFrame', 'inputEvent']);
-
+  // screenFrame/inputEvent were originally P2P-only (skipping the line below) on the
+  // theory that they're high-frequency and a WS-relay round trip would be too slow to
+  // make remote control usable anyway. Reverted after real-world testing (2026-08-11):
+  // on a viewer whose network doesn't establish real P2P at all (the same class of
+  // Zscaler-style restriction that motivated the fallback channel in the first place),
+  // that made screen control silently non-functional beyond the initial grant handshake
+  // — the grant/deny round trip worked (dual-transport), but no frame or tap ever
+  // arrived. Reliability on the networks this app actually gets used on beats the
+  // relay-load savings; the grantId+seq scoping already handles the resulting
+  // cross-transport reordering/double-delivery correctly (a frame or input event is
+  // dropped if its seq isn't strictly greater than the last one accepted for that
+  // grantId), so there's no correctness cost to sending these over both transports.
   function wrap(name) {
     const real = room.makeAction(name);
     real.onMessage = (data, ctx) => deliver(name, data, ctx);
     return {
       send: (data, opts) => {
         try { real.send(data, opts); } catch (_) {}
-        if (!p2pOnlyActions.has(name)) fallback.send({ action: name, from: sessionId, target: opts?.target, data });
+        fallback.send({ action: name, from: sessionId, target: opts?.target, data });
       },
       get onMessage() { return dispatchers[name]; },
       set onMessage(handler) { dispatchers[name] = handler; },
