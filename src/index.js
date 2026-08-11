@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.18.0';
+const APP_VERSION = '1.19.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1815,15 +1815,14 @@ function cacheAndBroadcastTabHtml(serial, tab, html) {
 // and it also drives the host's own visible tabs. A viewer who selects one of those
 // never-clicked devices correctly (from the code's perspective) saw "Waiting for host
 // data…" permanently — not a transmission bug, just genuinely no data anywhere to send,
-// for a reason invisible from the viewer side. Fetches Properties/Features/Packages (the
-// three cheapest and most commonly needed tabs) directly into hostTabHtmlCache without
-// touching activeSerial, dataCache, or any live DOM element, so it can never disturb
-// whatever the host is actually looking at. Attestation/RKP are deliberately left out —
-// both are slower, real hardware/keystore probes (sometimes several seconds) that aren't
-// worth running automatically for a device nobody may ever look at; those still populate
-// the first time the host (or, going forward, a viewer prompting the host to check) visits
-// that tab locally. Only called when a remote session is actually active as host (see call
-// sites), so purely-local usage never pays this extra background cost.
+// for a reason invisible from the viewer side. Fetches all five tabs directly into
+// hostTabHtmlCache without touching activeSerial, dataCache, or any live DOM element, so
+// it can never disturb whatever the host is actually looking at — fetchAttestation()/
+// fetchRKP() take an explicit (targetSerial, background=true) so they skip showLoading()
+// and cache+broadcast instead of writing to the live DOM (see their own comments).
+// Attestation/RKP are real hardware/keystore probes that can take several seconds each —
+// accepted cost for full parity between devices; only called when a remote session is
+// actually active as host (see call sites), so purely-local usage never pays it.
 async function prefetchTabsForViewers(serial) {
   debugLogPush(`prefetchTabsForViewers(${serial}): starting`, 'evt');
   const info = connectedDevices.get(serial);
@@ -1861,6 +1860,18 @@ async function prefetchTabsForViewers(serial) {
     if (packages.length > 0) cacheAndBroadcastTabHtml(serial, 'packages', packagesToHtml(packages, fallback, method, ''));
   } catch (err) {
     debugLogPush(`prefetchTabsForViewers(${serial}): packages FAILED: ${err && err.message || err}`, 'err');
+  }
+  try {
+    await fetchAttestation(serial, true);
+    debugLogPush(`prefetchTabsForViewers(${serial}): attestation done`, 'ok');
+  } catch (err) {
+    debugLogPush(`prefetchTabsForViewers(${serial}): attestation FAILED: ${err && err.message || err}`, 'err');
+  }
+  try {
+    await fetchRKP(serial, true);
+    debugLogPush(`prefetchTabsForViewers(${serial}): rkp done`, 'ok');
+  } catch (err) {
+    debugLogPush(`prefetchTabsForViewers(${serial}): rkp FAILED: ${err && err.message || err}`, 'err');
   }
   debugLogPush(`prefetchTabsForViewers(${serial}): done, hostTabHtmlCache now has [${Object.keys(hostTabHtmlCache[serial] || {}).join(', ')}]`, 'evt');
 }
@@ -3298,10 +3309,19 @@ function parsePmListPackagesFallback(text) {
 }
 
 // --- Attestation ---
-async function fetchAttestation() {
-  const info = connectedDevices.get(activeSerial);
+// targetSerial/background let prefetchTabsForViewers() (see its comment) run this for a
+// device that ISN'T the host's own currently-selected one: background=true skips
+// showLoading() (a host-UI-only concern) and writes the result into hostTabHtmlCache
+// instead of the live #attestation-output element, so it can never disturb whatever the
+// host is actually looking at. The existing local call site (selectDevice()'s fetch
+// chain) calls this with no args, same as before — targetSerial defaults to activeSerial
+// and background defaults to falsy, so its own behavior is unchanged.
+async function fetchAttestation(targetSerial, background) {
+  const serial = targetSerial || activeSerial;
+  const info = connectedDevices.get(serial);
   if (!info) return;
-  showLoading('attestation', true);
+  if (!background) showLoading('attestation', true);
+  let html;
   try {
     const results = await Promise.allSettled([
       safeGetProp(info.adb, 'ro.boot.verifiedbootstate'),
@@ -3326,11 +3346,16 @@ async function fetchAttestation() {
       ['KeyMint', kMint ? 'Yes' : 'No', kMint ? 'ok' : 'warn'],
       ['StrongBox', sBox ? 'Yes' : 'No', sBox ? 'ok' : 'warn'],
     ];
-    document.getElementById('attestation-output').innerHTML = renderStatusTable(rows);
+    html = renderStatusTable(rows);
   } catch (err) {
-    document.getElementById('attestation-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
+    html = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
-  showLoading('attestation', false);
+  if (background) {
+    cacheAndBroadcastTabHtml(serial, 'attestation', html);
+  } else {
+    document.getElementById('attestation-output').innerHTML = html;
+    showLoading('attestation', false);
+  }
 }
 
 
@@ -3902,10 +3927,13 @@ window.denyControlRequest = denyControlRequest;
 window.stopControlSession = stopControlSession;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
-async function fetchRKP() {
-  const info = connectedDevices.get(activeSerial);
+// targetSerial/background — same purpose and contract as fetchAttestation()'s, see its
+// comment. Existing local call site (selectDevice()'s fetch chain) is unaffected.
+async function fetchRKP(targetSerial, background) {
+  const serial = targetSerial || activeSerial;
+  const info = connectedDevices.get(serial);
   if (!info) return;
-  showLoading('rkp', true);
+  if (!background) showLoading('rkp', true);
   try {
     // 0) Definitive RKP provisioning check (cmd remote_provisioning certify <name>)
     const rkp = await checkRkpProvisioning(info.adb);
@@ -4087,11 +4115,21 @@ async function fetchRKP() {
       const val = (r[1] || '').toString().trim().toLowerCase();
       return val !== '' && val !== 'not set' && val !== 'not found' && val !== 'not installed' && val !== 'not reported';
     });
-    document.getElementById('rkp-output').innerHTML = renderRKPTable(validRows);
+    const html = renderRKPTable(validRows);
+    if (background) {
+      cacheAndBroadcastTabHtml(serial, 'rkp', html);
+    } else {
+      document.getElementById('rkp-output').innerHTML = html;
+    }
   } catch (err) {
-    document.getElementById('rkp-output').innerHTML = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
+    const html = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
+    if (background) {
+      cacheAndBroadcastTabHtml(serial, 'rkp', html);
+    } else {
+      document.getElementById('rkp-output').innerHTML = html;
+    }
   }
-  showLoading('rkp', false);
+  if (!background) showLoading('rkp', false);
 }
 
 function clearShell() {
