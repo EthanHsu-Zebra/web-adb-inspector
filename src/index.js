@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.10.2';
+const APP_VERSION = '1.10.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2600,12 +2600,16 @@ async function runShell() {
   input.value = '';
   if (!dataCache.cwdBySerial) dataCache.cwdBySerial = {};
   const cwd = dataCache.cwdBySerial[activeSerial] || null;
-  output.textContent += (cwd || '/') + ' $ ' + cmd + '\n';
+  const promptCwd = cwd || '/';
+  output.textContent += promptCwd + ' $ ' + cmd + '\n';
   try {
     const raw = await adbShell(info.adb, wrapWithCwdTracking(cwd, cmd));
     const { text, cwd: newCwd } = extractCwdMarker(raw);
     if (newCwd) dataCache.cwdBySerial[activeSerial] = newCwd;
     output.textContent += text + '\n';
+    // Confirm the new directory right away (like a real shell's next prompt) instead
+    // of only showing it once the user happens to run another command.
+    if (newCwd && newCwd !== promptCwd) output.textContent += newCwd + ' $ \n';
     updateShellCwdLabel();
   } catch (err) {
     output.textContent += 'Error: ' + String(err.message || err) + '\n';
@@ -2826,7 +2830,7 @@ function sendRemoteCommand() {
   const targetDev = remoteSession.mirror.connected.find(d => d.serial === targetSerial);
   const targetLabel = targetDev ? (targetDev.nickname || targetDev.displayName || targetDev.serial) : targetSerial;
   const targetCwd = remoteSession.mirror.cwdBySerial?.[targetSerial] || '/';
-  remoteSession.pendingRequests.set(requestId, { cmd, serial: targetSerial });
+  remoteSession.pendingRequests.set(requestId, { cmd, serial: targetSerial, promptCwd: targetCwd });
   output.textContent += '[' + targetLabel + '] ' + targetCwd + ' $ ' + cmd + '\n';
   output.scrollTop = output.scrollHeight;
   debugLogPush(`remote (viewer): sending cmdRequest requestId=${requestId} to hostPeerId=${remoteSession.hostPeerId}`, 'evt');
@@ -2859,7 +2863,14 @@ function handleCmdResponse(data) {
     remoteSession.mirror.cwdBySerial[serial] = cwd;
     if (serial === remoteSession.mirror.activeSerial) updateViewerCwdLabel();
   }
-  const text = denied ? '(denied by host)\n' : ok ? (out || '') + '\n' : 'Error: ' + (error || 'unknown error') + '\n';
+  let text = denied ? '(denied by host)\n' : ok ? (out || '') + '\n' : 'Error: ' + (error || 'unknown error') + '\n';
+  // Confirm the new directory right away (like a real shell's next prompt) instead of
+  // only showing it once the user happens to run another command.
+  if (ok && cwd && req && cwd !== req.promptCwd) {
+    const dev = remoteSession.mirror.connected.find(d => d.serial === serial);
+    const label = dev ? (dev.nickname || dev.displayName || dev.serial) : serial;
+    text += '[' + label + '] ' + cwd + ' $ \n';
+  }
   if (serial && serial === remoteSession.mirror.activeSerial) {
     const output = document.getElementById('viewer-shell-output');
     if (output) { output.textContent += text; output.scrollTop = output.scrollHeight; }
