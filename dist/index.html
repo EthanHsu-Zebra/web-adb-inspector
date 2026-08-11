@@ -563,6 +563,38 @@
   font-size: calc(0.85rem * var(--font-scale));
 }
 
+.control-active-banner {
+  background: rgba(255,82,82,0.1);
+  border-bottom: 1px solid var(--red);
+  padding: 0.5rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: calc(0.85rem * var(--font-scale));
+  color: var(--red);
+}
+.control-screen-wrap { display: inline-block; max-width: 100%; margin-top: 0.5rem; }
+.control-screen-wrap img {
+  max-width: 100%;
+  max-height: 70vh;
+  cursor: crosshair;
+  user-select: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+}
+.control-text-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+.control-text-row input {
+  flex: 1;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  font-family: var(--mono);
+  font-size: calc(0.8rem * var(--font-scale));
+}
+
 </style>
 </head>
 <body>
@@ -584,6 +616,11 @@
   <span>Remote viewer mode — connected to host session</span>
   <span id="viewer-status" class="badge">Connecting...</span>
   <button class="btn btn-sm" onclick="leaveRemoteSession()">Leave Session</button>
+</div>
+
+<div id="control-active-banner" class="control-active-banner hidden">
+  <span id="control-active-banner-label">Remote control active</span>
+  <button class="btn btn-sm" onclick="stopControlSession()">Stop Control</button>
 </div>
 
 <div class="main">
@@ -628,6 +665,7 @@
         <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
         <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
         <div class="tab" id="tab-btn-shell" onclick="switchTab(this, 'tab-shell')">Shell</div>
+        <div class="tab viewer-only" id="tab-btn-control" onclick="switchTab(this, 'tab-control')">Remote Control</div>
       </div>
 
       <!-- Properties Tab -->
@@ -730,6 +768,36 @@
           </div>
         </div>
       </div>
+
+      <!-- Remote Control Tab (viewer only — tab-bar button is .viewer-only; this
+           tab-content is a plain, unmodified tab so switchTab()'s .active toggle
+           keeps working normally: a host can never activate it since its button
+           is hidden, so it never needs its own viewer-only visibility gate. -->
+      <div id="tab-control" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Remote Control <span style="font-weight:400;color:var(--muted);font-size:calc(0.75rem * var(--font-scale))">(screen mirroring + touch, ~2-6fps — not a video stream)</span></h3>
+            <div class="panel-actions">
+              <span id="control-status" class="badge">Not in control</span>
+              <button id="btn-request-control" class="btn btn-sm" onclick="requestControl()">Request Control</button>
+              <button id="btn-release-control" class="btn btn-sm hidden" onclick="releaseControl()">Release Control</button>
+            </div>
+          </div>
+          <div id="control-screen-wrap" class="control-screen-wrap hidden">
+            <img id="control-screen-img" draggable="false" alt="Device screen">
+          </div>
+          <div id="control-hw-buttons" class="quick-btns hidden">
+            <button class="btn btn-sm" onclick="sendControlKey(4)">Back</button>
+            <button class="btn btn-sm" onclick="sendControlKey(3)">Home</button>
+            <button class="btn btn-sm" onclick="sendControlKey(187)">Recent</button>
+            <button class="btn btn-sm" onclick="sendControlKey(26)">Power</button>
+          </div>
+          <div id="control-text-row" class="control-text-row hidden">
+            <input id="control-text-input" type="text" placeholder="Type text to send to the device..." onkeydown="if(event.key==='Enter')sendControlText()" autocomplete="off" spellcheck="false">
+            <button class="btn btn-sm" onclick="sendControlText()">Send Text</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -747,6 +815,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080619"></script>
+<script type="module" src="bundle.js?v=2026081101"></script>
 </body>
 </html>
