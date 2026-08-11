@@ -195,6 +195,13 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.13.1 — Linux: real guidance for "Access denied," plus a device-specific udev rule
+First real Linux report: with two devices sharing the same vendor:product ID plugged in at once, one connected fine while the other failed `Failed to execute 'open' on 'USBDevice': Access denied.` on every retry for 44s straight, then succeeded instantly once the *other* device was tried instead — pointing at something host-side already holding that specific device, not a per-app/per-tab WebUSB conflict (which is what the rest of `isDeviceBusyError()`'s handling was built around, all from earlier Windows-only debugging).
+
+`showADBReleaseDialog()`'s Linux branch had never actually been fleshed out — it was a placeholder (`echo "BUS-DEV" | sudo tee /sys/bus/usb/drivers/android_usb/unbind`, a command for making a Linux box act as a USB *gadget*, not for a Linux box acting as an ADB *host* talking to an Android device, which is our actual scenario) that nobody had hit until now. Replaced with real guidance covering the two actual causes: (1) the native Android platform-tools `adb` server auto-claims any ADB-capable USB device the instant it sees one — even with zero active `adb shell` sessions — which directly conflicts with this page's WebUSB access, and plausibly explains the one-device-fails-the-other-doesn't split (only the device the native adb server had already seen would be held); fix is `adb kill-server`. (2) A missing udev rule, needed on Linux for a non-root user to open the raw USB device node at all — the dialog now generates the exact rule line, with the real vendor ID pre-filled in hex, instead of telling the user to go figure that out themselves.
+
+`showADBReleaseDialog()` now takes an optional `vendorId` param for this — threaded through from all four call sites (`scanDevices()`, `connectDevice()`, `connectAvailable()`), each of which already had a USB vendor ID in scope.
+
 ### v1.13.0 — removed the per-command approval gate entirely
 Reported twice now: a freshly-created host session still required manually clicking Approve/Deny for every viewer-issued command, even though `remoteSession.trusted` had defaulted to `true` since v1.9.0. Root cause not conclusively pinned down (most likely the Share modal's "Auto-run commands" checkbox ended up unchecked for that session — a manual per-session toggle, not persisted, easy to leave in the wrong state) — but rather than keep chasing exactly how the toggle got there, removed the toggle and the whole gate mechanism, per the user's now twice-stated preference that a shared link is already the authorization boundary for this use case.
 

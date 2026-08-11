@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.13.0';
+const APP_VERSION = '1.13.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -195,13 +195,34 @@ function isDeviceBusyError(msg) {
 // own code recovers it; only an actual page reload does, reliably, every time. Most likely
 // a stuck per-page WebUSB<->browser-service connection that our script has no way to reset
 // short of the page itself reloading.
-function showADBReleaseDialog() {
+function showADBReleaseDialog(vendorId) {
   hideADBReleaseDialog();
   const os = getOS();
   let t, b;
   if (os === 'windows') { t = 'Release the device on Windows'; b = 'Something else on this machine may have the device open (a background adb.exe/ADB server, Android Studio, or vendor device-management software).\n\n1. Command Prompt: adb kill-server\n2. Or: taskkill /F /IM adb.exe\n3. Also check Task Manager for Android Studio, Zebra device-management tools (e.g. StageNow, 123Scan, device sync utilities), or other apps that talk to this device over USB, and close them.'; }
   else if (os === 'mac') { t = 'Release ADB on macOS'; b = '1. Terminal: adb kill-server\n2. If stuck: pkill -f adb'; }
-  else { t = 'Release ADB on Linux'; b = 'echo "BUS-DEV" | sudo tee /sys/bus/usb/drivers/android_usb/unbind'; }
+  else {
+    // "Access denied" on Linux almost always means one of two things, and it's worth
+    // trying both since they look identical from here: (1) the native platform-tools
+    // adb server has already claimed the device — it does this the instant it sees an
+    // ADB-capable device, even with no "adb shell" session running, which conflicts
+    // directly with this page's WebUSB access; or (2) there's no udev rule granting a
+    // non-root user permission to open the raw USB device node at all. Confirmed
+    // (2026-08 report): with two devices sharing the same vendor:product ID plugged in
+    // at once, one connected fine while the other failed "Access denied" on every
+    // retry — consistent with (1), since a device the native adb server had already
+    // seen earlier would be claimed while a never-before-seen one wouldn't be.
+    const vidHex = vendorId ? vendorId.toString(16).padStart(4, '0') : 'xxxx';
+    t = 'Release the device on Linux';
+    b = 'Something else on this machine most likely has the device open:\n\n' +
+      '1. Terminal: adb kill-server\n' +
+      '   The native Android platform-tools adb server auto-claims any ADB-capable USB device the moment it sees it. This is the most common cause, especially if only one of several similar devices fails.\n\n' +
+      '2. If that doesn\'t fix it, you likely need a udev rule granting USB access:\n' +
+      '   echo \'SUBSYSTEM=="usb", ATTR{idVendor}=="' + vidHex + '", MODE="0666", GROUP="plugdev"\' | sudo tee /etc/udev/rules.d/51-android.rules\n' +
+      '   sudo udevadm control --reload-rules && sudo udevadm trigger\n' +
+      '   Then unplug and replug the device.' + (vendorId ? '' : ' (run `lsusb` first to find the vendor ID for the "idVendor" line above.)') + '\n\n' +
+      '3. Also check for Android Studio, scrcpy, or other USB device-management tools that might already have it open.';
+  }
   const overlay = document.createElement('div');
   overlay.id = 'adb-release-modal-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
@@ -256,11 +277,11 @@ async function scanDevices() {
     const { ok, lastError } = await connectWithRetries(mgr, usbId, device, (label) => setStatus(label, 'connecting'));
     if (!ok) {
       setStatus('Failed to connect after retries' + (lastError ? ': ' + lastError : ''), 'err');
-      if (lastError && isDeviceBusyError(lastError)) showADBReleaseDialog();
+      if (lastError && isDeviceBusyError(lastError)) showADBReleaseDialog(usbId.vendorId);
     }
   } catch (err) {
     const msg = err.message || String(err);
-    if (isDeviceBusyError(msg)) showADBReleaseDialog();
+    if (isDeviceBusyError(msg)) showADBReleaseDialog(usbId.vendorId);
     else setStatus('Failed: ' + msg, 'err');
   }
 }
@@ -730,7 +751,7 @@ async function connectDevice(usbDevice, opts = {}) {
     }
     if (opts.onError) opts.onError(msg);
     if (!silent) {
-      if (isDeviceBusyError(msg)) showADBReleaseDialog();
+      if (isDeviceBusyError(msg)) showADBReleaseDialog(usbDevice.raw.vendorId);
       setStatus('Failed: ' + msg, 'err');
     }
     return false;
@@ -1091,7 +1112,7 @@ async function connectAvailable(serial) {
       if (!ok) {
         debugLogPush(`connectAvailable: connectDevice failed after all retries: serial=${serial}`, 'warn');
         setStatus(`Failed to connect ${info._displayName || serial} after retries` + (lastError ? ': ' + lastError : ''), 'err');
-        if (lastError && isDeviceBusyError(lastError)) showADBReleaseDialog();
+        if (lastError && isDeviceBusyError(lastError)) showADBReleaseDialog(info._usbId?.vendorId);
       }
       renderDeviceList();
       return;
