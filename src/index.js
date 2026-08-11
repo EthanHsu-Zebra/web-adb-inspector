@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.10.3';
+const APP_VERSION = '1.11.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -972,6 +972,8 @@ function selectDevice(serial) {
   const shellEl = document.getElementById('shell-output');
   if (shellEl) {
     shellEl.textContent = dataCache.shellBySerial?.[serial] || '';
+    const term = document.getElementById('shell-console');
+    if (term) term.scrollTop = term.scrollHeight;
   }
   updateShellCwdLabel();
   document.getElementById('search-props').value = '';
@@ -1001,12 +1003,13 @@ function selectDevice(serial) {
   const countEl = document.getElementById('hwtrust-count');
   if (countEl) countEl.textContent = '';
 
-  // Fetch all data for the new device
-  fetchProperties();
-  fetchFeatures();
-  fetchPackages();
-  fetchAttestation();
-  fetchRKP();
+  // Fetch all data for the new device (and mirror each tab's rendered result to any
+  // connected viewers once it settles — see pushTabHtml()).
+  fetchProperties().then(() => pushTabHtml('props', 'props-output'));
+  fetchFeatures().then(() => pushTabHtml('features', 'features-output'));
+  fetchPackages().then(() => pushTabHtml('packages', 'packages-output'));
+  fetchAttestation().then(() => pushTabHtml('attestation', 'attestation-output'));
+  fetchRKP().then(() => pushTabHtml('rkp', 'rkp-output'));
 }
 
 // Re-fetches the manager's granted-device list fresh and finds the one matching usbId.
@@ -1383,7 +1386,7 @@ function makeRemoteActions(room, roomId, password, label) {
   }
 
   const actions = {};
-  for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'bye']) actions[name] = wrap(name);
+  for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'tabDataPush', 'bye']) actions[name] = wrap(name);
   actions._fallback = fallback;
   actions._sessionId = sessionId;
   return actions;
@@ -1526,6 +1529,22 @@ function buildDeviceSnapshot() {
 function broadcastDeviceState() {
   if (!remoteSession || remoteSession.role !== 'host') return;
   try { remoteSession.actions.devicePush.send(buildDeviceSnapshot()); } catch (_) {}
+}
+
+// Mirrors a data tab (Properties/Features/Packages/Attestation/RKP/HW Trust) to any
+// connected viewers. Rather than re-deriving/re-transmitting each tab's structured data
+// (several different shapes, some assembled inline with no cached structure at all —
+// e.g. Attestation/RKP build their table rows and set innerHTML in one step), just
+// broadcast the already-rendered HTML for that tab's output element: the viewer reuses
+// the exact same DOM structure/CSS, so it renders identically with far less plumbing.
+// Trade-off: per-tab search boxes (Properties/Features/Packages) filter dataCache
+// arrays the viewer doesn't have, so they're hidden in viewer mode (.host-only) rather
+// than silently doing nothing.
+function pushTabHtml(tab, elementId) {
+  if (!remoteSession || remoteSession.role !== 'host' || !activeSerial) return;
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }); } catch (_) {}
 }
 
 function handleViewerHello(data, peerId) {
@@ -1688,6 +1707,10 @@ function joinAsViewer(roomId, password) {
     const cb = remoteSession.pendingCompletions?.get(requestId);
     if (cb) { remoteSession.pendingCompletions.delete(requestId); cb(ok ? (entries || []) : []); }
   };
+  actions.tabDataPush.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    handleTabDataPush(data);
+  };
   actions.bye.onMessage = (data, ctx) => { if (ctx.peerId === remoteSession.hostPeerId) showHostDisconnectedBanner(); };
 
   setTimeout(() => {
@@ -1718,9 +1741,18 @@ function renderViewerShell() {
   document.getElementById('btn-share')?.classList.add('hidden');
   document.getElementById('welcome-msg')?.classList.add('hidden');
   document.getElementById('available-section')?.classList.add('hidden');
-  document.getElementById('inspector-section')?.classList.add('hidden');
   document.getElementById('viewer-banner')?.classList.remove('hidden');
-  document.getElementById('viewer-shell-section')?.classList.remove('hidden');
+  // Viewer mode reuses the full Properties/Features/.../Shell tab set instead of a
+  // parallel UI — .viewer-mode (CSS) hides host-only controls (nickname/disconnect,
+  // search boxes, Export JSON, CSR/probe buttons) and swaps in the Remote Shell block
+  // in place of the host's local Shell block.
+  const inspector = document.getElementById('inspector-section');
+  if (inspector) {
+    inspector.classList.remove('hidden');
+    inspector.classList.add('viewer-mode');
+  }
+  const shellTabBtn = document.getElementById('tab-btn-shell');
+  if (shellTabBtn) switchTab(shellTabBtn, 'tab-shell');
   renderMirrorDeviceList({ activeSerial: null, connected: [], available: [] });
 }
 
@@ -1747,7 +1779,58 @@ function switchMirrorShellOutput(oldSerial, newSerial) {
   if (!remoteSession.mirror.shellBySerial) remoteSession.mirror.shellBySerial = {};
   if (oldSerial) remoteSession.mirror.shellBySerial[oldSerial] = output.textContent;
   output.textContent = newSerial ? (remoteSession.mirror.shellBySerial[newSerial] || '') : '';
-  output.scrollTop = output.scrollHeight;
+  const term = document.getElementById('viewer-shell-console');
+  if (term) term.scrollTop = term.scrollHeight;
+}
+
+// Maps a broadcast tab key to the DOM element it should be dropped into — the exact
+// same elements the host's own UI uses, since viewer mode reuses #inspector-section
+// wholesale rather than maintaining a parallel set of read-only views.
+// NOTE: a function, not a top-level const object — applyMirroredTabsForSerial() below
+// is reachable synchronously from init() (via initRemoteViewerIfLinked() ->
+// joinAsViewer() -> renderViewerShell(), all on a viewer's very first page load,
+// before the rest of this module has finished its own top-level evaluation). A
+// module-level `const` here would sit in the temporal dead zone at that point —
+// exactly the v1.10.0 bug (REMOTE_ACTION_NAMES) repeated. A function declaration is
+// fully hoisted, so it has no such ordering dependency.
+function mirroredTabElementIds() {
+  return {
+    props: 'props-output', features: 'features-output', packages: 'packages-output',
+    attestation: 'attestation-output', rkp: 'rkp-output',
+    hwtrust: 'hwtrust-output', hwtrustProbe: 'apk-verify-output',
+  };
+}
+
+function handleTabDataPush(data) {
+  const { serial, tab, html } = data || {};
+  if (!serial || !tab || !mirroredTabElementIds()[tab]) return;
+  if (!remoteSession.mirror.tabHtml) remoteSession.mirror.tabHtml = {};
+  if (!remoteSession.mirror.tabHtml[serial]) remoteSession.mirror.tabHtml[serial] = {};
+  remoteSession.mirror.tabHtml[serial][tab] = html;
+  if (serial === remoteSession.mirror.activeSerial) {
+    const el = document.getElementById(mirroredTabElementIds()[tab]);
+    if (el) el.innerHTML = html;
+  }
+}
+
+// Called whenever the mirrored active device changes — refreshes every data tab from
+// whatever's cached for that serial (empty/placeholder if the host hasn't sent
+// anything for it yet), the same way switchMirrorShellOutput() does for the console.
+function applyMirroredTabsForSerial(serial) {
+  const cached = (serial && remoteSession.mirror.tabHtml?.[serial]) || {};
+  for (const [tab, elementId] of Object.entries(mirroredTabElementIds())) {
+    const el = document.getElementById(elementId);
+    if (el) el.innerHTML = cached[tab] || '<div class="empty-hint">Waiting for host data…</div>';
+  }
+}
+
+function updateViewerDeviceHeader() {
+  const el = document.getElementById('selected-device-name');
+  if (!el || !remoteSession) return;
+  const dev = remoteSession.mirror.connected.find(d => d.serial === remoteSession.mirror.activeSerial);
+  if (!dev) { el.textContent = ''; return; }
+  const nick = dev.nickname ? ' ("' + dev.nickname + '")' : '';
+  el.textContent = (dev.displayName || dev.serial) + nick + ' (' + dev.serial + ')';
 }
 
 function selectMirrorDevice(serial) {
@@ -1766,12 +1849,9 @@ function renderMirrorDeviceList(snapshot) {
     if (fallback !== remoteSession.mirror.activeSerial) switchMirrorShellOutput(remoteSession.mirror.activeSerial, fallback);
     remoteSession.mirror.activeSerial = fallback;
   }
-  const targetEl = document.getElementById('viewer-shell-target');
-  if (targetEl) {
-    const activeDev = remoteSession.mirror.connected.find(d => d.serial === remoteSession.mirror.activeSerial);
-    targetEl.textContent = activeDev ? (activeDev.nickname || activeDev.displayName || activeDev.serial) : 'none selected';
-  }
   updateViewerCwdLabel();
+  updateViewerDeviceHeader();
+  applyMirroredTabsForSerial(remoteSession.mirror.activeSerial);
   const list = document.getElementById('device-list');
   const welcome = document.getElementById('welcome-msg');
   if (!list || !welcome) return;
@@ -2586,13 +2666,21 @@ function renderRKPTable(rows) {
 
 // --- Shell ---
 function updateShellCwdLabel() {
-  const el = document.getElementById('shell-cwd');
-  if (el) el.textContent = (activeSerial && dataCache.cwdBySerial?.[activeSerial]) || '/';
+  const el = document.getElementById('shell-prompt-label');
+  if (el) el.textContent = ((activeSerial && dataCache.cwdBySerial?.[activeSerial]) || '/') + ' $';
+}
+
+// The input lives inline as the console's last line rather than in a separate bar —
+// clicking anywhere in the console (e.g. to scroll or read history) should still put
+// the cursor back in it, like clicking into a real terminal window.
+function focusShellInput() {
+  document.getElementById('shell-input')?.focus();
 }
 
 async function runShell() {
   const input = document.getElementById('shell-input');
   const output = document.getElementById('shell-output');
+  const term = document.getElementById('shell-console');
   const cmd = input.value.trim();
   if (!cmd || !activeSerial) return;
   const info = connectedDevices.get(activeSerial);
@@ -2600,21 +2688,19 @@ async function runShell() {
   input.value = '';
   if (!dataCache.cwdBySerial) dataCache.cwdBySerial = {};
   const cwd = dataCache.cwdBySerial[activeSerial] || null;
-  const promptCwd = cwd || '/';
-  output.textContent += promptCwd + ' $ ' + cmd + '\n';
+  output.textContent += (cwd || '/') + ' $ ' + cmd + '\n';
   try {
     const raw = await adbShell(info.adb, wrapWithCwdTracking(cwd, cmd));
     const { text, cwd: newCwd } = extractCwdMarker(raw);
     if (newCwd) dataCache.cwdBySerial[activeSerial] = newCwd;
     output.textContent += text + '\n';
-    // Confirm the new directory right away (like a real shell's next prompt) instead
-    // of only showing it once the user happens to run another command.
-    if (newCwd && newCwd !== promptCwd) output.textContent += newCwd + ' $ \n';
+    // The live prompt label below (updateShellCwdLabel) now shows the new directory
+    // immediately, so there's no need for a separate confirmation line in the history.
     updateShellCwdLabel();
   } catch (err) {
     output.textContent += 'Error: ' + String(err.message || err) + '\n';
   }
-  output.scrollTop = output.scrollHeight;
+  if (term) term.scrollTop = term.scrollHeight;
 }
 function runCmd(cmd) { document.getElementById('shell-input').value = cmd; runShell(); }
 
@@ -2816,9 +2902,14 @@ function handleViewerShellKeydown(event) {
   if (event.key === 'Tab') { event.preventDefault(); completeViewerShellPath(event.target); }
 }
 
+function focusViewerShellInput() {
+  document.getElementById('viewer-shell-input')?.focus();
+}
+
 function sendRemoteCommand() {
   const input = document.getElementById('viewer-shell-input');
   const output = document.getElementById('viewer-shell-output');
+  const term = document.getElementById('viewer-shell-console');
   if (!input || !output || !remoteSession || remoteSession.role !== 'viewer') return;
   const cmd = input.value.trim();
   if (!cmd) return;
@@ -2832,7 +2923,7 @@ function sendRemoteCommand() {
   const targetCwd = remoteSession.mirror.cwdBySerial?.[targetSerial] || '/';
   remoteSession.pendingRequests.set(requestId, { cmd, serial: targetSerial, promptCwd: targetCwd });
   output.textContent += '[' + targetLabel + '] ' + targetCwd + ' $ ' + cmd + '\n';
-  output.scrollTop = output.scrollHeight;
+  if (term) term.scrollTop = term.scrollHeight;
   debugLogPush(`remote (viewer): sending cmdRequest requestId=${requestId} to hostPeerId=${remoteSession.hostPeerId}`, 'evt');
   Promise.resolve(
     remoteSession.actions.cmdRequest.send({ requestId, serial: targetSerial, command: cmd }, { target: remoteSession.hostPeerId })
@@ -2841,15 +2932,19 @@ function sendRemoteCommand() {
   }).catch(err => {
     debugLogPush(`remote (viewer): cmdRequest send() FAILED requestId=${requestId}: ${err && err.message || err}`, 'err');
     output.textContent += 'Error sending command: ' + (err && err.message || err) + '\n';
-    output.scrollTop = output.scrollHeight;
+    if (term) term.scrollTop = term.scrollHeight;
     remoteSession.pendingRequests.delete(requestId);
   });
 }
 
 function updateViewerCwdLabel() {
-  const el = document.getElementById('viewer-shell-cwd');
+  const el = document.getElementById('viewer-prompt-label');
   if (!el || !remoteSession) return;
-  el.textContent = (remoteSession.mirror.activeSerial && remoteSession.mirror.cwdBySerial?.[remoteSession.mirror.activeSerial]) || '/';
+  const dev = remoteSession.mirror.connected.find(d => d.serial === remoteSession.mirror.activeSerial);
+  if (!dev) { el.textContent = 'none selected $'; return; }
+  const label = dev.nickname || dev.displayName || dev.serial;
+  const cwd = (remoteSession.mirror.activeSerial && remoteSession.mirror.cwdBySerial?.[remoteSession.mirror.activeSerial]) || '/';
+  el.textContent = '[' + label + '] ' + cwd + ' $';
 }
 
 function handleCmdResponse(data) {
@@ -2861,19 +2956,15 @@ function handleCmdResponse(data) {
   if (serial && cwd) {
     if (!remoteSession.mirror.cwdBySerial) remoteSession.mirror.cwdBySerial = {};
     remoteSession.mirror.cwdBySerial[serial] = cwd;
+    // The live prompt label (updateViewerCwdLabel) now shows the new directory
+    // immediately, so there's no need for a separate confirmation line in the history.
     if (serial === remoteSession.mirror.activeSerial) updateViewerCwdLabel();
   }
-  let text = denied ? '(denied by host)\n' : ok ? (out || '') + '\n' : 'Error: ' + (error || 'unknown error') + '\n';
-  // Confirm the new directory right away (like a real shell's next prompt) instead of
-  // only showing it once the user happens to run another command.
-  if (ok && cwd && req && cwd !== req.promptCwd) {
-    const dev = remoteSession.mirror.connected.find(d => d.serial === serial);
-    const label = dev ? (dev.nickname || dev.displayName || dev.serial) : serial;
-    text += '[' + label + '] ' + cwd + ' $ \n';
-  }
+  const text = denied ? '(denied by host)\n' : ok ? (out || '') + '\n' : 'Error: ' + (error || 'unknown error') + '\n';
   if (serial && serial === remoteSession.mirror.activeSerial) {
     const output = document.getElementById('viewer-shell-output');
-    if (output) { output.textContent += text; output.scrollTop = output.scrollHeight; }
+    const term = document.getElementById('viewer-shell-console');
+    if (output) { output.textContent += text; if (term) term.scrollTop = term.scrollHeight; }
   } else if (serial) {
     // Response arrived for a device the viewer has since switched away from —
     // stash it in that device's own console instead of the currently visible one.
@@ -3006,10 +3097,12 @@ window.changeFontSize = changeFontSize;
 window.renderProperties = renderProperties;
 window.renderFeatures = renderFeatures;
 window.renderPackages = renderPackages;
-window.fetchCSR = fetchCSR;
+window.fetchCSR = (slot) => fetchCSR(slot).then(() => pushTabHtml('hwtrust', 'hwtrust-output'));
 window.copyCSR = copyCSR;
 window.clearShell = clearShell;
-window.runAttestationProbe = runAttestationProbe;
+window.focusShellInput = focusShellInput;
+window.focusViewerShellInput = focusViewerShellInput;
+window.runAttestationProbe = () => runAttestationProbe().then(() => pushTabHtml('hwtrustProbe', 'apk-verify-output'));
 window.clearProbeDebug = clearProbeDebug;
 window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
 window.copyProbeDebug = copyProbeDebug;

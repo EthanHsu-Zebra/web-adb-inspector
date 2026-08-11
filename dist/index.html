@@ -425,32 +425,44 @@
   .pkg-perm-status { margin-left: 0.2rem; font-size: calc(0.55rem * var(--font-scale)); }
   .pkg-perm-more { color: var(--muted); font-style: italic; font-size: calc(0.62rem * var(--font-scale)); }
 
-  /* Shell */
-  .shell-bar { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
-  .shell-bar input {
-    flex: 1;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 0.4rem 0.75rem;
-    border-radius: 6px;
-    font-family: var(--mono);
-    font-size: calc(0.8rem * var(--font-scale));
-  }
-  .shell-bar input:focus { outline: none; border-color: var(--accent); }
-  .shell-output {
+  /* Shell — a single scrolling console; the input sits inline as the last line,
+     styled seamlessly with the history above it, like a real terminal. */
+  .terminal-console {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 0.75rem;
     font-family: var(--mono);
     font-size: calc(0.75rem * var(--font-scale));
-    white-space: pre-wrap;
-    max-height: 35vh;
+    max-height: 45vh;
     overflow-y: auto;
-    min-height: 120px;
+    min-height: 160px;
+    cursor: text;
+  }
+  .terminal-history { white-space: pre-wrap; word-break: break-all; }
+  .terminal-prompt-line { display: flex; align-items: center; gap: 0.4rem; }
+  .terminal-prompt-label { color: var(--accent); white-space: nowrap; flex-shrink: 0; }
+  .terminal-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: calc(0.75rem * var(--font-scale));
+    padding: 0;
   }
   .quick-btns { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+
+  /* Viewer mode reuses the host's Properties/Features/.../Shell tabs to mirror data
+     from the host, instead of a parallel UI — host-only controls (nickname editing,
+     Disconnect, search boxes tied to local dataCache, Export JSON, CSR/probe buttons
+     that need a live device connection) are hidden; the .viewer-only Shell block
+     (remote command execution) is shown instead of the host's local Shell block. */
+  .viewer-only { display: none; }
+  #inspector-section.viewer-mode .host-only { display: none !important; }
+  #inspector-section.viewer-mode .viewer-only { display: block; }
 
   /* Status table */
   .status-table { width: 100%; border-collapse: collapse; font-size: calc(0.8rem * var(--font-scale)); }
@@ -625,7 +637,7 @@
     <div id="inspector-section" class="hidden">
       <div class="device-header">
         <h2 id="selected-device-name"></h2>
-        <div class="device-header-actions">
+        <div class="device-header-actions host-only">
           <input id="nickname-input" class="nickname-input" type="text" placeholder="Device nickname..." onkeydown="if(event.key==='Enter')setNickname()">
           <button class="btn btn-sm" onclick="setNickname()">Save</button>
           <button class="btn btn-sm" onclick="disconnectDevice()">Disconnect</button>
@@ -639,7 +651,7 @@
         <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
         <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
         <div class="tab" onclick="switchTab(this, 'tab-hwtrust')">HW Trust</div>
-        <div class="tab" onclick="switchTab(this, 'tab-shell')">Shell</div>
+        <div class="tab" id="tab-btn-shell" onclick="switchTab(this, 'tab-shell')">Shell</div>
       </div>
 
       <!-- Properties Tab -->
@@ -647,7 +659,7 @@
         <div class="panel">
           <div class="panel-header">
             <h3>System Properties <span id="props-count" style="color:var(--accent)"></span></h3>
-            <div class="panel-actions">
+            <div class="panel-actions host-only">
               <input id="search-props" class="search-input" type="text" placeholder="Search properties..." oninput="renderProperties(dataCache.props)">
               <span id="props-loading" class="loading hidden"></span>
               <button class="btn btn-sm btn-export" onclick="exportJSON('props')">Export JSON</button>
@@ -662,7 +674,7 @@
         <div class="panel">
           <div class="panel-header">
             <h3>Package Manager Features <span id="features-count" style="color:var(--accent)"></span></h3>
-            <div class="panel-actions">
+            <div class="panel-actions host-only">
               <input id="search-features" class="search-input" type="text" placeholder="Search features..." oninput="renderFeatures(dataCache.features)">
               <span id="features-loading" class="loading hidden"></span>
               <button class="btn btn-sm btn-export" onclick="exportJSON('features')">Export JSON</button>
@@ -677,7 +689,7 @@
         <div class="panel">
           <div class="panel-header">
             <h3>Packages <span id="packages-count" style="color:var(--accent)"></span></h3>
-            <div class="panel-actions">
+            <div class="panel-actions host-only">
               <input id="search-packages" class="search-input" type="text" placeholder="Search packages..." oninput="renderPackages(dataCache.packages)">
               <span id="packages-loading" class="loading hidden"></span>
               <button class="btn btn-sm btn-export" onclick="exportJSON('packages')">Export JSON</button>
@@ -714,12 +726,12 @@
         <div class="panel">
           <div class="panel-header">
             <h3>Hardware-Backed Key Attestation <span id="hwtrust-count" style="color:var(--accent)"></span></h3>
-            <div class="panel-actions">
+            <div class="panel-actions host-only">
               <span id="hwtrust-loading" class="loading hidden"></span>
               <button class="btn btn-sm btn-export" onclick="exportJSON('hwtrust')">Export JSON</button>
             </div>
           </div>
-          <div style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap">
+          <div class="host-only" style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap">
             <button class="btn btn-sm" onclick="fetchCSR('default')">Get CSR (default)</button>
             <button class="btn btn-sm" onclick="fetchCSR('strongbox')">Get CSR (strongbox)</button>
             <button class="btn btn-sm" onclick="fetchCSR('tee')">Get CSR (TEE)</button>
@@ -733,13 +745,13 @@
             Collects all attestation/HW Trust data from adb shell context — no APK needed.
             Gathers KeyMint CSR, verified boot state, security HAL status, and Build properties.
           </div>
-          <div style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
+          <div class="host-only" style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
             <button class="btn" onclick="runAttestationProbe()">Run Probe</button>
             <button class="btn btn-sm" onclick="clearProbeDebug()">Clear Debug</button>
             <span id="apk-verify-loading" class="loading hidden"></span>
           </div>
           <div id="apk-verify-output"></div>
-          <div style="margin-top:0.5rem">
+          <div class="host-only" style="margin-top:0.5rem">
             <div style="font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim);margin-bottom:0.25rem">
               Debug console:
             </div>
@@ -753,38 +765,36 @@
 
       <!-- Shell Tab -->
       <div id="tab-shell" class="tab-content">
-        <div class="panel">
+        <div class="panel host-only">
           <div class="panel-header">
             <h3>ADB Shell</h3>
+            <div class="panel-actions">
+              <button class="btn btn-sm" onclick="clearShell()">Clear</button>
+            </div>
           </div>
-          <div style="padding:0 0 4px;font-size:13px;color:var(--muted);">Current directory: <strong id="shell-cwd">/</strong></div>
-          <div class="shell-bar">
-            <input id="shell-input" type="text" placeholder="adb shell command... (Tab to autocomplete paths)" onkeydown="handleShellKeydown(event)">
-            <button class="btn" onclick="runShell()">Run</button>
-            <button class="btn btn-sm" onclick="clearShell()">Clear</button>
+          <div class="terminal-console" id="shell-console" onclick="focusShellInput()">
+            <div id="shell-output" class="terminal-history"></div>
+            <div class="terminal-prompt-line">
+              <span class="terminal-prompt-label" id="shell-prompt-label">/ $</span>
+              <input id="shell-input" class="terminal-input" type="text" onkeydown="handleShellKeydown(event)" autocomplete="off" spellcheck="false" autocapitalize="off">
+            </div>
           </div>
-          <div id="shell-output" class="shell-output"></div>
         </div>
-      </div>
-    </div>
-
-    <!-- Remote Viewer Shell (shown only in remote-viewer mode) -->
-    <div id="viewer-shell-section" class="hidden">
-      <div class="device-header">
-        <h2>Remote Shell</h2>
-      </div>
-      <div class="panel">
-        <div class="panel-header">
-          <h3>Run a command on the host's connected device</h3>
+        <div class="panel viewer-only">
+          <div class="panel-header">
+            <h3>Remote Shell <span style="font-weight:400;color:var(--muted);font-size:calc(0.75rem * var(--font-scale))">(runs on the host's connected device)</span></h3>
+            <div class="panel-actions">
+              <button class="btn btn-sm" onclick="clearViewerShell()">Clear</button>
+            </div>
+          </div>
+          <div class="terminal-console" id="viewer-shell-console" onclick="focusViewerShellInput()">
+            <div id="viewer-shell-output" class="terminal-history"></div>
+            <div class="terminal-prompt-line">
+              <span class="terminal-prompt-label" id="viewer-prompt-label">none selected $</span>
+              <input id="viewer-shell-input" class="terminal-input" type="text" onkeydown="handleViewerShellKeydown(event)" autocomplete="off" spellcheck="false" autocapitalize="off">
+            </div>
+          </div>
         </div>
-        <div style="padding:4px 16px;font-size:13px;color:#a6adc6;">Target device: <strong id="viewer-shell-target">none selected</strong></div>
-        <div style="padding:0 16px 4px;font-size:13px;color:#a6adc6;">Current directory: <strong id="viewer-shell-cwd">/</strong></div>
-        <div class="shell-bar">
-          <input id="viewer-shell-input" type="text" placeholder="adb shell command... (Tab to autocomplete paths)" onkeydown="handleViewerShellKeydown(event)">
-          <button class="btn" onclick="sendRemoteCommand()">Run</button>
-          <button class="btn btn-sm" onclick="clearViewerShell()">Clear</button>
-        </div>
-        <div id="viewer-shell-output" class="shell-output"></div>
       </div>
     </div>
   </div>
@@ -803,6 +813,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080614"></script>
+<script type="module" src="bundle.js?v=2026080615"></script>
 </body>
 </html>
