@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.11.1';
+const APP_VERSION = '1.12.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -981,27 +981,10 @@ function selectDevice(serial) {
   document.getElementById('search-packages').value = '';
 
   // Clear live-tab outputs (these refresh on each switch)
-  ['hwtrust-output', 'rkp-output', 'attestation-output'].forEach(id => {
+  ['rkp-output', 'attestation-output'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = '';
   });
-
-  // Restore persisted probe results if cached (don't clear probe!)
-  const probeCache = dataCache.probeBySerial?.[serial];
-  const probeOut = document.getElementById('apk-verify-output');
-  const probeDebug = document.getElementById('apk-verify-debug');
-  if (probeCache && probeOut) {
-    probeOut.innerHTML = probeCache.output;
-  } else if (probeOut) {
-    probeOut.innerHTML = '';
-  }
-  if (probeDebug) {
-    probeDebug.textContent = dataCache.probeDebugBySerial?.[serial] || '';
-  }
-
-  // Reset HW trust count badge
-  const countEl = document.getElementById('hwtrust-count');
-  if (countEl) countEl.textContent = '';
 
   // Fetch all data for the new device (and mirror each tab's rendered result to any
   // connected viewers once it settles — see pushTabHtml()).
@@ -1531,7 +1514,7 @@ function broadcastDeviceState() {
   try { remoteSession.actions.devicePush.send(buildDeviceSnapshot()); } catch (_) {}
 }
 
-// Mirrors a data tab (Properties/Features/Packages/Attestation/RKP/HW Trust) to any
+// Mirrors a data tab (Properties/Features/Packages/Attestation/RKP) to any
 // connected viewers. Rather than re-deriving/re-transmitting each tab's structured data
 // (several different shapes, some assembled inline with no cached structure at all —
 // e.g. Attestation/RKP build their table rows and set innerHTML in one step), just
@@ -1805,7 +1788,6 @@ function mirroredTabElementIds() {
   return {
     props: 'props-output', features: 'features-output', packages: 'packages-output',
     attestation: 'attestation-output', rkp: 'rkp-output',
-    hwtrust: 'hwtrust-output', hwtrustProbe: 'apk-verify-output',
   };
 }
 
@@ -3045,19 +3027,6 @@ function exportJSON(type) {
       })),
     };
     fn = 'PackageDeviceInfo.deviceinfo.json';
-  } else if (type === 'hwtrust') {
-    const hw = dataCache.hwtrust || {};
-    json = {
-      csr: Object.entries(hw).map(([slot, v]) => ({
-        slot,
-        der_sha256: v.der_sha256 || '',
-        pem: v.pem || '',
-      })),
-    };
-    fn = 'HardwareTrustDeviceInfo.deviceinfo.json';
-  } else if (type === 'apk') {
-    json = { attestation_probe: dataCache.attestationProbe || null };
-    fn = 'AttestationProbeDeviceInfo.deviceinfo.json';
   } else return;
   const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -3105,15 +3074,9 @@ window.changeFontSize = changeFontSize;
 window.renderProperties = renderProperties;
 window.renderFeatures = renderFeatures;
 window.renderPackages = renderPackages;
-window.fetchCSR = (slot) => fetchCSR(slot).then(() => pushTabHtml('hwtrust', 'hwtrust-output'));
-window.copyCSR = copyCSR;
 window.clearShell = clearShell;
 window.focusShellInput = focusShellInput;
 window.focusViewerShellInput = focusViewerShellInput;
-window.runAttestationProbe = () => runAttestationProbe().then(() => pushTabHtml('hwtrustProbe', 'apk-verify-output'));
-window.clearProbeDebug = clearProbeDebug;
-window.fetchProbeDebugLogcat = fetchProbeDebugLogcat;
-window.copyProbeDebug = copyProbeDebug;
 window.connectAvailable = connectAvailable;
 window.showHelpModal = showHelpModal;
 window.toggleDeviceSelection = toggleDeviceSelection;
@@ -3322,396 +3285,8 @@ async function fetchRKP() {
   showLoading('rkp', false);
 }
 
-// --- Hardware Trust: KeyMint CSR retrieval ---
-async function fetchCSR(slot) {
-  const info = connectedDevices.get(activeSerial);
-  if (!info) return;
-  showLoading('hwtrust', true);
-  const out = document.getElementById('hwtrust-output');
-  try {
-    let csrText = '';
-    try {
-      csrText = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
-    } catch (e) {
-      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:#ff5252">Command failed: ' + esc(String(e.message || e)) + '</div></div>';
-      out.insertAdjacentHTML('beforeend', errHtml);
-      showLoading('hwtrust', false);
-      return;
-    }
-    csrText = (csrText || '').trim();
-
-    // Check for error messages (Identity service not available on many devices)
-    if (!csrText || /can.t find service|error|failed|usage|invalid/i.test(csrText)) {
-      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:var(--yellow)">Identity service not available on this device</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText) + '</div></div>';
-      out.insertAdjacentHTML('beforeend', errHtml);
-      showLoading('hwtrust', false);
-      return;
-    }
-
-    // Parse PEM (-----BEGIN CERTIFICATE REQUEST----- ... -----END CERTIFICATE REQUEST-----)
-    const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
-    if (!pemMatch) {
-      const errHtml = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header"><h4>CSR — ' + esc(slot) + '</h4></div><div style="color:#ff5252">No PEM certificate found in command output</div><div style="font-size:calc(0.7rem * var(--font-scale));color:var(--muted);margin-top:0.25rem">Raw: ' + esc(csrText.slice(0, 200)) + '</div></div>';
-      out.insertAdjacentHTML('beforeend', errHtml);
-      showLoading('hwtrust', false);
-      return;
-    }
-    const pem = pemMatch[0];
-
-    // Derive SHA-256 of the DER bytes (base64-decoded PEM body)
-    let derSha256 = '';
-    try {
-      const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      derSha256 = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-    } catch (e) {
-      derSha256 = '(unable to compute — ' + (e.message || e) + ')';
-    }
-
-    // Cache for export
-    if (!dataCache.hwtrust) dataCache.hwtrust = {};
-    dataCache.hwtrust[slot] = { pem, der_sha256: derSha256, raw: csrText };
-
-    // Count badge
-    const slots = Object.keys(dataCache.hwtrust);
-    const countEl = document.getElementById('hwtrust-count');
-    if (countEl) countEl.textContent = slots.length ? '(' + slots.length + ')' : '';
-
-    // Render: PEM in <pre> + copy button + SHA-256 chip
-    const html =
-      '<div class="panel" style="margin-top:0.5rem">' +
-      '<div class="panel-header">' +
-      '<h4>CSR — ' + esc(slot) + '</h4>' +
-      '<div class="panel-actions">' +
-      '<button class="btn btn-sm" onclick="copyCSR(\'' + esc(slot) + '\')">Copy PEM</button>' +
-      '</div>' +
-      '</div>' +
-      '<div style="font-family:monospace;font-size:calc(0.72rem * var(--font-scale));margin-bottom:0.4rem">' +
-      '<b>DER SHA-256:</b> <span style="word-break:break-all">' + esc(derSha256) + '</span>' +
-      '</div>' +
-      '<pre style="background:var(--bg);padding:0.6rem;border-radius:6px;overflow-x:auto;font-size:calc(0.7rem * var(--font-scale));white-space:pre-wrap;word-break:break-all;border:1px solid var(--border)">' +
-      esc(pem) +
-      '</pre>' +
-      '</div>';
-
-    out.insertAdjacentHTML('beforeend', html);
-  } catch (err) {
-    out.insertAdjacentHTML('beforeend',
-      '<div style="color:#ff5252;margin-top:0.5rem">' + esc(slot) + ' error: ' + esc(String(err.message || err)) + '</div>');
-  }
-  showLoading('hwtrust', false);
-}
-
-function copyCSR(slot) {
-  if (!dataCache.hwtrust || !dataCache.hwtrust[slot]) return;
-  navigator.clipboard.writeText(dataCache.hwtrust[slot].pem).then(() => {
-    setStatus('PEM copied (' + slot + ')', 'ok');
-  }).catch(e => {
-    setStatus('Copy failed: ' + e.message, 'err');
-  });
-}
-
-// --- APK probe removed (v1.1.14) — OEM ROMs block shell-launched app processes ---
-
-async function runAttestationProbe() {
-  const info = connectedDevices.get(activeSerial);
-  if (!info) { setStatus('No device connected', 'err'); return; }
-  const out = document.getElementById('apk-verify-output');
-  const dbg = document.getElementById('apk-verify-debug');
-  showLoading('apk-verify', true);
-  out.innerHTML = '<div style="font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">Running shell-based attestation probe...</div>';
-  if (dbg) dbg.textContent = '';
-
-  const dbgLog = (msg) => {
-    if (!dbg) return;
-    dbg.textContent += (dbg.textContent ? '\n' : '') + '[' +
-      new Date().toISOString().slice(11,19) + ' UTC / ' +
-      new Date(new Date().getTime() + 8*3600*1000).toISOString().slice(11,19) + ' TW] ' + msg;
-    dbg.scrollTop = dbg.scrollHeight;
-  };
-  const runShell = async (cmd, label) => {
-    dbgLog('> ' + (label || cmd));
-    try {
-      const result = await adbShell(info.adb, cmd + ' 2>&1');
-      dbgLog('  ' + String(result).replace(/\n/g, '\n  ').trim().slice(0, 300));
-      return result;
-    } catch (e) {
-      dbgLog('  ERROR: ' + (e.message || e));
-      throw e;
-    }
-  };
-
-  try {
-    const getprop = async (k) => {
-      try { return (await adbShell(info.adb, 'getprop ' + k)).trim(); } catch { return ''; }
-    };
-
-    // --- Build info ---
-    dbgLog('Collecting build properties...');
-    const build = {
-      manufacturer: await getprop('ro.product.manufacturer'),
-      model: await getprop('ro.product.model'),
-      brand: await getprop('ro.product.brand'),
-      device: await getprop('ro.product.device'),
-      product: await getprop('ro.product.name'),
-      hardware: await getprop('ro.hardware'),
-      fingerprint: await getprop('ro.build.fingerprint'),
-      release: await getprop('ro.build.version.release'),
-      sdk_int: await getprop('ro.build.version.sdk'),
-      security_patch: await getprop('ro.build.version.security_patch'),
-      bootloader: await getprop('ro.bootloader'),
-    };
-
-    // --- Verified Boot state ---
-    dbgLog('Collecting verified boot state...');
-    const verified_boot = {
-      verifiedbootstate: await getprop('ro.boot.verifiedbootstate'),
-      vbmeta_verify_state: await getprop('ro.boot.vbmeta.verify_state'),
-      vbmeta_device_state: await getprop('ro.boot.vbmeta.device_state'),
-      veritymode: await getprop('ro.boot.veritymode'),
-      flash_locked: await getprop('ro.boot.flash.locked'),
-      warranty_bit: await getprop('ro.boot.warranty_bit'),
-      avb_state: await getprop('ro.boot.vbmeta.avb_state'),
-    };
-
-    // --- Security / Trust hardware ---
-    dbgLog('Collecting security hardware properties...');
-    const security_hw = {
-      keystore: await getprop('ro.hardware.keystore'),
-      keystore2: await getprop('ro.hardware.keystore2'),
-      keymaster: await getprop('ro.hardware.keymaster'),
-      strongbox: await getprop('ro.hardware.strongbox'),
-      rkp_enabled: await getprop('ro.rkp.enabled'),
-      rkp: await getprop('ro.security.rkp'),
-    };
-
-    // --- Android ID ---
-    let android_id = '';
-    try { android_id = (await adbShell(info.adb, 'settings get secure android_id')).trim(); } catch {}
-
-    // --- HW Trust: cmd identity get_csr (shell context, no app needed) ---
-    dbgLog('Collecting HW Trust CSRs (cmd identity get_csr)...');
-    const hwtrust = {};
-    for (const slot of ['default', 'strongbox', 'tee']) {
-      try {
-        const csrOut = await adbShell(info.adb, 'cmd identity get_csr ' + slot + ' 2>&1');
-        const csrText = (csrOut || '').trim();
-
-        // Check for error messages (Identity service not available on many devices)
-        if (!csrText || /can.t find service|error|failed|usage|invalid/i.test(csrText)) {
-          hwtrust[slot] = {
-            available: false,
-            error: csrText || 'No output',
-            note: 'Identity service not available on this device',
-          };
-          dbgLog('  ' + slot + ': not available - ' + (csrText || 'no output'));
-          continue;
-        }
-
-        // Extract PEM
-        const pemMatch = csrText.match(/-----BEGIN CERTIFICATE REQUEST-----[\s\S]+?-----END CERTIFICATE REQUEST-----/);
-        if (!pemMatch) {
-          hwtrust[slot] = {
-            available: false,
-            error: 'No PEM certificate found in output',
-            raw: csrText,
-          };
-          dbgLog('  ' + slot + ': no PEM in output');
-          continue;
-        }
-
-        const pem = pemMatch[0];
-        let der_sha256 = '';
-        try {
-          const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
-          const bin = atob(b64);
-          const bytes = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-          const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
-          der_sha256 = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
-        } catch (e) {
-          der_sha256 = '(unable to compute - ' + (e.message || e) + ')';
-        }
-        hwtrust[slot] = { available: true, pem, der_sha256, raw_length: csrText.length };
-        dbgLog('  ' + slot + ': CSR obtained, DER SHA-256: ' + der_sha256.slice(0, 16) + '...');
-      } catch (e) {
-        hwtrust[slot] = { available: false, error: String(e.message || e) };
-        dbgLog('  ' + slot + ': error: ' + (e.message || e));
-      }
-    }
-
-    // --- KeyStore/KeyMint HAL check ---
-    dbgLog('Checking KeyStore/KeyMint HAL...');
-    let keystore = {};
-    try {
-      const ksOut = await adbShell(info.adb, 'cmd keystore 2>&1 | head -c 2048');
-      keystore = { available: !!ksOut.trim(), raw: ksOut.trim().slice(0, 500) };
-    } catch (e) {
-      keystore = { available: false, error: String(e.message || e) };
-    }
-
-    // --- Keystore services ---
-    const keystore_services = {};
-    try {
-      const svcOut = await adbShell(info.adb, 'service list 2>/dev/null');
-      for (const svc of ['android.security.keystore', 'android.hardware.keymaster', 'android.hardware.security.keymint']) {
-        keystore_services[svc] = svcOut.includes(svc);
-      }
-    } catch {}
-
-    // --- Signing cert (sample from 3rd-party packages) ---
-    let signing = {};
-    try {
-      const sigOut = await adbShell(info.adb, 'pm list packages -S -3 2>/dev/null | head -5 | cut -d= -f2');
-      if (sigOut.trim()) {
-        signing = { note: 'shell-probe shows sample 3rd-party cert', sample_3rd_party_certs: sigOut.trim() };
-      }
-    } catch {}
-
-    const result = {
-      source: 'shell-probe',
-      build,
-      android_id,
-      verified_boot,
-      security_hw,
-      hwtrust,
-      keystore,
-      keystore_services,
-      signing,
-      ts: new Date().toISOString(),
-    };
-    dbgLog('Shell probe collected ' + Object.keys(result).join(', '));
-
-    // Push JSON to device and read back
-    const json = JSON.stringify(result, null, 2);
-    const blob = new Blob([json], { type: 'application/json' });
-    const remotePath = '/data/local/tmp/webadb_attestation_shell.json';
-    const sync = await info.adb.sync();
-    try {
-      await sync.write({ filename: remotePath, file: blob.stream(), permission: 0o644 });
-    } finally {
-      await sync.dispose();
-    }
-    let probeJson = await readDeviceFile(info.adb, remotePath);
-    dbgLog('Wrote ' + probeJson.length + ' bytes via sync');
-
-    // Parse and render
-    const parsed = JSON.parse(probeJson);
-
-    const renderKV = (obj, prefix) => {
-      let html = '';
-      for (const k of Object.keys(obj || {})) {
-        const v = obj[k];
-        const fullKey = prefix ? prefix + '.' + k : k;
-        if (v && typeof v === 'object' && !Array.isArray(v)) {
-          // Recurse into objects, but skip empty sub-objects
-          const subHtml = renderKV(v, fullKey);
-          if (subHtml) html += subHtml;
-        } else if (Array.isArray(v)) {
-          html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
-            '</span><span>[' + v.length + ' item' + (v.length === 1 ? '' : 's') + ']</span></div>';
-          v.forEach((item, i) => {
-            if (item && typeof item === 'object') {
-              html += '<div style="margin-left:1rem;border-left:2px solid var(--border);padding-left:0.5rem">' +
-                renderKV(item, fullKey + '[' + i + ']') + '</div>';
-            } else if (item !== '' && item !== null && item !== undefined) {
-              html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' +
-                esc(fullKey + '[' + i + ']') + '</span><span>' + esc(String(item)) + '</span></div>';
-            }
-          });
-        } else if (v === '' || v === null || v === undefined) {
-          // Skip empty values
-        } else {
-          const statusColor = v === false ? 'color:var(--red)' : v === true ? 'color:var(--green)' : '';
-          html += '<div class="pkg-detail-row"><span class="pkg-detail-label">' + esc(fullKey) +
-            '</span><span style="word-break:break-all;' + statusColor + '">' + esc(String(v)) + '</span></div>';
-        }
-      }
-      return html;
-    };
-
-    // Custom rendering for hwtrust to show clean status
-    let hwtrustHtml = '';
-    for (const slot of ['default', 'strongbox', 'tee']) {
-      const h = parsed.hwtrust?.[slot];
-      if (h && h.available) {
-        hwtrustHtml += '<div class="pkg-detail-row"><span class="pkg-detail-label">hwtrust.' + esc(slot) + '.status</span><span style="color:var(--green)">CSR obtained</span></div>';
-        hwtrustHtml += '<div class="pkg-detail-row"><span class="pkg-detail-label">hwtrust.' + esc(slot) + '.der_sha256</span><span style="word-break:break-all">' + esc(h.der_sha256) + '</span></div>';
-      } else {
-        hwtrustHtml += '<div class="pkg-detail-row"><span class="pkg-detail-label">hwtrust.' + esc(slot) + '.status</span><span style="color:var(--yellow)">Identity service not available (device does not support cmd identity)</span></div>';
-      }
-    }
-
-    let html = '<div class="panel" style="margin-top:0.5rem"><div class="panel-header">' +
-      '<h4>Attestation Probe Result (shell-probe)</h4>' +
-      '<span style="font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim)">' +
-      esc(parsed.build?.fingerprint || '') + '</span>' +
-      '</div>';
-    // Render sections with clean hwtrust output
-    for (const key of ['build', 'android_id', 'verified_boot', 'security_hw', 'keystore', 'keystore_services', 'signing']) {
-      if (parsed[key]) {
-        const subHtml = renderKV({[key]: parsed[key]}, '');
-        if (subHtml) html += subHtml;
-      }
-    }
-    html += hwtrustHtml;
-    html += '</div>';
-    out.innerHTML = html;
-
-    dataCache.attestationProbe = parsed;
-    // Persist probe results per device so they survive device switches
-    if (!dataCache.probeBySerial) dataCache.probeBySerial = {};
-    dataCache.probeBySerial[activeSerial] = { output: out.innerHTML };
-    if (!dataCache.probeDebugBySerial) dataCache.probeDebugBySerial = {};
-    const dbg = document.getElementById('apk-verify-debug');
-    if (dbg) dataCache.probeDebugBySerial[activeSerial] = dbg.textContent;
-    setStatus('Attestation probe complete', 'ok');
-
-    // Cleanup
-    try { await adbShell(info.adb, 'rm -f ' + remotePath); } catch (_) {}
-  } catch (err) {
-    out.innerHTML = '<div style="color:#ff5252">' + esc(String(err.message || err)) + '</div>';
-    setStatus('Probe failed: ' + (err.message || err), 'err');
-  }
-  showLoading('apk-verify', false);
-}
-
 function clearShell() {
   const el = document.getElementById('shell-output');
   if (el) el.textContent = '';
 }
 
-// --- Debug console helpers ---
-function clearProbeDebug() {
-  const dbg = document.getElementById('apk-verify-debug');
-  if (dbg) dbg.textContent = '';
-}
-
-async function fetchProbeDebugLogcat() {
-  const info = connectedDevices.get(activeSerial);
-  if (!info) return;
-  const dbg = document.getElementById('apk-verify-debug');
-  if (dbg) dbg.textContent += (dbg.textContent ? '\n' : '') +
-    '[logcat] fetching WebAdbProbe:* lines...';
-  try {
-    // -d = dump and exit (don't follow), -t 100 = last 100 lines,
-    // -s WebAdbProbe:V AndroidRuntime:E *:S = filter to our tag + crashes.
-    const out = await adbShell(info.adb,
-      'logcat -d -t 200 -s WebAdbProbe:V WebAdbBoot:V AndroidRuntime:E *:S 2>&1');
-    if (dbg) dbg.textContent += '\n--- logcat ---\n' + out + '\n--- end ---';
-  } catch (e) {
-    if (dbg) dbg.textContent += '\n[logcat] error: ' + (e.message || e);
-  }
-}
-
-function copyProbeDebug() {
-  const dbg = document.getElementById('apk-verify-debug');
-  if (!dbg || !dbg.textContent) return;
-  navigator.clipboard.writeText(dbg.textContent).then(() => {
-    setStatus('Debug log copied', 'ok');
-  }).catch(e => {
-    setStatus('Copy failed: ' + e.message, 'err');
-  });
-}

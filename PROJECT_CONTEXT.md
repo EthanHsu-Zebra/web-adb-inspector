@@ -187,15 +187,16 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 | Features | `fetchFeatures()` | `adb.features()`, SDK feature classification |
 | Packages | `fetchPackages()` | `dumpsys package` parser (primary) + `pm list packages` fallback |
 | Attestation | `fetchAttestation()` | Verified Boot, VBMeta, DM-Verity, Flash Lock, KeyMint, StrongBox |
-| CSR | `fetchCSR(slot)` | KeyMint CSR via `cmd identity get_csr` |
 | RKP | `fetchRKP()` | Google server ping, KeyMint provider, HAL service checks |
 | Shell | `runShell()` | Custom ADB shell commands |
-| Probe | `runAttestationProbe()` | Ships APK to device, runs probe, retrieves results |
 | JSON Export | `exportJSON()` | CTS-compatible `DeviceInfo.deviceinfo.json` |
 | Nicknames | `setNickname()` | Persistent device nicknames (localStorage) |
 | Font Size | `changeFontSize()` | Text scaling (localStorage) |
 
 ## 7. Known Bugs and Fixes
+
+### v1.12.0 — removed the HW Trust tab
+Removed entirely, at request: the tab bar entry, the `#tab-hwtrust` content block (Get CSR buttons + `#hwtrust-output`, the Attestation Probe section + `#apk-verify-output`/`#apk-verify-debug`), and every backing function — `fetchCSR()`/`copyCSR()`, `runAttestationProbe()`, `clearProbeDebug()`/`fetchProbeDebugLogcat()`/`copyProbeDebug()` — plus their `window.*` exposures, the `exportJSON()` `'hwtrust'`/`'apk'` branches (the latter was already dead code — nothing in the UI ever called `exportJSON('apk')`), `selectDevice()`'s HW-Trust-specific reset/restore code, and the `hwtrust`/`hwtrustProbe` entries from `mirroredTabElementIds()` (the viewer-mirroring map added in v1.11.0). Properties/Features/Packages/Attestation/RKP and the Shell tabs are unaffected, on both host and viewer.
 
 ### v1.11.1 — late-joining viewers never got any tab data
 Every non-Shell tab showed "Waiting for host data…" indefinitely for the reported case. Root cause: `pushTabHtml()` only fires when the host *freshly fetches* a tab — i.e. on `selectDevice()`'s auto-fetch, or a manual CSR/probe click. The common flow is host connects a device (which selects and fetches it) *then* clicks Share — so by the time a viewer joins, that one-time fetch-and-broadcast has already happened and nothing re-triggers it just because someone new showed up.

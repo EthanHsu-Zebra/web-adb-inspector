@@ -650,7 +650,6 @@
         <div class="tab" onclick="switchTab(this, 'tab-packages')">Packages</div>
         <div class="tab" onclick="switchTab(this, 'tab-attestation')">Attestation</div>
         <div class="tab" onclick="switchTab(this, 'tab-rkp')">RKP</div>
-        <div class="tab" onclick="switchTab(this, 'tab-hwtrust')">HW Trust</div>
         <div class="tab" id="tab-btn-shell" onclick="switchTab(this, 'tab-shell')">Shell</div>
       </div>
 
@@ -721,48 +720,6 @@
         </div>
       </div>
 
-      <!-- Hardware Trust Tab -->
-      <div id="tab-hwtrust" class="tab-content">
-        <div class="panel">
-          <div class="panel-header">
-            <h3>Hardware-Backed Key Attestation <span id="hwtrust-count" style="color:var(--accent)"></span></h3>
-            <div class="panel-actions host-only">
-              <span id="hwtrust-loading" class="loading hidden"></span>
-              <button class="btn btn-sm btn-export" onclick="exportJSON('hwtrust')">Export JSON</button>
-            </div>
-          </div>
-          <div class="host-only" style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap">
-            <button class="btn btn-sm" onclick="fetchCSR('default')">Get CSR (default)</button>
-            <button class="btn btn-sm" onclick="fetchCSR('strongbox')">Get CSR (strongbox)</button>
-            <button class="btn btn-sm" onclick="fetchCSR('tee')">Get CSR (TEE)</button>
-          </div>
-          <div id="hwtrust-output"></div>
-
-          <div class="panel-header" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:0.75rem">
-            <h3>Attestation Probe (shell-only)</h3>
-          </div>
-          <div style="margin-bottom:0.5rem;font-size:calc(0.75rem * var(--font-scale));color:var(--text-dim)">
-            Collects all attestation/HW Trust data from adb shell context — no APK needed.
-            Gathers KeyMint CSR, verified boot state, security HAL status, and Build properties.
-          </div>
-          <div class="host-only" style="margin-bottom:0.75rem;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
-            <button class="btn" onclick="runAttestationProbe()">Run Probe</button>
-            <button class="btn btn-sm" onclick="clearProbeDebug()">Clear Debug</button>
-            <span id="apk-verify-loading" class="loading hidden"></span>
-          </div>
-          <div id="apk-verify-output"></div>
-          <div class="host-only" style="margin-top:0.5rem">
-            <div style="font-size:calc(0.7rem * var(--font-scale));color:var(--text-dim);margin-bottom:0.25rem">
-              Debug console:
-            </div>
-            <div style="display:flex;gap:0.25rem;margin-bottom:0.25rem">
-              <button class="btn btn-sm" onclick="copyProbeDebug()">Copy debug log</button>
-            </div>
-            <pre id="apk-verify-debug" style="background:var(--bg);padding:0.5rem;border-radius:6px;font-size:calc(0.65rem * var(--font-scale));max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;border:1px solid var(--border);margin:0;font-family:monospace"></pre>
-          </div>
-        </div>
-      </div>
-
       <!-- Shell Tab -->
       <div id="tab-shell" class="tab-content">
         <div class="panel host-only">
@@ -813,6 +770,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080616"></script>
+<script type="module" src="bundle.js?v=2026080617"></script>
 </body>
 </html>
