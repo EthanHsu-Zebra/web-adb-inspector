@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.17.1';
+const APP_VERSION = '1.17.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -760,11 +760,17 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
     }
     debugLogPush(`connectDevice SUCCESS: serial=${adbSerial} display=${displayName} usb=${usbId.vendorId}:${usbId.productId}:${usbId.serial || '(none)'}`, 'ok');
     renderDeviceList();
-    if (connectedDevices.size === 1) selectDevice(adbSerial);
-    // Second+ device connected while already sharing — it won't get auto-selected (so
-    // nothing would otherwise ever fetch its tab data), but a viewer could pick it right
-    // away. See prefetchTabsForViewers()'s comment.
-    else if (remoteSession && remoteSession.role === 'host') prefetchTabsForViewers(adbSerial);
+    if (connectedDevices.size === 1) {
+      selectDevice(adbSerial);
+    } else if (remoteSession && remoteSession.role === 'host') {
+      // Second+ device connected while already sharing — it won't get auto-selected (so
+      // nothing would otherwise ever fetch its tab data), but a viewer could pick it
+      // right away. See prefetchTabsForViewers()'s comment.
+      debugLogPush(`connectDevice SUCCESS: triggering prefetchTabsForViewers(${adbSerial}) (not first device, already sharing)`, 'evt');
+      prefetchTabsForViewers(adbSerial);
+    } else {
+      debugLogPush(`connectDevice SUCCESS: NOT prefetching for ${adbSerial} (not first device, not sharing yet — will run when/if a share session starts)`, 'evt');
+    }
     setStatus('Connected', 'ok');
     return true;
 
@@ -1699,8 +1705,12 @@ function startShareSession() {
   // (which is already fresh from being selected), has never had its tab data fetched —
   // see prefetchTabsForViewers()'s comment. Fire-and-forget, one per device, concurrently
   // (each targets a different device's own independent WebUSB/ADB connection).
+  debugLogPush(`startShareSession: connectedDevices=[${Array.from(connectedDevices.keys()).join(', ')}] activeSerial=${activeSerial}`, 'evt');
   for (const serial of connectedDevices.keys()) {
-    if (serial !== activeSerial) prefetchTabsForViewers(serial);
+    if (serial !== activeSerial) {
+      debugLogPush(`startShareSession: triggering prefetchTabsForViewers(${serial})`, 'evt');
+      prefetchTabsForViewers(serial);
+    }
   }
   showShareModal();
 }
@@ -1745,22 +1755,41 @@ function broadcastDeviceState() {
 // arrays the viewer doesn't have, so they're hidden in viewer mode (.host-only) rather
 // than silently doing nothing.
 function pushTabHtml(tab, elementId, target) {
-  if (!remoteSession || remoteSession.role !== 'host' || !activeSerial) return;
+  if (!remoteSession || remoteSession.role !== 'host') {
+    debugLogPush(`pushTabHtml(${tab}): skipped — not sharing as host`, 'warn');
+    return;
+  }
+  if (!activeSerial) {
+    debugLogPush(`pushTabHtml(${tab}): skipped — no activeSerial`, 'warn');
+    return;
+  }
   const el = document.getElementById(elementId);
-  if (!el) return;
+  if (!el) {
+    debugLogPush(`pushTabHtml(${tab}): skipped — element #${elementId} not found`, 'err');
+    return;
+  }
   if (!hostTabHtmlCache[activeSerial]) hostTabHtmlCache[activeSerial] = {};
   hostTabHtmlCache[activeSerial][tab] = el.innerHTML;
-  try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }, target ? { target } : undefined); } catch (_) {}
+  debugLogPush(`pushTabHtml: serial=${activeSerial} tab=${tab} htmlLen=${el.innerHTML.length} target=${target || 'broadcast'}`, 'evt');
+  try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }, target ? { target } : undefined); } catch (err) {
+    debugLogPush(`pushTabHtml: send threw: ${err && err.message || err}`, 'err');
+  }
 }
 
 // Same caching+broadcast as pushTabHtml(), but for a specific serial directly rather than
 // always "whatever's currently active" — used by prefetchTabsForViewers() below, which
 // computes html for a device that ISN'T necessarily the one on screen right now.
 function cacheAndBroadcastTabHtml(serial, tab, html) {
-  if (!remoteSession || remoteSession.role !== 'host') return;
+  if (!remoteSession || remoteSession.role !== 'host') {
+    debugLogPush(`cacheAndBroadcastTabHtml(${serial}, ${tab}): skipped — not sharing as host`, 'warn');
+    return;
+  }
   if (!hostTabHtmlCache[serial]) hostTabHtmlCache[serial] = {};
   hostTabHtmlCache[serial][tab] = html;
-  try { remoteSession.actions.tabDataPush.send({ serial, tab, html }); } catch (_) {}
+  debugLogPush(`cacheAndBroadcastTabHtml: serial=${serial} tab=${tab} htmlLen=${html.length}`, 'evt');
+  try { remoteSession.actions.tabDataPush.send({ serial, tab, html }); } catch (err) {
+    debugLogPush(`cacheAndBroadcastTabHtml: send threw: ${err && err.message || err}`, 'err');
+  }
 }
 
 // connectDeviceExclusive() only auto-selects the FIRST device it connects
@@ -1780,27 +1809,44 @@ function cacheAndBroadcastTabHtml(serial, tab, html) {
 // that tab locally. Only called when a remote session is actually active as host (see call
 // sites), so purely-local usage never pays this extra background cost.
 async function prefetchTabsForViewers(serial) {
+  debugLogPush(`prefetchTabsForViewers(${serial}): starting`, 'evt');
   const info = connectedDevices.get(serial);
-  if (!info) return;
+  if (!info) {
+    debugLogPush(`prefetchTabsForViewers(${serial}): aborted — not in connectedDevices`, 'err');
+    return;
+  }
   try {
     const text = await adbShell(info.adb, 'getprop');
-    cacheAndBroadcastTabHtml(serial, 'props', propsToHtml(parseGetprop(text), ''));
-  } catch (_) {}
+    const props = parseGetprop(text);
+    debugLogPush(`prefetchTabsForViewers(${serial}): props parsed ${props.length} entries from ${text.length} chars`, 'ok');
+    cacheAndBroadcastTabHtml(serial, 'props', propsToHtml(props, ''));
+  } catch (err) {
+    debugLogPush(`prefetchTabsForViewers(${serial}): props FAILED: ${err && err.message || err}`, 'err');
+  }
   try {
     const text = await adbShell(info.adb, 'pm list features');
-    cacheAndBroadcastTabHtml(serial, 'features', featuresToHtml(parsePmListFeatures(text), ''));
-  } catch (_) {}
+    const features = parsePmListFeatures(text);
+    debugLogPush(`prefetchTabsForViewers(${serial}): features parsed ${features.length} entries from ${text.length} chars`, 'ok');
+    cacheAndBroadcastTabHtml(serial, 'features', featuresToHtml(features, ''));
+  } catch (err) {
+    debugLogPush(`prefetchTabsForViewers(${serial}): features FAILED: ${err && err.message || err}`, 'err');
+  }
   try {
     const text = await adbShell(info.adb, 'dumpsys package 2>&1');
     let packages = parseDumpsysPackage(text);
     let fallback = false, method = 'dumpsys';
     if (packages.length === 0) {
+      debugLogPush(`prefetchTabsForViewers(${serial}): dumpsys parsed 0 packages from ${text.length} chars, trying pm list fallback`, 'warn');
       const text2 = await adbShell(info.adb, 'pm list packages -f -u');
       packages = parsePmListPackagesFallback(text2);
       fallback = true; method = 'pm-list';
     }
+    debugLogPush(`prefetchTabsForViewers(${serial}): packages parsed ${packages.length} entries (method=${method})`, packages.length > 0 ? 'ok' : 'warn');
     if (packages.length > 0) cacheAndBroadcastTabHtml(serial, 'packages', packagesToHtml(packages, fallback, method, ''));
-  } catch (_) {}
+  } catch (err) {
+    debugLogPush(`prefetchTabsForViewers(${serial}): packages FAILED: ${err && err.message || err}`, 'err');
+  }
+  debugLogPush(`prefetchTabsForViewers(${serial}): done, hostTabHtmlCache now has [${Object.keys(hostTabHtmlCache[serial] || {}).join(', ')}]`, 'evt');
 }
 
 function handleViewerHello(data, peerId) {
@@ -1828,9 +1874,13 @@ function handleViewerHello(data, peerId) {
   // avoids the identity-matching problem entirely, at the cost of also re-sending this
   // cached data to every OTHER already-connected viewer — harmless (they just re-cache
   // the same html) and rare (only fires when someone new joins).
+  const cachedSerials = Object.keys(hostTabHtmlCache);
+  debugLogPush(`handleViewerHello: dumping hostTabHtmlCache for serials=[${cachedSerials.join(', ')}] to peerId=${peerId}`, 'evt');
   for (const [serial, tabs] of Object.entries(hostTabHtmlCache)) {
     for (const [tab, html] of Object.entries(tabs)) {
-      try { remoteSession.actions.tabDataPush.send({ serial, tab, html }); } catch (_) {}
+      try { remoteSession.actions.tabDataPush.send({ serial, tab, html }); } catch (err) {
+        debugLogPush(`handleViewerHello: send failed for serial=${serial} tab=${tab}: ${err && err.message || err}`, 'err');
+      }
     }
   }
   updateShareModalViewerCount();
@@ -2194,7 +2244,10 @@ function joinAsViewer(roomId, password) {
     if (cb) { remoteSession.pendingCompletions.delete(requestId); cb(ok ? (entries || []) : []); }
   };
   actions.tabDataPush.onMessage = (data, ctx) => {
-    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    if (ctx.peerId !== remoteSession.hostPeerId) {
+      debugLogPush(`remote (viewer): tabDataPush IGNORED — from peerId=${ctx.peerId}, expected hostPeerId=${remoteSession.hostPeerId} (serial=${data?.serial} tab=${data?.tab})`, 'warn');
+      return;
+    }
     handleTabDataPush(data);
   };
   actions.controlResponse.onMessage = (data, ctx) => {
@@ -2308,7 +2361,11 @@ function mirroredTabElementIds() {
 
 function handleTabDataPush(data) {
   const { serial, tab, html } = data || {};
-  if (!serial || !tab || !mirroredTabElementIds()[tab]) return;
+  if (!serial || !tab || !mirroredTabElementIds()[tab]) {
+    debugLogPush(`handleTabDataPush: ignored malformed/unknown message: ${JSON.stringify(data && { serial: data.serial, tab: data.tab })}`, 'warn');
+    return;
+  }
+  debugLogPush(`handleTabDataPush: received serial=${serial} tab=${tab} htmlLen=${(html || '').length} (mirror.activeSerial=${remoteSession.mirror.activeSerial})`, 'evt');
   if (!remoteSession.mirror.tabHtml) remoteSession.mirror.tabHtml = {};
   if (!remoteSession.mirror.tabHtml[serial]) remoteSession.mirror.tabHtml[serial] = {};
   remoteSession.mirror.tabHtml[serial][tab] = html;
@@ -2323,6 +2380,7 @@ function handleTabDataPush(data) {
 // anything for it yet), the same way switchMirrorShellOutput() does for the console.
 function applyMirroredTabsForSerial(serial) {
   const cached = (serial && remoteSession.mirror.tabHtml?.[serial]) || {};
+  debugLogPush(`applyMirroredTabsForSerial(${serial}): cached tabs=[${Object.keys(cached).join(', ')}] out of known=[${Object.keys(mirroredTabElementIds()).join(', ')}]`, 'evt');
   for (const [tab, elementId] of Object.entries(mirroredTabElementIds())) {
     const el = document.getElementById(elementId);
     if (el) el.innerHTML = cached[tab] || '<div class="empty-hint">Waiting for host data…</div>';
