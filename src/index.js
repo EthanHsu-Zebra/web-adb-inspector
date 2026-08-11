@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.17.2';
+const APP_VERSION = '1.18.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1701,11 +1701,27 @@ function startShareSession() {
   };
 
   debugLogPush(`remote session started: roomId=${roomId} appId=${REMOTE_APP_ID}`, 'ok');
-  // Any device connected BEFORE sharing started, other than the currently-active one
-  // (which is already fresh from being selected), has never had its tab data fetched —
-  // see prefetchTabsForViewers()'s comment. Fire-and-forget, one per device, concurrently
-  // (each targets a different device's own independent WebUSB/ADB connection).
   debugLogPush(`startShareSession: connectedDevices=[${Array.from(connectedDevices.keys()).join(', ')}] activeSerial=${activeSerial}`, 'evt');
+  // BUG FOUND (2026-08-11, real viewer debug log): activeSerial's own tab data was
+  // ASSUMED already cached ("already fresh from being selected") and skipped here — but
+  // pushTabHtml() (called from selectDevice()'s fetch chain) silently no-ops whenever
+  // remoteSession is null, which it always is at the moment a device connects/gets
+  // auto-selected BEFORE the host has ever clicked Share. In that (the NORMAL) ordering —
+  // connect a device first, share second — activeSerial's data was fetched into the live
+  // DOM just fine, but never made it into hostTabHtmlCache at all, since nothing re-runs
+  // those fetches later. Confirmed: viewer log showed the non-active (prefetched) device's
+  // tabs rendering correctly while the ACTIVE device stayed "Waiting for host data…"
+  // forever. Fix: explicitly (re-)broadcast activeSerial's already-rendered tab HTML now,
+  // pulling straight from the live DOM (cheap — no new adb round-trips needed, the host is
+  // already looking at this exact data) instead of assuming it's already cached.
+  if (activeSerial) {
+    for (const [tab, elementId] of Object.entries(mirroredTabElementIds())) {
+      pushTabHtml(tab, elementId);
+    }
+  }
+  // Any OTHER device connected before sharing started has never had its tab data fetched
+  // at all — see prefetchTabsForViewers()'s comment. Fire-and-forget, one per device,
+  // concurrently (each targets a different device's own independent WebUSB/ADB connection).
   for (const serial of connectedDevices.keys()) {
     if (serial !== activeSerial) {
       debugLogPush(`startShareSession: triggering prefetchTabsForViewers(${serial})`, 'evt');
