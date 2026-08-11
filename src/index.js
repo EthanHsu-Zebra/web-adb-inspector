@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.17.0';
+const APP_VERSION = '1.17.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -812,25 +812,35 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
 
 // Serializes every actual connectDeviceExclusive() attempt (across ALL devices, not just
 // retries of the same one) behind a simple promise-chain mutex — the backoff WAITS between
-// retries are NOT held under this lock (only each individual attempt is), so two devices
-// being connected around the same time don't block each other for a full ~45s retry cycle,
-// but their risky open()/reset()/close() sequences can also never overlap in time.
 // Confirmed via a real Linux multi-device debug log (2026-08-11): connecting a second
 // device while a first one is already connected (or being connected) can trigger a
 // spurious 'disconnect' for the OTHER device — almost certainly a bus-level reset ripple
-// across a shared hub/controller. That's an inherent USB/hardware quirk this app can't
-// fully prevent, but letting two connectDeviceExclusive() calls run their open/reset/close
-// sequences at the literal same instant only makes it more likely; serializing them is a
-// real (if partial) mitigation, not just a band-aid on the symptom (see
-// pendingAutoReconnect above for the complementary self-healing side of this fix).
-let connectQueue = Promise.resolve();
-function connectDevice(usbDevice, opts = {}) {
-  const run = connectQueue.then(
-    () => connectDeviceExclusive(usbDevice, opts),
-    () => connectDeviceExclusive(usbDevice, opts),
-  );
-  connectQueue = run.then(() => {}, () => {});
-  return run;
+// across a shared hub/controller from connectDeviceExclusive()'s pre-emptive
+// open()/reset()/close() sequence. That's an inherent USB/hardware quirk this app can't
+// fully prevent, but letting two of those sequences run at the literal same instant only
+// makes it more likely.
+//
+// v1.16.1 originally "fixed" this with a promise-chain mutex around the WHOLE
+// connectDeviceExclusive() call, including AdbDaemonTransport.authenticate() — which can
+// legitimately take an unbounded amount of time (it can be waiting on the user to accept
+// an on-device RSA key confirmation prompt). A real Windows debug log confirmed the
+// resulting bug: a second device's connect stalled after usbDevice.connect() resolved (no
+// SUCCESS, no FAILED, ever) and the app just went quiet — because that mutex design means
+// ONE stuck/slow connect call permanently jams every future connectDevice() call behind
+// it, forever, with zero visible error (the queue promise never settles either way).
+//
+// Fixed by staggering call STARTS instead of serializing whole calls: enforce a minimum
+// gap between when consecutive connectDeviceExclusive() calls begin (comfortably longer
+// than the observed reset/open/close duration, ~1s in practice), but never wait on a
+// previous call's actual completion. Worst case this adds a flat ~1.2s delay before a
+// connect attempt starts; it can never block indefinitely on another device's hang.
+const MIN_CONNECT_START_GAP_MS = 1200;
+let lastConnectStartAt = 0;
+async function connectDevice(usbDevice, opts = {}) {
+  const wait = Math.max(0, (lastConnectStartAt + MIN_CONNECT_START_GAP_MS) - Date.now());
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastConnectStartAt = Date.now();
+  return connectDeviceExclusive(usbDevice, opts);
 }
 
 // --- Shell ---
