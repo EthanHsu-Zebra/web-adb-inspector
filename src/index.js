@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.15.0';
+const APP_VERSION = '1.16.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -144,9 +144,14 @@ function isSDKFeature(n) { return SDK_PREFIXES.some(p => n.startsWith(p)); }
     }
   })();
   applyFontSize();
-  // Show version in header
+  // Show version in header (host) and in the viewer banner (viewer) — same string, two
+  // spots, since the viewer never sees the host's header controls but should still be
+  // able to tell which build they loaded (e.g. to confirm a hard-refresh actually
+  // picked up a new deploy).
   const verEl = document.getElementById('header-version');
   if (verEl) verEl.textContent = 'v' + APP_VERSION;
+  const viewerVerEl = document.getElementById('viewer-version');
+  if (viewerVerEl) viewerVerEl.textContent = 'v' + APP_VERSION;
 })();
 
 function checkWebUSB() {
@@ -1471,25 +1476,35 @@ function makeRemoteActions(room, roomId, password, label) {
     deliver(action, data, { peerId: envelope.from });
   });
 
-  // screenFrame/inputEvent were originally P2P-only (skipping the line below) on the
-  // theory that they're high-frequency and a WS-relay round trip would be too slow to
-  // make remote control usable anyway. Reverted after real-world testing (2026-08-11):
-  // on a viewer whose network doesn't establish real P2P at all (the same class of
-  // Zscaler-style restriction that motivated the fallback channel in the first place),
-  // that made screen control silently non-functional beyond the initial grant handshake
-  // — the grant/deny round trip worked (dual-transport), but no frame or tap ever
-  // arrived. Reliability on the networks this app actually gets used on beats the
-  // relay-load savings; the grantId+seq scoping already handles the resulting
-  // cross-transport reordering/double-delivery correctly (a frame or input event is
-  // dropped if its seq isn't strictly greater than the last one accepted for that
-  // grantId), so there's no correctness cost to sending these over both transports.
+  // screenFrame/inputEvent were originally P2P-only, then made fully dual-transport
+  // (2026-08-11) after a P2P-less viewer's screen never worked at all — the grant/deny
+  // round trip worked (dual-transport), but no frame or tap ever arrived. That fixed
+  // correctness but hurt speed: encryptForFallback() JSON.stringifies the whole
+  // envelope, runs AES-GCM, then JSON.stringifies the ciphertext AGAIN as a plain array
+  // of numbers — all synchronous main-thread work that scales with payload size, paid
+  // on every single frame even when P2P is working fine, directly competing with the
+  // fps this feature needs. Fixed properly by making it adaptive: skip the fallback
+  // send for these two actions specifically when room.getPeers() shows an active P2P
+  // connection to this exact target already — falling back only for a target with no
+  // such entry (unknown, or genuinely fallback-only/Zscaler-style). Gets both: full
+  // speed when P2P works, full reliability when it doesn't.
+  const HIGH_FREQUENCY_ACTIONS = new Set(['screenFrame', 'inputEvent']);
+
   function wrap(name) {
     const real = room.makeAction(name);
     real.onMessage = (data, ctx) => deliver(name, data, ctx);
+    const highFrequency = HIGH_FREQUENCY_ACTIONS.has(name);
     return {
       send: (data, opts) => {
-        try { real.send(data, opts); } catch (_) {}
-        fallback.send({ action: name, from: sessionId, target: opts?.target, data });
+        // real.send() is async (trystero) — a plain try/catch around the call doesn't
+        // catch a later rejection, since the throw happens after this line already
+        // returned. Wrap in Promise.resolve() so a failed send can't become an
+        // unhandled-rejection console error.
+        try { Promise.resolve(real.send(data, opts)).catch(() => {}); } catch (_) {}
+        const targetHasP2P = opts?.target && !!room.getPeers()[opts.target];
+        if (!(highFrequency && targetHasP2P)) {
+          fallback.send({ action: name, from: sessionId, target: opts?.target, data });
+        }
       },
       get onMessage() { return dispatchers[name]; },
       set onMessage(handler) { dispatchers[name] = handler; },
@@ -1595,7 +1610,7 @@ function startShareSession() {
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room, roomId, password, 'host');
-  remoteSession = { role: 'host', room, roomId, password, viewers: new Set(), actions };
+  remoteSession = { role: 'host', room, roomId, password, viewers: new Set(), actions, controlBySerial: new Map(), controlRequestQueue: [] };
   pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
@@ -1678,9 +1693,22 @@ function handleViewerHello(data, peerId) {
   // since nothing re-triggers a fetch just because someone new joined. Catch this viewer
   // up with hostTabHtmlCache's full history instead of just the live DOM, so it covers
   // every device the host has visited this session, not only whichever is active right now.
+  //
+  // Deliberately BROADCAST (no target), not targeted at peerId: hello arrives via
+  // whichever transport happens to deliver it, and ctx.peerId is a DIFFERENT string
+  // depending on which one (real trystero peerId vs. the fallback's per-tab session
+  // UUID — see makeRemoteActions()). A targeted tabDataPush.send(data, {target: peerId})
+  // built from that peerId only actually reaches the viewer over the transport whose
+  // own identity matches it — the other transport's own target check silently drops it
+  // — so if the transport that happened to deliver this hello isn't the one this viewer
+  // is actually reachable on, the whole catch-up dump was silently lost (this is the
+  // root cause of a real "every tab shows Waiting for host data" report). Broadcasting
+  // avoids the identity-matching problem entirely, at the cost of also re-sending this
+  // cached data to every OTHER already-connected viewer — harmless (they just re-cache
+  // the same html) and rare (only fires when someone new joins).
   for (const [serial, tabs] of Object.entries(hostTabHtmlCache)) {
     for (const [tab, html] of Object.entries(tabs)) {
-      try { remoteSession.actions.tabDataPush.send({ serial, tab, html }, { target: peerId }); } catch (_) {}
+      try { remoteSession.actions.tabDataPush.send({ serial, tab, html }); } catch (_) {}
     }
   }
   updateShareModalViewerCount();
@@ -1689,58 +1717,73 @@ function handleViewerHello(data, peerId) {
 function handlePeerLeaveHost(peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   remoteSession.viewers.delete(peerId);
-  if (remoteSession.control && remoteSession.control.peerId === peerId) {
-    // They're already gone — no point sending controlRevoked, just clean up locally.
-    remoteSession.control = null;
-    hideControlActiveBanner();
+  // They're already gone — no point sending controlRevoked, just clean up locally.
+  let hadControl = false;
+  for (const [serial, entry] of Array.from(remoteSession.controlBySerial)) {
+    if (entry.peerId === peerId) { remoteSession.controlBySerial.delete(serial); hadControl = true; }
   }
-  if (remoteSession.pendingControlRequest && remoteSession.pendingControlRequest.peerId === peerId) {
-    remoteSession.pendingControlRequest = null;
+  if (hadControl) showControlActiveBanner();
+  const before = remoteSession.controlRequestQueue.length;
+  remoteSession.controlRequestQueue = remoteSession.controlRequestQueue.filter((r) => r.peerId !== peerId);
+  if (remoteSession.controlRequestQueue.length !== before) {
     hideControlRequestPrompt();
+    if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
   }
   updateShareModalViewerCount();
 }
 
 // --- Remote Session: Screen/Input Control (Host) ---
-// remoteSession.control:               { peerId, serial, grantId, seq, lastInputSeq } | null
-//   — the one viewer (if any) currently allowed to see/drive the screen. grantId scopes
-//   every screenFrame/inputEvent belonging to this one control session end-to-end, so a
-//   stale message from a just-ended session can never be mistaken for a new one; seq
-//   orders messages within one grantId so a reordered delivery can't cause a visible
-//   rewind (also doubles as protection against the dual-transport double-delivery class
-//   of bug described above makeRemoteActions, for the two actions that skip that fix's
-//   requestId-based dedup because they're not request/response shaped).
-// remoteSession.pendingControlRequest: { peerId, serial, requestId } | null — an
-//   unreviewed request currently shown in the approval modal (only one at a time).
+// remoteSession.controlBySerial: Map<serial, {peerId, grantId, seq, lastInputSeq}> — one
+//   independent entry PER DEVICE, not one global slot. Each device has its own remote
+//   control instance: two different viewers can hold control of two different devices
+//   at once; a given device can only ever have one controller at a time. grantId scopes
+//   every screenFrame/inputEvent belonging to that one device's control session end-to-
+//   end, so a stale message from a just-ended session can never be mistaken for a new
+//   one; seq orders messages within one grantId so a reordered delivery can't cause a
+//   visible rewind (also doubles as protection against the dual-transport double-
+//   delivery class of bug described above makeRemoteActions, for the two actions that
+//   skip that fix's requestId-based dedup because they're not request/response shaped).
+// remoteSession.controlRequestQueue: [{peerId, serial, requestId}, ...] — unreviewed
+//   requests, reviewed one at a time via a single reused modal; a request for a device
+//   that's already got one queued (or already controlled) is auto-denied instead of
+//   queuing a duplicate.
 function handleControlRequest(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   const { requestId, serial } = data || {};
   if (!requestId || !serial) return;
   debugLogPush(`remote (host): controlRequest from peerId=${peerId} serial=${serial}`, 'evt');
-  if (remoteSession.control) {
-    if (remoteSession.control.peerId === peerId && remoteSession.control.serial === serial) {
-      try { remoteSession.actions.controlResponse.send({ requestId, granted: true, serial, grantId: remoteSession.control.grantId }, { target: peerId }); } catch (_) {}
+  const existing = remoteSession.controlBySerial.get(serial);
+  if (existing) {
+    if (existing.peerId === peerId) {
+      try { remoteSession.actions.controlResponse.send({ requestId, granted: true, serial, grantId: existing.grantId }, { target: peerId }); } catch (_) {}
     } else {
-      try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Another viewer is already in control' }, { target: peerId }); } catch (_) {}
+      try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Another viewer is already controlling this device' }, { target: peerId }); } catch (_) {}
     }
     return;
   }
-  if (remoteSession.pendingControlRequest) {
-    try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Another control request is already pending host review' }, { target: peerId }); } catch (_) {}
+  if (remoteSession.controlRequestQueue.some((r) => r.serial === serial)) {
+    try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'A control request for this device is already pending host review' }, { target: peerId }); } catch (_) {}
     return;
   }
   if (!connectedDevices.has(serial)) {
     try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Device not connected' }, { target: peerId }); } catch (_) {}
     return;
   }
-  remoteSession.pendingControlRequest = { peerId, serial, requestId };
-  showControlRequestPrompt(peerId, serial);
+  const wasEmpty = remoteSession.controlRequestQueue.length === 0;
+  remoteSession.controlRequestQueue.push({ peerId, serial, requestId });
+  if (wasEmpty) showControlRequestPrompt();
 }
 
-function showControlRequestPrompt(peerId, serial) {
+// Shows (or refreshes) a modal for the FRONT of controlRequestQueue — Grant/Deny always
+// act on queue[0], then advance to the next queued request (if any) automatically.
+function showControlRequestPrompt() {
   hideControlRequestPrompt();
-  const info = connectedDevices.get(serial);
-  const deviceName = (info && info._displayName) || serial;
+  const next = remoteSession.controlRequestQueue[0];
+  if (!next) return;
+  const info = connectedDevices.get(next.serial);
+  const deviceName = (info && info._displayName) || next.serial;
+  const queuedNote = remoteSession.controlRequestQueue.length > 1
+    ? ` <span style="color:var(--muted, #8b949e);">(${remoteSession.controlRequestQueue.length - 1} more request(s) waiting)</span>` : '';
   const overlay = document.createElement('div');
   overlay.id = 'control-request-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1001;';
@@ -1748,7 +1791,7 @@ function showControlRequestPrompt(peerId, serial) {
   box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:320px;max-width:460px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">Remote Control Request</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;">A connected viewer wants to remotely control <strong>' + esc(deviceName) + '</strong> — see its screen and send taps, swipes, and text.</p>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;">A connected viewer wants to remotely control <strong>' + esc(deviceName) + '</strong> — see its screen and send taps, swipes, and text.' + queuedNote + '</p>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
     '<button class="btn btn-sm" id="control-deny-btn">Deny</button>' +
     '<button class="btn" id="control-grant-btn" style="color:#a6e3a1;">Grant Control</button></div>';
@@ -1764,90 +1807,107 @@ function hideControlRequestPrompt() {
 }
 
 function grantControlRequest() {
-  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.pendingControlRequest) return;
-  const { peerId, serial, requestId } = remoteSession.pendingControlRequest;
-  remoteSession.pendingControlRequest = null;
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const next = remoteSession.controlRequestQueue.shift();
   hideControlRequestPrompt();
-  if (!connectedDevices.has(serial)) {
-    try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Device not connected' }, { target: peerId }); } catch (_) {}
-    return;
+  if (next) {
+    const { peerId, serial, requestId } = next;
+    if (!connectedDevices.has(serial)) {
+      try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Device not connected' }, { target: peerId }); } catch (_) {}
+    } else {
+      const grantId = crypto.randomUUID();
+      remoteSession.controlBySerial.set(serial, { peerId, grantId, seq: -1, lastInputSeq: -1 });
+      try { remoteSession.actions.controlResponse.send({ requestId, granted: true, serial, grantId }, { target: peerId }); } catch (_) {}
+      showControlActiveBanner();
+      debugLogPush(`remote (host): granted control of ${serial} to peerId=${peerId}`, 'ok');
+      startScreencapLoop(peerId, serial, grantId);
+    }
   }
-  const grantId = crypto.randomUUID();
-  remoteSession.control = { peerId, serial, grantId, seq: -1, lastInputSeq: -1 };
-  try { remoteSession.actions.controlResponse.send({ requestId, granted: true, serial, grantId }, { target: peerId }); } catch (_) {}
-  showControlActiveBanner(serial);
-  debugLogPush(`remote (host): granted control of ${serial} to peerId=${peerId}`, 'ok');
-  startScreencapLoop(peerId, serial, grantId);
+  if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
 }
 
 function denyControlRequest() {
-  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.pendingControlRequest) return;
-  const { peerId, serial, requestId } = remoteSession.pendingControlRequest;
-  remoteSession.pendingControlRequest = null;
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const next = remoteSession.controlRequestQueue.shift();
   hideControlRequestPrompt();
-  try { remoteSession.actions.controlResponse.send({ requestId, granted: false, serial, reason: 'Denied by host' }, { target: peerId }); } catch (_) {}
+  if (next) {
+    try { remoteSession.actions.controlResponse.send({ requestId: next.requestId, granted: false, serial: next.serial, reason: 'Denied by host' }, { target: next.peerId }); } catch (_) {}
+  }
+  if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
 }
 
-// Single cleanup path for ending an active control session, whichever side or event
+// Single cleanup path for ending one device's control session, whichever side or event
 // triggered it (host clicks Stop, device disconnects, viewer disconnects/releases).
-function stopControlSession(reason) {
-  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.control) return;
-  const { peerId, grantId } = remoteSession.control;
-  try { remoteSession.actions.controlRevoked.send({ grantId, reason: reason || 'Stopped by host' }, { target: peerId }); } catch (_) {}
-  remoteSession.control = null;
-  hideControlActiveBanner();
-  debugLogPush(`remote (host): control session ended (${reason || 'stopped by host'})`, 'warn');
+function stopControlSession(serial, reason) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const entry = remoteSession.controlBySerial.get(serial);
+  if (!entry) return;
+  try { remoteSession.actions.controlRevoked.send({ serial, grantId: entry.grantId, reason: reason || 'Stopped by host' }, { target: entry.peerId }); } catch (_) {}
+  remoteSession.controlBySerial.delete(serial);
+  showControlActiveBanner();
+  debugLogPush(`remote (host): control session ended for ${serial} (${reason || 'stopped by host'})`, 'warn');
 }
 
 function handleControlRelease(data, peerId) {
-  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.control) return;
-  if (remoteSession.control.peerId !== peerId || remoteSession.control.grantId !== data?.grantId) return;
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { serial, grantId } = data || {};
+  const entry = remoteSession.controlBySerial.get(serial);
+  if (!entry || entry.peerId !== peerId || entry.grantId !== grantId) return;
   // Viewer already knows it released control — no need to echo controlRevoked back.
-  remoteSession.control = null;
-  hideControlActiveBanner();
-  debugLogPush('remote (host): viewer released control', 'evt');
+  remoteSession.controlBySerial.delete(serial);
+  showControlActiveBanner();
+  debugLogPush(`remote (host): viewer released control of ${serial}`, 'evt');
 }
 
-function showControlActiveBanner(serial) {
+// Full re-render of the active-control banner from remoteSession.controlBySerial —
+// one row per currently-controlled device (since control is now per-device, more than
+// one can be active at once), each with its own Stop button. Hides itself when empty.
+function showControlActiveBanner() {
   const el = document.getElementById('control-active-banner');
-  if (!el) return;
-  const info = connectedDevices.get(serial);
-  const deviceName = (info && info._displayName) || serial;
-  const label = document.getElementById('control-active-banner-label');
-  if (label) label.textContent = 'Remote control active on ' + deviceName;
+  if (!el || !remoteSession || remoteSession.role !== 'host') return;
+  if (remoteSession.controlBySerial.size === 0) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+  el.innerHTML = '';
+  for (const serial of remoteSession.controlBySerial.keys()) {
+    const info = connectedDevices.get(serial);
+    const deviceName = (info && info._displayName) || serial;
+    const row = document.createElement('span');
+    row.style.cssText = 'display:inline-flex;align-items:center;gap:0.5rem;margin-right:1rem;';
+    row.textContent = 'Remote control active on ' + deviceName + ' ';
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm';
+    btn.textContent = 'Stop Control';
+    btn.onclick = () => stopControlSession(serial, 'Stopped by host');
+    row.appendChild(btn);
+    el.appendChild(row);
+  }
   el.classList.remove('hidden');
 }
 
 function hideControlActiveBanner() {
-  document.getElementById('control-active-banner')?.classList.add('hidden');
+  const el = document.getElementById('control-active-banner');
+  if (el) { el.classList.add('hidden'); el.innerHTML = ''; }
 }
 
 // Recursive setTimeout (not setInterval) so a slow capture never overlaps the next one.
-// Re-checks remoteSession.control fresh at both ends of the async capture — a revoke
-// mid-capture just means this loop quietly stops rescheduling itself.
-//
-// The 250ms fixed gap here used to be pure dead time layered ON TOP of however long the
-// on-device `screencap -p` + local scale/encode actually took (itself often 150-400ms) —
-// so real observed fps was well under half of what the capture step alone could support.
-// Cut to a minimal yield (just enough to avoid pegging the event loop) so the on-device
-// capture time is what paces the loop, not an artificial floor under it. Also dropped
-// maxWidth/quality slightly — less to encode and transfer per frame, still legible enough
-// for tap targeting.
+// Re-checks controlBySerial.get(serial) fresh at both ends of the async capture — a
+// revoke mid-capture just means this loop quietly stops rescheduling itself.
 async function startScreencapLoop(peerId, serial, grantId) {
-  if (!remoteSession?.control || remoteSession.control.grantId !== grantId) return;
+  let entry = remoteSession?.controlBySerial?.get(serial);
+  if (!entry || entry.grantId !== grantId) return;
   const info = connectedDevices.get(serial);
-  if (!info) { stopControlSession('device disconnected'); return; }
+  if (!info) { stopControlSession(serial, 'device disconnected'); return; }
   try {
-    const frame = await captureScaledFrame(info.adb, 400, 0.5);
-    if (!remoteSession?.control || remoteSession.control.grantId !== grantId) return; // ended mid-capture
-    remoteSession.control.seq++;
-    remoteSession.actions.screenFrame.send({ grantId, seq: remoteSession.control.seq, jpeg: frame.jpegBase64, w: frame.realWidth, h: frame.realHeight }, { target: peerId });
+    const frame = await captureScaledFrame(info.adb, 360, 0.45);
+    entry = remoteSession?.controlBySerial?.get(serial);
+    if (!entry || entry.grantId !== grantId) return; // ended mid-capture
+    entry.seq++;
+    remoteSession.actions.screenFrame.send({ serial, grantId, seq: entry.seq, jpeg: frame.jpegBase64, w: frame.realWidth, h: frame.realHeight }, { target: peerId });
   } catch (err) {
-    debugLogPush(`remote (host): screencap failed: ${err && err.message || err}`, 'err');
-    if (remoteSession?.control?.grantId === grantId) stopControlSession('screen capture failed');
+    debugLogPush(`remote (host): screencap failed for ${serial}: ${err && err.message || err}`, 'err');
+    if (remoteSession?.controlBySerial?.get(serial)?.grantId === grantId) stopControlSession(serial, 'screen capture failed');
     return;
   }
-  if (remoteSession?.control?.grantId === grantId) setTimeout(() => startScreencapLoop(peerId, serial, grantId), 15);
+  if (remoteSession?.controlBySerial?.get(serial)?.grantId === grantId) setTimeout(() => startScreencapLoop(peerId, serial, grantId), 15);
 }
 
 // Coerces to a finite integer, defaulting to 0 — input x/y/duration/keycode values are
@@ -1859,12 +1919,13 @@ function toSafeInt(v) {
 }
 
 function handleInputEvent(data, peerId) {
-  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.control) return;
-  const c = remoteSession.control;
-  if (c.peerId !== peerId || !data || data.grantId !== c.grantId) return;
-  if (typeof data.seq !== 'number' || data.seq <= c.lastInputSeq) return;
-  c.lastInputSeq = data.seq;
-  const info = connectedDevices.get(c.serial);
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { serial, grantId, seq } = data || {};
+  const entry = remoteSession.controlBySerial.get(serial);
+  if (!entry || entry.peerId !== peerId || grantId !== entry.grantId) return;
+  if (typeof seq !== 'number' || seq <= entry.lastInputSeq) return;
+  entry.lastInputSeq = seq;
+  const info = connectedDevices.get(serial);
   if (!info) return;
   let cmd;
   switch (data.type) {
@@ -1882,10 +1943,12 @@ function handleInputEvent(data, peerId) {
 // matter which of the six independent disconnect paths triggered the removal.
 function notifyDeviceRemoved(serial) {
   if (!remoteSession || remoteSession.role !== 'host') return;
-  if (remoteSession.control && remoteSession.control.serial === serial) stopControlSession('device disconnected');
-  if (remoteSession.pendingControlRequest && remoteSession.pendingControlRequest.serial === serial) {
-    remoteSession.pendingControlRequest = null;
+  if (remoteSession.controlBySerial.has(serial)) stopControlSession(serial, 'device disconnected');
+  const before = remoteSession.controlRequestQueue.length;
+  remoteSession.controlRequestQueue = remoteSession.controlRequestQueue.filter((r) => r.serial !== serial);
+  if (remoteSession.controlRequestQueue.length !== before) {
     hideControlRequestPrompt();
+    if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
   }
 }
 
@@ -1951,7 +2014,7 @@ function joinAsViewer(roomId, password) {
     pendingRequests: new Map(),
     pendingCompletions: new Map(),
     mirror: { activeSerial: null, connected: [], available: [], shellBySerial: {} },
-    control: null, // { active:true, serial, grantId, lastAppliedSeq, inputSeq } once granted
+    controlBySerial: {}, // serial -> {active, grantId, lastAppliedSeq, inputSeq, lastFrameW, lastFrameH, lastJpeg}
   };
   pollIceState(room, 'viewer', 60);
 
@@ -2027,7 +2090,9 @@ function joinAsViewer(roomId, password) {
   actions.bye.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
     showHostDisconnectedBanner();
-    if (remoteSession.control) handleControlRevoked({ grantId: remoteSession.control.grantId, reason: 'Host disconnected' });
+    for (const [serial, entry] of Object.entries(remoteSession.controlBySerial)) {
+      handleControlRevoked({ serial, grantId: entry.grantId, reason: 'Host disconnected' });
+    }
   };
 
   setTimeout(() => {
@@ -2070,6 +2135,8 @@ function renderViewerShell() {
   }
   const shellTabBtn = document.getElementById('tab-btn-shell');
   if (shellTabBtn) switchTab(shellTabBtn, 'tab-shell');
+  setupControlScreenInput();
+  renderControlTab();
   renderMirrorDeviceList({ activeSerial: null, connected: [], available: [] });
 }
 
@@ -2150,14 +2217,22 @@ function updateViewerDeviceHeader() {
 }
 
 // --- Remote Session: Screen/Input Control (Viewer) ---
+// remoteSession.controlBySerial: plain object, serial -> {active, grantId,
+//   lastAppliedSeq, inputSeq, lastFrameW, lastFrameH, lastJpeg} — one independent entry
+//   per device, so each device has its own remote-control instance. The Remote Control
+//   tab always reflects whichever device is currently selected (renderControlTab()),
+//   but a control session for a NON-selected device keeps running in the background
+//   (frames keep arriving and get cached via lastJpeg) — switching back to that device
+//   shows it immediately rather than waiting for the next poll.
 function requestControl() {
   if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.hostPeerId || !remoteSession.mirror.activeSerial) return;
+  const serial = remoteSession.mirror.activeSerial;
   const requestId = crypto.randomUUID();
   setControlStatus('Waiting for host approval...');
   const btn = document.getElementById('btn-request-control');
   if (btn) btn.disabled = true;
   try {
-    remoteSession.actions.controlRequest.send({ requestId, serial: remoteSession.mirror.activeSerial }, { target: remoteSession.hostPeerId });
+    remoteSession.actions.controlRequest.send({ requestId, serial }, { target: remoteSession.hostPeerId });
   } catch (_) {
     setControlStatus('Failed to send request');
     if (btn) btn.disabled = false;
@@ -2165,58 +2240,60 @@ function requestControl() {
 }
 
 function handleControlResponse(data) {
-  if (!remoteSession || remoteSession.role !== 'viewer') return;
-  const btn = document.getElementById('btn-request-control');
-  if (!data || !data.granted) {
-    setControlStatus(data && data.reason ? ('Not granted: ' + data.reason) : 'Control request denied');
-    if (btn) btn.disabled = false;
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial } = data;
+  if (!data.granted) {
+    if (serial === remoteSession.mirror.activeSerial) {
+      setControlStatus(data.reason ? ('Not granted: ' + data.reason) : 'Control request denied');
+      const btn = document.getElementById('btn-request-control');
+      if (btn) btn.disabled = false;
+    }
     return;
   }
-  remoteSession.control = { active: true, serial: data.serial, grantId: data.grantId, lastAppliedSeq: -1, inputSeq: 0, lastFrameW: 0, lastFrameH: 0 };
-  setControlStatus('In control of ' + data.serial);
-  btn?.classList.add('hidden');
-  document.getElementById('btn-release-control')?.classList.remove('hidden');
-  document.getElementById('control-screen-wrap')?.classList.remove('hidden');
-  document.getElementById('control-hw-buttons')?.classList.remove('hidden');
-  document.getElementById('control-text-row')?.classList.remove('hidden');
-  setupControlScreenInput();
+  remoteSession.controlBySerial[serial] = {
+    active: true, grantId: data.grantId, lastAppliedSeq: -1, inputSeq: 0,
+    lastFrameW: 0, lastFrameH: 0, lastJpeg: null,
+  };
+  if (serial === remoteSession.mirror.activeSerial) renderControlTab();
 }
 
 function handleScreenFrame(data) {
-  if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.control?.active) return;
-  if (!data || data.grantId !== remoteSession.control.grantId) return;
-  if (typeof data.seq !== 'number' || data.seq <= remoteSession.control.lastAppliedSeq) return;
-  remoteSession.control.lastAppliedSeq = data.seq;
-  remoteSession.control.lastFrameW = data.w;
-  remoteSession.control.lastFrameH = data.h;
-  const img = document.getElementById('control-screen-img');
-  if (img) img.src = 'data:image/jpeg;base64,' + data.jpeg;
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || !entry.active || data.grantId !== entry.grantId) return;
+  if (typeof data.seq !== 'number' || data.seq <= entry.lastAppliedSeq) return;
+  entry.lastAppliedSeq = data.seq;
+  entry.lastFrameW = data.w;
+  entry.lastFrameH = data.h;
+  entry.lastJpeg = data.jpeg;
+  if (serial === remoteSession.mirror.activeSerial) {
+    const img = document.getElementById('control-screen-img');
+    if (img) img.src = 'data:image/jpeg;base64,' + data.jpeg;
+  }
 }
 
 function handleControlRevoked(data) {
-  if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.control) return;
-  if (data && data.grantId !== remoteSession.control.grantId) return;
-  remoteSession.control = null;
-  setControlStatus('Control ended' + (data && data.reason ? ': ' + data.reason : ''));
-  resetControlUI();
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || data.grantId !== entry.grantId) return;
+  delete remoteSession.controlBySerial[serial];
+  if (serial === remoteSession.mirror.activeSerial) {
+    setControlStatus('Control ended' + (data.reason ? ': ' + data.reason : ''));
+    renderControlTab();
+  }
 }
 
 function releaseControl() {
-  if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.control?.active) return;
-  try { remoteSession.actions.controlRelease.send({ grantId: remoteSession.control.grantId }, { target: remoteSession.hostPeerId }); } catch (_) {}
-  remoteSession.control = null;
+  if (!remoteSession || remoteSession.role !== 'viewer') return;
+  const serial = remoteSession.mirror.activeSerial;
+  const entry = serial && remoteSession.controlBySerial[serial];
+  if (!entry || !entry.active) return;
+  try { remoteSession.actions.controlRelease.send({ serial, grantId: entry.grantId }, { target: remoteSession.hostPeerId }); } catch (_) {}
+  delete remoteSession.controlBySerial[serial];
   setControlStatus('Control released');
-  resetControlUI();
-}
-
-function resetControlUI() {
-  const reqBtn = document.getElementById('btn-request-control');
-  reqBtn?.classList.remove('hidden');
-  if (reqBtn) reqBtn.disabled = false;
-  document.getElementById('btn-release-control')?.classList.add('hidden');
-  document.getElementById('control-screen-wrap')?.classList.add('hidden');
-  document.getElementById('control-hw-buttons')?.classList.add('hidden');
-  document.getElementById('control-text-row')?.classList.add('hidden');
+  renderControlTab();
 }
 
 function setControlStatus(text) {
@@ -2224,11 +2301,55 @@ function setControlStatus(text) {
   if (el) el.textContent = text;
 }
 
+// Redraws the whole Remote Control tab from whatever's currently true for
+// mirror.activeSerial — called on device switch (setMirrorActiveSerial) and whenever a
+// grant/revoke changes that specific device's entry. screenFrame updates the <img>
+// directly (see handleScreenFrame) rather than going through a full re-render every
+// frame, since that fires several times a second.
+function renderControlTab() {
+  if (!remoteSession || remoteSession.role !== 'viewer') return;
+  const serial = remoteSession.mirror.activeSerial;
+  const entry = serial && remoteSession.controlBySerial[serial];
+  const reqBtn = document.getElementById('btn-request-control');
+  const relBtn = document.getElementById('btn-release-control');
+  const screenWrap = document.getElementById('control-screen-wrap');
+  const hwButtons = document.getElementById('control-hw-buttons');
+  const textRow = document.getElementById('control-text-row');
+  const img = document.getElementById('control-screen-img');
+  if (entry && entry.active) {
+    setControlStatus('In control of ' + serial);
+    reqBtn?.classList.add('hidden');
+    relBtn?.classList.remove('hidden');
+    screenWrap?.classList.remove('hidden');
+    hwButtons?.classList.remove('hidden');
+    textRow?.classList.remove('hidden');
+    if (img) img.src = entry.lastJpeg ? ('data:image/jpeg;base64,' + entry.lastJpeg) : '';
+  } else {
+    setControlStatus(serial ? 'Not in control' : 'Select a device to request control');
+    if (reqBtn) { reqBtn.classList.remove('hidden'); reqBtn.disabled = !serial; }
+    relBtn?.classList.add('hidden');
+    screenWrap?.classList.add('hidden');
+    hwButtons?.classList.add('hidden');
+    textRow?.classList.add('hidden');
+    if (img) img.src = '';
+  }
+}
+
+function getActiveControlEntry() {
+  if (!remoteSession || remoteSession.role !== 'viewer') return null;
+  const serial = remoteSession.mirror.activeSerial;
+  const entry = serial && remoteSession.controlBySerial[serial];
+  return (entry && entry.active) ? entry : null;
+}
+
 function sendInputEvent(type, params) {
-  if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.control?.active || !remoteSession.hostPeerId) return;
-  remoteSession.control.inputSeq++;
+  if (!remoteSession || remoteSession.role !== 'viewer' || !remoteSession.hostPeerId) return;
+  const serial = remoteSession.mirror.activeSerial;
+  const entry = getActiveControlEntry();
+  if (!entry) return;
+  entry.inputSeq++;
   try {
-    remoteSession.actions.inputEvent.send({ grantId: remoteSession.control.grantId, seq: remoteSession.control.inputSeq, type, ...params }, { target: remoteSession.hostPeerId });
+    remoteSession.actions.inputEvent.send({ serial, grantId: entry.grantId, seq: entry.inputSeq, type, ...params }, { target: remoteSession.hostPeerId });
   } catch (_) {}
 }
 
@@ -2241,24 +2362,29 @@ function sendControlText() {
   input.value = '';
 }
 
+// Wired once (guarded by _controlWired) and left in place for the life of the page —
+// reads getActiveControlEntry() fresh on every pointer event instead of capturing one
+// device's state at setup time, so it stays correct across device switches with zero
+// re-wiring needed.
 let controlPointerState = null;
 function setupControlScreenInput() {
   const img = document.getElementById('control-screen-img');
   if (!img || img._controlWired) return;
   img._controlWired = true;
   img.addEventListener('pointerdown', (e) => {
-    if (!remoteSession?.control?.active) return;
+    if (!getActiveControlEntry()) return;
     e.preventDefault();
     controlPointerState = { startX: e.clientX, startY: e.clientY, startTime: Date.now() };
   });
   img.addEventListener('pointerup', (e) => {
-    if (!remoteSession?.control?.active || !controlPointerState) return;
+    const entry = getActiveControlEntry();
+    if (!entry || !controlPointerState) return;
     e.preventDefault();
     const { startX, startY, startTime } = controlPointerState;
     controlPointerState = null;
     const rect = img.getBoundingClientRect();
-    const w = remoteSession.control.lastFrameW || rect.width;
-    const h = remoteSession.control.lastFrameH || rect.height;
+    const w = entry.lastFrameW || rect.width;
+    const h = entry.lastFrameH || rect.height;
     const toDeviceX = (clientX) => Math.round(((clientX - rect.left) / rect.width) * w);
     const toDeviceY = (clientY) => Math.round(((clientY - rect.top) / rect.height) * h);
     const dx = e.clientX - startX, dy = e.clientY - startY;
@@ -2280,20 +2406,19 @@ function setupControlScreenInput() {
 
 // Both places that reassign remoteSession.mirror.activeSerial (the button click below,
 // and renderMirrorDeviceList()'s own auto-fallback when the mirrored serial disappears
-// from the host's broadcast list) route through here. This intentionally does NOT touch
-// an active control session: control is pinned to whatever device it was granted for
-// (remoteSession.control.serial), independent of which device the sidebar/other tabs
-// currently have selected — none of the control/screenFrame code paths read
-// mirror.activeSerial, so browsing another device's Properties/Shell tab, or the
-// sidebar's own auto-reselect after a devicePush update, can't disturb it. An earlier
-// version auto-released control on any activeSerial change, which — since
-// renderMirrorDeviceList() calls this on every devicePush whose snapshot briefly didn't
-// contain the mirrored serial — ended up silently dropping control just from switching
-// tabs for a while or from unrelated host-side device-list churn, not just an intentional
-// device switch. Control now only ever ends via an explicit Release/Stop, a controlRevoked
-// from the host, or the session itself ending (reload/close/Leave Session).
+// from the host's broadcast list) route through here. Each device has its own
+// independent control instance (remoteSession.controlBySerial, keyed by serial) — this
+// never releases anything on a switch, it just re-renders the Remote Control tab to
+// reflect whichever device is now selected (renderControlTab()); a control session for
+// a device you switch away from keeps running in the background untouched (frames keep
+// arriving and get cached, see handleScreenFrame) and reappears instantly if you switch
+// back. Control only ever ends via an explicit Release/Stop, a controlRevoked from the
+// host, or the session itself ending (reload/close/Leave Session) — never merely from
+// switching which device is selected elsewhere, or from unrelated host-side device-list
+// churn (an earlier, single-slot version of this got that wrong).
 function setMirrorActiveSerial(serial) {
   remoteSession.mirror.activeSerial = serial;
+  renderControlTab();
 }
 
 function selectMirrorDevice(serial) {

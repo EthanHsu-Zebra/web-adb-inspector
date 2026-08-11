@@ -615,13 +615,14 @@
 <div id="viewer-banner" class="viewer-banner hidden">
   <span>Remote viewer mode — connected to host session</span>
   <span id="viewer-status" class="badge">Connecting...</span>
+  <span id="viewer-version" style="color:var(--muted);"></span>
   <button class="btn btn-sm" onclick="leaveRemoteSession()">Leave Session</button>
 </div>
 
-<div id="control-active-banner" class="control-active-banner hidden">
-  <span id="control-active-banner-label">Remote control active</span>
-  <button class="btn btn-sm" onclick="stopControlSession()">Stop Control</button>
-</div>
+<!-- Populated entirely at runtime by showControlActiveBanner() — one row per
+     currently-controlled device, each with its own Stop button (control is per-device,
+     so more than one row can show at once). -->
+<div id="control-active-banner" class="control-active-banner hidden"></div>
 
 <div class="main">
   <div class="sidebar">
@@ -815,6 +816,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026081103"></script>
+<script type="module" src="bundle.js?v=2026081104"></script>
 </body>
 </html>
