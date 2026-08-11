@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.14.1';
+const APP_VERSION = '1.15.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -30,6 +30,15 @@ const connectingStatus = new Map();
 let activeSerial = null;
 let disconnectingSerial = null;  // serial currently being intentionally disconnected (suppress USB event)
 const dataCache = { props: [], features: [], packages: [] };
+// Host-side, keyed by serial -> {tab: html} — the most recently rendered tab HTML for
+// EVERY device the host has ever selected this session, not just whichever one is
+// currently active. Populated by pushTabHtml() on every fresh fetch/render; read by
+// handleViewerHello() so a newly-joined viewer gets caught up on every device the host
+// has visited so far, not only the one currently open. Without this, a viewer selecting a
+// device the host looked at earlier (and has since switched away from) saw a permanent
+// "Waiting for host data…" for that device's Properties/Features/etc, since pushTabHtml()
+// only ever fires again for whichever device is CURRENTLY active on the host.
+const hostTabHtmlCache = {};
 const deviceNicknames = (() => { try { return JSON.parse(localStorage.getItem('device-nicknames') || '{}'); } catch { return {}; } })();
 let fontSizeLevel = (() => { try { return parseInt(localStorage.getItem('font-size-level') || '0', 10); } catch { return 0; } })();
 
@@ -1089,7 +1098,19 @@ async function findGrantedDevice(mgr, usbId) {
     usbDevice = granted.find(d => d.serial === usbId.serial && d.raw.vendorId === usbId.vendorId && d.raw.productId === usbId.productId);
   }
   if (!usbDevice) {
-    usbDevice = granted.find(d => d.raw.vendorId === usbId.vendorId && d.raw.productId === usbId.productId);
+    const candidates = granted.filter(d => d.raw.vendorId === usbId.vendorId && d.raw.productId === usbId.productId);
+    // Linux quirk (confirmed via a real multi-device debug log, 2026-08-11): during the
+    // Access-denied/disconnect-reconnect churn right after a reconnect attempt, a granted
+    // device's .serial can transiently read back empty/unset even though it's the same
+    // physical device — that's why the exact-serial match above can miss. Falling back to
+    // "any vid+pid match" is fine when there's only one such device, but with TWO OR MORE
+    // devices sharing the same vid+pid (e.g. two of the same model), picking blindly here
+    // previously connected the WRONG physical device under this card's serial with no
+    // indication anything was amiss (confirmed: a retry meant for serial A silently
+    // "succeeded" by reconnecting already-connected serial B instead). Safer to report no
+    // match and let the existing retry/backoff loop try again shortly, by which point the
+    // serial is usually readable again, than to ever misattribute a connection.
+    if (!usbId.serial || candidates.length === 1) usbDevice = candidates[0] || null;
   }
   return { usbDevice, count: granted.length };
 }
@@ -1640,6 +1661,8 @@ function pushTabHtml(tab, elementId, target) {
   if (!remoteSession || remoteSession.role !== 'host' || !activeSerial) return;
   const el = document.getElementById(elementId);
   if (!el) return;
+  if (!hostTabHtmlCache[activeSerial]) hostTabHtmlCache[activeSerial] = {};
+  hostTabHtmlCache[activeSerial][tab] = el.innerHTML;
   try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }, target ? { target } : undefined); } catch (_) {}
 }
 
@@ -1649,12 +1672,16 @@ function handleViewerHello(data, peerId) {
   remoteSession.viewers.add(peerId);
   try { remoteSession.actions.devicePush.send(buildDeviceSnapshot(), { target: peerId }); } catch (_) {}
   // pushTabHtml() only fires on a fresh fetch (device selection, or a manual CSR/probe
-  // click) — a viewer joining after the host already selected/fetched a device would
-  // otherwise see "Waiting for host data…" forever, since nothing re-triggers a fetch
-  // just because someone new joined. Catch this specific viewer up with whatever's
-  // already on screen for the active device.
-  for (const [tab, elementId] of Object.entries(mirroredTabElementIds())) {
-    pushTabHtml(tab, elementId, peerId);
+  // click) for whichever device is CURRENTLY active — a viewer joining after the host
+  // already looked at (and possibly switched away from) one or more devices would
+  // otherwise see "Waiting for host data…" forever for anything but the current one,
+  // since nothing re-triggers a fetch just because someone new joined. Catch this viewer
+  // up with hostTabHtmlCache's full history instead of just the live DOM, so it covers
+  // every device the host has visited this session, not only whichever is active right now.
+  for (const [serial, tabs] of Object.entries(hostTabHtmlCache)) {
+    for (const [tab, html] of Object.entries(tabs)) {
+      try { remoteSession.actions.tabDataPush.send({ serial, tab, html }, { target: peerId }); } catch (_) {}
+    }
   }
   updateShareModalViewerCount();
 }
@@ -1798,12 +1825,20 @@ function hideControlActiveBanner() {
 // Recursive setTimeout (not setInterval) so a slow capture never overlaps the next one.
 // Re-checks remoteSession.control fresh at both ends of the async capture — a revoke
 // mid-capture just means this loop quietly stops rescheduling itself.
+//
+// The 250ms fixed gap here used to be pure dead time layered ON TOP of however long the
+// on-device `screencap -p` + local scale/encode actually took (itself often 150-400ms) —
+// so real observed fps was well under half of what the capture step alone could support.
+// Cut to a minimal yield (just enough to avoid pegging the event loop) so the on-device
+// capture time is what paces the loop, not an artificial floor under it. Also dropped
+// maxWidth/quality slightly — less to encode and transfer per frame, still legible enough
+// for tap targeting.
 async function startScreencapLoop(peerId, serial, grantId) {
   if (!remoteSession?.control || remoteSession.control.grantId !== grantId) return;
   const info = connectedDevices.get(serial);
   if (!info) { stopControlSession('device disconnected'); return; }
   try {
-    const frame = await captureScaledFrame(info.adb, 480, 0.55);
+    const frame = await captureScaledFrame(info.adb, 400, 0.5);
     if (!remoteSession?.control || remoteSession.control.grantId !== grantId) return; // ended mid-capture
     remoteSession.control.seq++;
     remoteSession.actions.screenFrame.send({ grantId, seq: remoteSession.control.seq, jpeg: frame.jpegBase64, w: frame.realWidth, h: frame.realHeight }, { target: peerId });
@@ -1812,7 +1847,7 @@ async function startScreencapLoop(peerId, serial, grantId) {
     if (remoteSession?.control?.grantId === grantId) stopControlSession('screen capture failed');
     return;
   }
-  if (remoteSession?.control?.grantId === grantId) setTimeout(() => startScreencapLoop(peerId, serial, grantId), 250);
+  if (remoteSession?.control?.grantId === grantId) setTimeout(() => startScreencapLoop(peerId, serial, grantId), 15);
 }
 
 // Coerces to a finite integer, defaulting to 0 — input x/y/duration/keycode values are
@@ -2245,11 +2280,19 @@ function setupControlScreenInput() {
 
 // Both places that reassign remoteSession.mirror.activeSerial (the button click below,
 // and renderMirrorDeviceList()'s own auto-fallback when the mirrored serial disappears
-// from the host's broadcast list) route through here, so a switch away from the device
-// currently under remote control always releases it — capturing/controlling a DIFFERENT
-// device than what was granted would silently point taps/swipes at the wrong screen.
+// from the host's broadcast list) route through here. This intentionally does NOT touch
+// an active control session: control is pinned to whatever device it was granted for
+// (remoteSession.control.serial), independent of which device the sidebar/other tabs
+// currently have selected — none of the control/screenFrame code paths read
+// mirror.activeSerial, so browsing another device's Properties/Shell tab, or the
+// sidebar's own auto-reselect after a devicePush update, can't disturb it. An earlier
+// version auto-released control on any activeSerial change, which — since
+// renderMirrorDeviceList() calls this on every devicePush whose snapshot briefly didn't
+// contain the mirrored serial — ended up silently dropping control just from switching
+// tabs for a while or from unrelated host-side device-list churn, not just an intentional
+// device switch. Control now only ever ends via an explicit Release/Stop, a controlRevoked
+// from the host, or the session itself ending (reload/close/Leave Session).
 function setMirrorActiveSerial(serial) {
-  if (remoteSession.control?.active && serial !== remoteSession.control.serial) releaseControl();
   remoteSession.mirror.activeSerial = serial;
 }
 
