@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.10.1';
+const APP_VERSION = '1.10.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1366,8 +1366,17 @@ function makeRemoteActions(room, roomId, password, label) {
         try { real.send(data, opts); } catch (_) {}
         fallback.send({ action: name, from: sessionId, target: opts?.target, data });
       },
-      onMessage: (handler) => {
-        real.onMessage(handler);
+      // trystero's own action.onMessage is an assignable property (a setter), not a
+      // method — every caller here does `actions.foo.onMessage = handler`. This must
+      // mirror that exact shape (get/set), not a plain callable function: an object
+      // literal's `onMessage: (h) => {...}` is just a function-VALUED property, so
+      // `actions.foo.onMessage = handler` would silently overwrite it with the raw
+      // handler instead of invoking it — meaning `real.onMessage = handler` (the
+      // actual trystero registration) would never happen, breaking the real P2P
+      // channel for everyone, not just the fallback path.
+      get onMessage() { return dispatchers[name]; },
+      set onMessage(handler) {
+        real.onMessage = handler;
         dispatchers[name] = handler;
       },
     };
