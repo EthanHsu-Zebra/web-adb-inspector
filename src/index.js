@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.11.0';
+const APP_VERSION = '1.11.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1540,11 +1540,11 @@ function broadcastDeviceState() {
 // Trade-off: per-tab search boxes (Properties/Features/Packages) filter dataCache
 // arrays the viewer doesn't have, so they're hidden in viewer mode (.host-only) rather
 // than silently doing nothing.
-function pushTabHtml(tab, elementId) {
+function pushTabHtml(tab, elementId, target) {
   if (!remoteSession || remoteSession.role !== 'host' || !activeSerial) return;
   const el = document.getElementById(elementId);
   if (!el) return;
-  try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }); } catch (_) {}
+  try { remoteSession.actions.tabDataPush.send({ serial: activeSerial, tab, html: el.innerHTML }, target ? { target } : undefined); } catch (_) {}
 }
 
 function handleViewerHello(data, peerId) {
@@ -1552,6 +1552,14 @@ function handleViewerHello(data, peerId) {
   debugLogPush(`remote viewer hello: peerId=${peerId}`, 'evt');
   remoteSession.viewers.add(peerId);
   try { remoteSession.actions.devicePush.send(buildDeviceSnapshot(), { target: peerId }); } catch (_) {}
+  // pushTabHtml() only fires on a fresh fetch (device selection, or a manual CSR/probe
+  // click) — a viewer joining after the host already selected/fetched a device would
+  // otherwise see "Waiting for host data…" forever, since nothing re-triggers a fetch
+  // just because someone new joined. Catch this specific viewer up with whatever's
+  // already on screen for the active device.
+  for (const [tab, elementId] of Object.entries(mirroredTabElementIds())) {
+    pushTabHtml(tab, elementId, peerId);
+  }
   updateShareModalViewerCount();
 }
 

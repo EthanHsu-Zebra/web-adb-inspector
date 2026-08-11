@@ -197,6 +197,11 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.11.1 — late-joining viewers never got any tab data
+Every non-Shell tab showed "Waiting for host data…" indefinitely for the reported case. Root cause: `pushTabHtml()` only fires when the host *freshly fetches* a tab — i.e. on `selectDevice()`'s auto-fetch, or a manual CSR/probe click. The common flow is host connects a device (which selects and fetches it) *then* clicks Share — so by the time a viewer joins, that one-time fetch-and-broadcast has already happened and nothing re-triggers it just because someone new showed up.
+
+Fixed by having `handleViewerHello()` (already the mechanism for catching a late joiner up on the device list, via a targeted `devicePush`) also send a targeted `tabDataPush` for every tab, reading whatever's *currently* in each output element's `innerHTML` — the same live DOM the host itself is looking at, regardless of when it was fetched. `pushTabHtml()` gained an optional `target` param for this (broadcasts as before when omitted).
+
 ### v1.11.0 — terminal-style merged console + full data-tab mirroring for viewers
 Two related requests: (1) type directly into the console like a real terminal instead of a separate input bar below it, and (2) mirror all the other tabs (Properties/Features/Packages/Attestation/RKP/HW Trust), not just device list + Shell, to the viewer.
 
