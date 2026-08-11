@@ -562,27 +562,6 @@
   gap: 0.75rem;
   font-size: calc(0.85rem * var(--font-scale));
 }
-.remote-approval-bar {
-  background: rgba(210,153,34,0.12);
-  border-bottom: 1px solid var(--yellow);
-  padding: 0.5rem 1.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-}
-.approval-row {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  font-size: calc(0.8rem * var(--font-scale));
-  flex-wrap: wrap;
-}
-.approval-text code {
-  background: var(--bg);
-  padding: 0.1rem 0.35rem;
-  border-radius: 3px;
-  font-family: var(--mono);
-}
 
 </style>
 </head>
@@ -606,8 +585,6 @@
   <span id="viewer-status" class="badge">Connecting...</span>
   <button class="btn btn-sm" onclick="leaveRemoteSession()">Leave Session</button>
 </div>
-
-<div id="remote-approval-bar" class="remote-approval-bar hidden"></div>
 
 <div class="main">
   <div class="sidebar">
@@ -770,6 +747,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026080617"></script>
+<script type="module" src="bundle.js?v=2026080618"></script>
 </body>
 </html>

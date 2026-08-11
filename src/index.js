@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.12.0';
+const APP_VERSION = '1.13.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -69,8 +69,8 @@ const REMOTE_TURN_CONFIG = [
 const REMOTE_RELAY_URLS = ['wss://web-adb-inspector-relay.onrender.com'];
 let remoteSession = null;
 function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
-// host:   { role:'host', room, roomId, password, trusted:false, viewers:Set<peerId>,
-//           actions:{hello,devicePush,cmdRequest,cmdResponse,bye}, pendingApprovals:Map<requestId,{peerId,serial,command}> }
+// host:   { role:'host', room, roomId, password, viewers:Set<peerId>,
+//           actions:{hello,devicePush,cmdRequest,cmdResponse,bye} }
 // viewer: { role:'viewer', room, roomId, password, hostPeerId:null,
 //           actions:{...}, pendingRequests:Map<requestId,{cmd}>,
 //           mirror:{ activeSerial:null, connected:[], available:[] } }
@@ -1466,7 +1466,7 @@ function startShareSession() {
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room, roomId, password, 'host');
-  remoteSession = { role: 'host', room, roomId, password, trusted: true, viewers: new Set(), actions, pendingApprovals: new Map() };
+  remoteSession = { role: 'host', room, roomId, password, viewers: new Set(), actions };
   pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
@@ -1549,9 +1549,6 @@ function handleViewerHello(data, peerId) {
 function handlePeerLeaveHost(peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   remoteSession.viewers.delete(peerId);
-  for (const [reqId, req] of remoteSession.pendingApprovals) {
-    if (req.peerId === peerId) { remoteSession.pendingApprovals.delete(reqId); removeApprovalPrompt(reqId); }
-  }
   updateShareModalViewerCount();
 }
 
@@ -1567,12 +1564,10 @@ function showShareModal() {
   box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">Share Remote Session</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and run shell commands on it — commands run immediately, with no approval prompt. Treat it like a password — use "Regenerate Link" if it leaks.</p>' +
+    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and run shell commands on it immediately, with no approval step — treat it like a password. Use "Regenerate Link" if it leaks.</p>' +
     '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
     '<input id="share-link-input" type="text" readonly value="' + esc(link) + '" style="flex:1;background:#11111b;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;">' +
     '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
-    '<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;cursor:pointer;">' +
-    '<input type="checkbox" id="share-trust-checkbox" checked> Auto-run commands from any connected viewer (uncheck to require approval per command)</label>' +
     '<div style="font-size:12px;color:#a6adc6;margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
     '<button class="btn btn-sm" id="share-regen-btn">Regenerate Link</button>' +
@@ -1583,9 +1578,6 @@ function showShareModal() {
 
   document.getElementById('share-copy-btn').onclick = () => {
     navigator.clipboard.writeText(link).then(() => setStatus('Link copied', 'ok')).catch(() => {});
-  };
-  document.getElementById('share-trust-checkbox').onchange = (e) => {
-    if (remoteSession) remoteSession.trusted = e.target.checked;
   };
   document.getElementById('share-regen-btn').onclick = async () => { await stopShareSession(); startShareSession(); };
   document.getElementById('share-stop-btn').onclick = () => stopShareSession();
@@ -1601,26 +1593,6 @@ function hideShareModal() {
 function updateShareModalViewerCount() {
   const el = document.getElementById('share-viewer-count');
   if (el && remoteSession && remoteSession.role === 'host') el.textContent = String(remoteSession.viewers.size);
-}
-
-function showApprovalPrompt(requestId, serial, command) {
-  const bar = document.getElementById('remote-approval-bar');
-  if (!bar) return;
-  bar.classList.remove('hidden');
-  const devName = (connectedDevices.get(serial) || {})._displayName || serial;
-  const row = document.createElement('div');
-  row.className = 'approval-row';
-  row.id = 'approval-' + requestId;
-  row.innerHTML = '<span class="approval-text">Remote viewer wants to run <code>' + esc(command) + '</code> on <strong>' + esc(devName) + '</strong></span>' +
-    '<button class="btn btn-sm" onclick="approveRemoteCommand(\'' + requestId + '\')">Approve</button>' +
-    '<button class="btn btn-sm" onclick="denyRemoteCommand(\'' + requestId + '\')" style="color:#f38ba8;">Deny</button>';
-  bar.appendChild(row);
-}
-function removeApprovalPrompt(requestId) {
-  const row = document.getElementById('approval-' + requestId);
-  if (row && row.parentNode) row.parentNode.removeChild(row);
-  const bar = document.getElementById('remote-approval-bar');
-  if (bar && !bar.querySelector('.approval-row')) bar.classList.add('hidden');
 }
 
 // --- Remote Session: Viewer ---
@@ -2778,7 +2750,13 @@ function handleShellKeydown(event) {
   if (event.key === 'Tab') { event.preventDefault(); completeShellPath(event.target); }
 }
 
-// --- Remote Shell: host executes on behalf of a remote viewer, gated by approval ---
+// --- Remote Shell: host executes on behalf of a remote viewer ---
+// No approval gate: the share link itself is the authorization boundary (whoever has
+// it can already see live device state and, once connected, run commands) — a
+// per-command approve/deny step added friction without adding real security for the
+// "share with someone you already trust" use case this is designed for, and having a
+// per-session toggle for it meant it could silently end up gating everything if that
+// toggle wasn't in the state you expected.
 function handleRemoteCmdRequest(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   const { requestId, serial, command } = data || {};
@@ -2788,31 +2766,7 @@ function handleRemoteCmdRequest(data, peerId) {
     try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, error: 'device not connected' }, { target: peerId }); } catch (_) {}
     return;
   }
-  if (remoteSession.trusted) {
-    executeRemoteShell(peerId, { requestId, serial, command });
-    return;
-  }
-  remoteSession.pendingApprovals.set(requestId, { peerId, serial, command });
-  showApprovalPrompt(requestId, serial, command);
-  debugLogPush(`remote (host): approval prompt shown for requestId=${requestId} (bar present: ${!!document.getElementById('remote-approval-bar')})`, 'evt');
-}
-
-function approveRemoteCommand(requestId) {
-  if (!remoteSession || remoteSession.role !== 'host') return;
-  const req = remoteSession.pendingApprovals.get(requestId);
-  if (!req) return;
-  remoteSession.pendingApprovals.delete(requestId);
-  removeApprovalPrompt(requestId);
-  executeRemoteShell(req.peerId, { requestId, serial: req.serial, command: req.command });
-}
-
-function denyRemoteCommand(requestId) {
-  if (!remoteSession || remoteSession.role !== 'host') return;
-  const req = remoteSession.pendingApprovals.get(requestId);
-  if (!req) return;
-  remoteSession.pendingApprovals.delete(requestId);
-  removeApprovalPrompt(requestId);
-  try { remoteSession.actions.cmdResponse.send({ requestId, ok: false, denied: true }, { target: req.peerId }); } catch (_) {}
+  executeRemoteShell(peerId, { requestId, serial, command });
 }
 
 async function executeRemoteShell(peerId, { requestId, serial, command }) {
@@ -3084,8 +3038,6 @@ window.connectSelected = connectSelected;
 window.disconnectSelected = disconnectSelected;
 window.startShareSession = startShareSession;
 window.stopShareSession = stopShareSession;
-window.approveRemoteCommand = approveRemoteCommand;
-window.denyRemoteCommand = denyRemoteCommand;
 window.leaveRemoteSession = leaveRemoteSession;
 window.sendRemoteCommand = sendRemoteCommand;
 window.clearViewerShell = clearViewerShell;
