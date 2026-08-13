@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.19.1';
+const APP_VERSION = '1.19.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -615,6 +615,19 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
     connectingKey = usbDevice.raw.vendorId + ':' + usbDevice.raw.productId + ':' + (usbDevice.serial || '');
     connectingUsbIds.add(connectingKey);
     debugLogPush(`connectDevice start: serial=${usbDevice.serial || '(none)'} opened=${usbDevice.opened} otherConnected=${connectedDevices.size}`, 'evt');
+    // Deep diagnostic dump (2026-08-13): retries alone weren't recovering ANY device on a
+    // real multi-device Linux report, which the "transient contention, just wait longer"
+    // theory can't explain — either the retry math is wrong somewhere, or this specific
+    // failure mode isn't actually transient at all (e.g. a permissions/udev issue, which
+    // no amount of waiting fixes). Logging the raw USBDevice descriptor fields and the
+    // exact name+message of every step's error (not just the final swallowed-or-not
+    // outcome) should show which one it actually is.
+    try {
+      const raw = usbDevice.raw;
+      debugLogPush(`connectDevice diag: vendorId=${raw.vendorId} productId=${raw.productId} deviceClass=${raw.deviceClass} deviceSubclass=${raw.deviceSubclass} configCount=${raw.configurations?.length ?? '?'} opened=${raw.opened} manufacturer=${raw.manufacturerName || '?'} product=${raw.productName || '?'}`, 'evt');
+    } catch (diagErr) {
+      debugLogPush(`connectDevice diag: failed to read raw descriptor: ${diagErr && diagErr.message || diagErr}`, 'warn');
+    }
     // Defensive pre-emptive close: v1.5.5's catch-block cleanup only runs when
     // usbDevice.connect() itself *succeeds* and a later step fails. It does nothing for
     // "Failed to execute 'open' on 'USBDevice': The device was disconnected" — that error
@@ -636,13 +649,42 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
     // aggressive best-effort cleanup than v1.5.6's close()-only attempt, since that alone
     // didn't recover this failure. Each step is independent and best-effort; if any of
     // them isn't applicable (e.g. nothing to reset) that's expected, not an error.
-    try { await usbDevice.raw.open(); } catch (_) {}
-    try { await usbDevice.raw.reset(); debugLogPush('connectDevice: pre-emptive USB reset succeeded', 'evt'); } catch (_) {}
-    try { await usbDevice.raw.close(); } catch (_) {}
+    // These three used to swallow every error silently (`catch (_) {}`) — meaning if the
+    // very FIRST step (open()) is what's actually failing with Access-denied every single
+    // time, that was completely invisible; only the LATER, outer connect() failure ever
+    // surfaced. Logging each step's own outcome (including WHICH step failed and with
+    // what exact name+message) directly distinguishes "pre-emptive open already fails —
+    // likely a persistent permissions/udev issue, not transient contention" from "open
+    // succeeds here but the real connect() below fails anyway — something else is
+    // reclaiming it in between."
+    try {
+      await usbDevice.raw.open();
+      debugLogPush('connectDevice: pre-emptive open() succeeded', 'evt');
+    } catch (err) {
+      debugLogPush(`connectDevice: pre-emptive open() FAILED: ${err && err.name || '?'}: ${err && err.message || err}`, 'warn');
+    }
+    try {
+      await usbDevice.raw.reset();
+      debugLogPush('connectDevice: pre-emptive USB reset succeeded', 'evt');
+    } catch (err) {
+      debugLogPush(`connectDevice: pre-emptive reset() FAILED: ${err && err.name || '?'}: ${err && err.message || err}`, 'warn');
+    }
+    try {
+      await usbDevice.raw.close();
+      debugLogPush('connectDevice: pre-emptive close() succeeded', 'evt');
+    } catch (err) {
+      debugLogPush(`connectDevice: pre-emptive close() FAILED: ${err && err.name || '?'}: ${err && err.message || err}`, 'warn');
+    }
     setStatus('Connecting...', 'connecting');
     console.log('[connect] usbDevice:', usbDevice.serial, 'opened:', usbDevice.opened, 'connect:', typeof usbDevice.connect);
     const t0 = Date.now();
-    const connection = await usbDevice.connect();
+    let connection;
+    try {
+      connection = await usbDevice.connect();
+    } catch (connectErr) {
+      debugLogPush(`connectDevice: real connect() FAILED after ${Date.now() - t0}ms: ${connectErr && connectErr.name || '?'}: ${connectErr && connectErr.message || connectErr}`, 'err');
+      throw connectErr;
+    }
     openedConnection = true;
     debugLogPush(`connectDevice: usbDevice.connect() resolved after ${Date.now() - t0}ms`, 'evt');
     console.log('[connect] connected, opened:', usbDevice.opened, 'conn.closed:', typeof connection.closed);
@@ -1169,6 +1211,7 @@ function selectDevice(serial) {
 // connect() attempt may be unusable even for an immediate retry with the same reference.
 async function findGrantedDevice(mgr, usbId) {
   const granted = mgr ? await mgr.getDevices({ filters: [AdbDefaultInterfaceFilter] }) : [];
+  debugLogPush(`findGrantedDevice(looking for ${usbId.vendorId}:${usbId.productId}:${usbId.serial || '(none)'}): granted=[${granted.map(d => `${d.raw.vendorId}:${d.raw.productId}:${d.serial || '(none)'}:opened=${d.opened}`).join(' | ')}]`, 'evt');
   let usbDevice = null;
   if (usbId.serial) {
     usbDevice = granted.find(d => d.serial === usbId.serial && d.raw.vendorId === usbId.vendorId && d.raw.productId === usbId.productId);
