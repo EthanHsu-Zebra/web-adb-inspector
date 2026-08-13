@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.19.0';
+const APP_VERSION = '1.19.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1203,7 +1203,17 @@ async function findGrantedDevice(mgr, usbId) {
 // scanning newly-attached-looking USB devices before releasing them) to finish. So: retry
 // for about that long instead of relying on the user to manually reload. See
 // PROJECT_CONTEXT.md for the full investigation.
-const CONNECT_RETRY_DELAYS_MS = [1500, 3000, 5000, 8000, 12000, 15000];
+//
+// Widened AGAIN (2026-08-11) — real Linux log with THREE devices sharing the same
+// vendor:product ID attempting to connect one after another: the original ~44.5s budget
+// (1.5+3+5+8+12+15) was exhausted for the first device with every single attempt still
+// failing "Access denied," and the second device then also failed 4 of its first 4
+// attempts before the log capture ended. Whatever's transiently holding these devices
+// evidently takes meaningfully longer to release when multiple devices sharing the same
+// vid:pid are being contended for at once, vs. the single/pair-device case this window
+// was originally tuned against. Added two more escalating attempts (20s, 25s), bringing
+// the total budget to ~89.5s — same self-heals-eventually theory, just more runway.
+const CONNECT_RETRY_DELAYS_MS = [1500, 3000, 5000, 8000, 12000, 15000, 20000, 25000];
 const CONNECT_TOTAL_ATTEMPTS = 1 + CONNECT_RETRY_DELAYS_MS.length; // shown in the card's "Connecting... (N/total)" status
 
 // Shared retry-with-backoff loop, used both when reconnecting an already-paired device
