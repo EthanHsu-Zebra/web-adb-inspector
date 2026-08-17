@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.1';
+const APP_VERSION = '1.25.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2611,49 +2611,79 @@ function sendLongScreenshotProgress(peerId, serial, grantId, message) {
 }
 
 async function handleLongScreenshotRequest(data, peerId) {
-  if (!remoteSession || remoteSession.role !== 'host') return;
+  debugLogPush(`remote (host): longScreenshotRequest received from peerId=${peerId}: ${JSON.stringify(data)}`, 'evt');
+  if (!remoteSession || remoteSession.role !== 'host') {
+    debugLogPush('remote (host): longScreenshotRequest ignored — not currently hosting', 'warn');
+    return;
+  }
   const { requestId, serial, grantId } = data || {};
-  if (!requestId || !isController(serial, peerId, grantId)) return;
+  if (!requestId) {
+    debugLogPush('remote (host): longScreenshotRequest ignored — missing requestId', 'warn');
+    return;
+  }
+  if (!isController(serial, peerId, grantId)) {
+    const entry = remoteSession.controlBySerial.get(serial);
+    debugLogPush(`remote (host): longScreenshotRequest REJECTED — not the current controller of ${serial} (sender peerId=${peerId} grantId=${grantId}; on file: peerId=${entry && entry.peerId} grantId=${entry && entry.grantId})`, 'err');
+    return;
+  }
   const info = connectedDevices.get(serial);
   if (!info) {
+    debugLogPush(`remote (host): longScreenshotRequest failed — ${serial} not in connectedDevices`, 'err');
     try { remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: false, error: 'Device not connected' }, { target: peerId }); } catch (_) {}
     return;
   }
   const startTime = Date.now();
   try {
+    debugLogPush(`remote (host): long screenshot starting for ${serial}`, 'evt');
     sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
-    let lastFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
+    debugLogPush('remote (host): long screenshot — capturing frame 1 (adbScreencap)...', 'evt');
+    const firstPng = await adbScreencap(info.adb, 15000);
+    debugLogPush(`remote (host): long screenshot — frame 1 captured, ${firstPng.length} bytes, decoding...`, 'evt');
+    let lastFrame = await pngToCanvas(firstPng);
+    debugLogPush(`remote (host): long screenshot — frame 1 decoded, ${lastFrame.width}x${lastFrame.height}`, 'evt');
     let stitched = lastFrame;
     let frameCount = 1;
     for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
-      if (!isController(serial, peerId, grantId) || Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) break;
+      if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
+      if (Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) { debugLogPush('remote (host): long screenshot — overall timeout reached, stopping early', 'warn'); break; }
       const x = Math.round(lastFrame.width / 2);
       const fromY = Math.round(lastFrame.height * 0.85);
       const toY = Math.round(lastFrame.height * 0.15);
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: swiping (${x},${fromY}) -> (${x},${toY})`, 'evt');
       await adbShell(info.adb, `input swipe ${x} ${fromY} ${x} ${toY} 300`);
       await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
       sendLongScreenshotProgress(peerId, serial, grantId, `Capturing frame ${i + 1}...`);
-      const newFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: capturing...`, 'evt');
+      const png = await adbScreencap(info.adb, 15000);
+      const newFrame = await pngToCanvas(png);
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: captured (${png.length} bytes), finding overlap...`, 'evt');
       const sliceY = findScrollOverlap(lastFrame, newFrame);
       await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas draw
       const newHeight = newFrame.height - sliceY;
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: sliceY=${sliceY} newHeight=${newHeight} (frame height=${newFrame.height})`, 'evt');
       lastFrame = newFrame;
       // Scrolling produced essentially no new content — reached the bottom of the page.
-      if (newHeight < Math.round(newFrame.height * 0.03)) { frameCount++; break; }
+      if (newHeight < Math.round(newFrame.height * 0.03)) {
+        debugLogPush(`remote (host): long screenshot — frame ${i + 1} added no new content, treating as end of page`, 'evt');
+        frameCount++;
+        break;
+      }
       const grown = new OffscreenCanvas(stitched.width, stitched.height + newHeight);
       const gctx = grown.getContext('2d');
       gctx.drawImage(stitched, 0, 0);
       gctx.drawImage(newFrame, 0, sliceY, newFrame.width, newHeight, 0, stitched.height, newFrame.width, newHeight);
       stitched = grown;
       frameCount++;
+      debugLogPush(`remote (host): long screenshot — stitched now ${stitched.width}x${stitched.height} (${frameCount} frames)`, 'evt');
     }
     sendLongScreenshotProgress(peerId, serial, grantId, 'Finalizing...');
+    debugLogPush('remote (host): long screenshot — encoding final PNG...', 'evt');
     const blob = await stitched.convertToBlob({ type: 'image/png' });
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    debugLogPush(`remote (host): long screenshot for ${serial}: ${frameCount} frame(s), ${stitched.width}x${stitched.height}, ${bytes.length} bytes`, 'ok');
+    debugLogPush(`remote (host): long screenshot for ${serial}: ${frameCount} frame(s), ${stitched.width}x${stitched.height}, ${bytes.length} bytes — sending result to peerId=${peerId}`, 'ok');
     remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: true, png: uint8ToBase64(bytes), frameCount }, { target: peerId });
   } catch (err) {
-    debugLogPush(`remote (host): long screenshot failed: ${err && err.message || err}`, 'err');
+    debugLogPush(`remote (host): long screenshot failed: ${err && err.stack || err}`, 'err');
     try { remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: false, error: String(err && err.message || err) }, { target: peerId }); } catch (_) {}
   }
 }
@@ -3265,7 +3295,9 @@ function handleScreenshotResult(data) {
 // messages keep the button's status text moving instead of looking hung.
 function requestLongScreenshot() {
   const entry = getActiveControlEntry();
-  if (!entry || !remoteSession.hostPeerId) return;
+  debugLogPush(`remote (viewer): requestLongScreenshot() clicked — activeSerial=${remoteSession?.mirror?.activeSerial} hasControlEntry=${!!entry} hostPeerId=${remoteSession?.hostPeerId}`, 'evt');
+  if (!entry) { debugLogPush('remote (viewer): requestLongScreenshot aborted — no active control entry (not currently in control of a device)', 'warn'); return; }
+  if (!remoteSession.hostPeerId) { debugLogPush('remote (viewer): requestLongScreenshot aborted — hostPeerId not yet known', 'warn'); return; }
   const serial = remoteSession.mirror.activeSerial;
   const requestId = crypto.randomUUID();
   const btn = document.getElementById('btn-long-screenshot');
@@ -3273,26 +3305,30 @@ function requestLongScreenshot() {
   setApkStatus('Starting long screenshot...', '');
   try {
     remoteSession.actions.longScreenshotRequest.send({ requestId, serial, grantId: entry.grantId }, { target: remoteSession.hostPeerId });
-  } catch (_) {
+    debugLogPush(`remote (viewer): longScreenshotRequest sent — requestId=${requestId} serial=${serial} grantId=${entry.grantId} target=${remoteSession.hostPeerId}`, 'evt');
+  } catch (err) {
+    debugLogPush(`remote (viewer): longScreenshotRequest send threw: ${err && err.message || err}`, 'err');
     if (btn) btn.disabled = false;
     setApkStatus('Failed to request long screenshot', 'err');
   }
 }
 
 function handleLongScreenshotProgress(data) {
+  debugLogPush(`remote (viewer): longScreenshotProgress received: ${JSON.stringify(data)}`, 'evt');
   if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
   const { serial, grantId, message } = data;
   const entry = remoteSession.controlBySerial[serial];
-  if (!entry || entry.grantId !== grantId) return;
+  if (!entry || entry.grantId !== grantId) { debugLogPush('remote (viewer): longScreenshotProgress ignored — grantId mismatch or no entry', 'warn'); return; }
   if (serial !== remoteSession.mirror.activeSerial) return;
   setApkStatus(message, '');
 }
 
 function handleLongScreenshotResult(data) {
+  debugLogPush(`remote (viewer): longScreenshotResult received: ok=${data && data.ok} frameCount=${data && data.frameCount} error=${data && data.error} pngLen=${data && data.png && data.png.length}`, 'evt');
   if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
   const { serial, grantId, ok, png, frameCount, error } = data;
   const entry = remoteSession.controlBySerial[serial];
-  if (!entry || entry.grantId !== grantId) return;
+  if (!entry || entry.grantId !== grantId) { debugLogPush('remote (viewer): longScreenshotResult ignored — grantId mismatch or no entry', 'warn'); return; }
   if (serial !== remoteSession.mirror.activeSerial) return;
   const btn = document.getElementById('btn-long-screenshot');
   if (btn) btn.disabled = false;
