@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.21.0';
+const APP_VERSION = '1.22.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1638,7 +1638,8 @@ function makeRemoteActions(room, roomId, password, label) {
   const actions = {};
   for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'tabDataPush', 'bye',
     'controlRequest', 'controlResponse', 'controlRelease', 'controlRevoked', 'screenFrame', 'inputEvent', 'orientationStatus',
-    'apkTransferStart', 'apkTransferChunk', 'apkTransferEnd', 'apkInstallResult']) actions[name] = wrap(name);
+    'apkTransferStart', 'apkTransferChunk', 'apkTransferEnd', 'apkInstallResult',
+    'screenshotRequest', 'screenshotResult']) actions[name] = wrap(name);
   actions._fallback = fallback;
   actions._sessionId = sessionId;
   return actions;
@@ -1747,6 +1748,7 @@ function startShareSession() {
   actions.apkTransferStart.onMessage = (data, ctx) => handleApkTransferStart(data, ctx.peerId);
   actions.apkTransferChunk.onMessage = (data, ctx) => handleApkTransferChunk(data, ctx.peerId);
   actions.apkTransferEnd.onMessage = (data, ctx) => handleApkTransferEnd(data, ctx.peerId);
+  actions.screenshotRequest.onMessage = (data, ctx) => handleScreenshotRequest(data, ctx.peerId);
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
     remoteSession.viewers.add(peerId);
@@ -2186,18 +2188,44 @@ function toSafeInt(v) {
 // 0-3 = 0°/90°/180°/270°, matching Surface.ROTATION_* constants — NOT literal degrees).
 // Some devices/Android versions don't support this command at all; `supported:false`
 // lets the UI show "Unknown" instead of a misleading default.
+// Was originally implemented by parsing `wm user-rotation`'s free-form text output
+// ("Rotation lock: enabled/disabled" + "Rotation: N") — reported as ALWAYS showing
+// "unknown," meaning that regex never actually matched real device output (`wm`'s bare
+// no-argument query behavior apparently isn't consistent enough across Android versions/
+// OEMs to parse reliably this way). Switched to `settings get system
+// accelerometer_rotation`/`user_rotation` — the Settings Provider is a much more
+// universal, stable primitive than a CLI tool's printed status text, and these two keys
+// are exactly what AOSP's own Settings app reads for this. Logs the raw values either
+// way so a future "still shows unknown" report has real data instead of another guess.
 async function queryOrientation(adb) {
   try {
-    const out = await adbShell(adb, 'wm user-rotation');
-    const lockedMatch = out.match(/Rotation lock:\s*(enabled|disabled)/i);
-    if (!lockedMatch) return { supported: false, locked: false, rotation: 0 };
-    const locked = /enabled/i.test(lockedMatch[1]);
-    const rotMatch = out.match(/Rotation:\s*(\d+)/i);
-    const rotation = rotMatch ? (parseInt(rotMatch[1], 10) % 4) : 0;
+    const [autoRotateRaw, userRotationRaw] = await Promise.all([
+      adbShell(adb, 'settings get system accelerometer_rotation'),
+      adbShell(adb, 'settings get system user_rotation'),
+    ]);
+    const autoRotate = autoRotateRaw.trim();
+    const userRotation = userRotationRaw.trim();
+    debugLogPush(`queryOrientation: accelerometer_rotation="${autoRotate}" user_rotation="${userRotation}"`, 'evt');
+    if (autoRotate === '' || autoRotate.toLowerCase() === 'null') {
+      return { supported: false, locked: false, rotation: 0 };
+    }
+    const locked = autoRotate === '0';
+    const rotation = /^[0-3]$/.test(userRotation) ? parseInt(userRotation, 10) : 0;
     return { supported: true, locked, rotation };
-  } catch (_) {
+  } catch (err) {
+    debugLogPush(`queryOrientation FAILED: ${err && err.message || err}`, 'warn');
     return { supported: false, locked: false, rotation: 0 };
   }
+}
+
+// Sets an ABSOLUTE rotation (0=portrait, 1=landscape, 2=portrait-upside-down,
+// 3=landscape-upside-down) via `wm user-rotation lock N`, per the user's explicit ask
+// for rotation to go through the wm command specifically (kept distinct from the more
+// reliable `settings put` primitive used for the read side above, since the two are
+// separate concerns — reading status vs. issuing the rotate action).
+async function setOrientation(adb, rotation) {
+  const out = await adbShell(adb, `wm user-rotation lock ${toSafeInt(rotation) % 4}`);
+  debugLogPush(`setOrientation(${rotation}): wm output="${out.trim()}"`, 'evt');
 }
 
 function sendOrientationStatus(peerId, serial, grantId, status) {
@@ -2218,16 +2246,20 @@ async function handleInputEvent(data, peerId) {
   // Rotation needs a read-modify-write round trip (query current state, compute the next
   // one, apply it, report back) — handled separately from the simple fire-and-forget
   // keyevent/tap/swipe/text commands below.
-  if (data.type === 'rotate' || data.type === 'setAutoRotate') {
+  if (data.type === 'rotate' || data.type === 'rotateTo' || data.type === 'setAutoRotate') {
     try {
       if (data.type === 'setAutoRotate') {
         await adbShell(info.adb, 'wm user-rotation free');
+      } else if (data.type === 'rotateTo') {
+        // Absolute Portrait (0) / Landscape (1) buttons — as opposed to 'rotate', which
+        // moves relative to whatever the current rotation is.
+        await setOrientation(info.adb, data.rotation);
       } else {
         const current = await queryOrientation(info.adb);
         const base = current.supported ? current.rotation : 0;
         const delta = data.direction === 'left' ? -1 : 1;
         const next = ((base + delta) % 4 + 4) % 4;
-        await adbShell(info.adb, `wm user-rotation lock ${next}`);
+        await setOrientation(info.adb, next);
       }
       const updated = await queryOrientation(info.adb);
       sendOrientationStatus(peerId, serial, grantId, updated);
@@ -2371,6 +2403,30 @@ async function handleApkTransferEnd(data, peerId) {
     debugLogPush(`remote (host): apk install failed: ${err && err.message || err}`, 'err');
     sendApkInstallResult(peerId, serial, grantId, transferId, false, String(err && err.message || err));
     try { await info.adb.rm(remotePath, { force: true }); } catch (_) {}
+  }
+}
+
+// --- Remote Control: full-resolution screenshot (host) ---
+// Deliberately separate from the continuous screenFrame stream (which is scaled down for
+// speed, see captureScaledFrame()) — this is a discrete, one-off, full-resolution capture
+// meant to actually be saved, so no scaling/recompression: same authorization check as
+// every other control action (must be the current controller for this serial+grantId).
+async function handleScreenshotRequest(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { requestId, serial, grantId } = data || {};
+  if (!requestId || !isController(serial, peerId, grantId)) return;
+  const info = connectedDevices.get(serial);
+  if (!info) {
+    try { remoteSession.actions.screenshotResult.send({ requestId, serial, grantId, ok: false, error: 'Device not connected' }, { target: peerId }); } catch (_) {}
+    return;
+  }
+  try {
+    const png = await adbScreencap(info.adb, 15000);
+    debugLogPush(`remote (host): screenshot captured for ${serial}: ${png.length} bytes`, 'ok');
+    remoteSession.actions.screenshotResult.send({ requestId, serial, grantId, ok: true, png: uint8ToBase64(png) }, { target: peerId });
+  } catch (err) {
+    debugLogPush(`remote (host): screenshot failed: ${err && err.message || err}`, 'err');
+    try { remoteSession.actions.screenshotResult.send({ requestId, serial, grantId, ok: false, error: String(err && err.message || err) }, { target: peerId }); } catch (_) {}
   }
 }
 
@@ -2519,6 +2575,10 @@ function joinAsViewer(roomId, password) {
   actions.apkInstallResult.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
     handleApkInstallResult(data);
+  };
+  actions.screenshotResult.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    handleScreenshotResult(data);
   };
   actions.bye.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
@@ -2751,10 +2811,7 @@ function renderControlTab() {
   const reqBtn = document.getElementById('btn-request-control');
   const relBtn = document.getElementById('btn-release-control');
   const screenWrap = document.getElementById('control-screen-wrap');
-  const hwButtons = document.getElementById('control-hw-buttons');
-  const orientationRow = document.getElementById('control-orientation-row');
-  const textRow = document.getElementById('control-text-row');
-  const apkRow = document.getElementById('control-apk-row');
+  const sidePanel = document.getElementById('control-side-panel');
   const img = document.getElementById('control-screen-img');
   resetApkProgressUI();
   if (entry && entry.active) {
@@ -2762,10 +2819,7 @@ function renderControlTab() {
     reqBtn?.classList.add('hidden');
     relBtn?.classList.remove('hidden');
     screenWrap?.classList.remove('hidden');
-    hwButtons?.classList.remove('hidden');
-    orientationRow?.classList.remove('hidden');
-    textRow?.classList.remove('hidden');
-    apkRow?.classList.remove('hidden');
+    sidePanel?.classList.remove('hidden');
     if (img) img.src = entry.lastJpeg ? ('data:image/jpeg;base64,' + entry.lastJpeg) : '';
     setOrientationBadge(entry.orientation);
   } else {
@@ -2773,10 +2827,7 @@ function renderControlTab() {
     if (reqBtn) { reqBtn.classList.remove('hidden'); reqBtn.disabled = !serial; }
     relBtn?.classList.add('hidden');
     screenWrap?.classList.add('hidden');
-    hwButtons?.classList.add('hidden');
-    orientationRow?.classList.add('hidden');
-    textRow?.classList.add('hidden');
-    apkRow?.classList.add('hidden');
+    sidePanel?.classList.add('hidden');
     if (img) img.src = '';
   }
 }
@@ -2810,6 +2861,7 @@ function sendControlText() {
 
 function sendControlRotate(direction) { sendInputEvent('rotate', { direction }); }
 function sendControlAutoRotate() { sendInputEvent('setAutoRotate', { enabled: true }); }
+function sendControlRotateTo(rotation) { sendInputEvent('rotateTo', { rotation }); }
 
 function setOrientationBadge(status) {
   const el = document.getElementById('control-orientation-status');
@@ -2842,8 +2894,14 @@ function setApkStatus(text, kind) {
   el.className = 'badge' + (kind === 'err' ? ' err' : kind === 'ok' ? ' ok' : '');
 }
 
+function setApkFilename(text) {
+  const el = document.getElementById('control-apk-filename');
+  if (el) el.textContent = text;
+}
+
 function resetApkProgressUI() {
   setApkStatus('', '');
+  setApkFilename('No file selected');
   const input = document.getElementById('control-apk-input');
   if (input) { input.disabled = false; input.value = ''; }
 }
@@ -2851,6 +2909,7 @@ function resetApkProgressUI() {
 async function installApk(fileInput) {
   const file = fileInput.files && fileInput.files[0];
   if (!file) return;
+  setApkFilename(file.name);
   const entry = getActiveControlEntry();
   if (!entry) { setApkStatus('Not in control of this device', 'err'); fileInput.value = ''; return; }
   if (!file.name.toLowerCase().endsWith('.apk')) { setApkStatus('Please select a .apk file', 'err'); fileInput.value = ''; return; }
@@ -2892,6 +2951,41 @@ function handleApkInstallResult(data) {
   if (serial === remoteSession.mirror.activeSerial) {
     setApkStatus(ok ? ('Installed: ' + message) : ('Failed: ' + message), ok ? 'ok' : 'err');
   }
+}
+
+// --- Remote Control: full-resolution screenshot (viewer) ---
+function requestScreenshot() {
+  const entry = getActiveControlEntry();
+  if (!entry || !remoteSession.hostPeerId) return;
+  const serial = remoteSession.mirror.activeSerial;
+  const requestId = crypto.randomUUID();
+  const btn = document.getElementById('btn-screenshot');
+  if (btn) btn.disabled = true;
+  setApkStatus('Capturing screenshot...', '');
+  try {
+    remoteSession.actions.screenshotRequest.send({ requestId, serial, grantId: entry.grantId }, { target: remoteSession.hostPeerId });
+  } catch (_) {
+    if (btn) btn.disabled = false;
+    setApkStatus('Failed to request screenshot', 'err');
+  }
+}
+
+function handleScreenshotResult(data) {
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial, grantId, ok, png, error } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || entry.grantId !== grantId) return;
+  if (serial !== remoteSession.mirror.activeSerial) return;
+  const btn = document.getElementById('btn-screenshot');
+  if (btn) btn.disabled = false;
+  if (!ok) { setApkStatus('Screenshot failed: ' + error, 'err'); return; }
+  const link = document.createElement('a');
+  link.href = 'data:image/png;base64,' + png;
+  link.download = 'screenshot_' + serial + '_' + Date.now() + '.png';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setApkStatus('Screenshot saved', 'ok');
 }
 
 // Wired once (guarded by _controlWired) and left in place for the life of the page —
@@ -4305,7 +4399,9 @@ window.denyControlRequest = denyControlRequest;
 window.stopControlSession = stopControlSession;
 window.sendControlRotate = sendControlRotate;
 window.sendControlAutoRotate = sendControlAutoRotate;
+window.sendControlRotateTo = sendControlRotateTo;
 window.installApk = installApk;
+window.requestScreenshot = requestScreenshot;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 // targetSerial/background — same purpose and contract as fetchAttestation()'s, see its
