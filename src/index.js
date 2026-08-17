@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.6';
+const APP_VERSION = '1.25.7';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2698,6 +2698,20 @@ function detectChromeBounds(canvasA, canvasB) {
   return { top: Math.round(top * unscale), bottom: canvasA.height - Math.round(bottomCount * unscale) };
 }
 
+// Hides (or restores) the status bar + on-screen navigation bar via the same hidden
+// "immersive mode" global setting Android's own automation/testing tooling uses to get
+// clean UI screenshots — `policy_control` isn't a documented public API, but it's been
+// stable since Android 4.4 and works without root. This sidesteps the whole class of
+// pixel-based chrome-detection bugs found in v1.25.5/v1.25.6 (a mostly-dark, sparse-text
+// theme kept fooling pixel-diff heuristics into misjudging where chrome ends) by simply
+// not having any chrome in the captured frames to begin with. Best-effort: some
+// MDM-locked enterprise devices may reject `settings put global`, so a failure here is
+// logged and swallowed rather than aborting the whole capture — detectChromeBounds()
+// below still runs as a defensive fallback in case bars are still present.
+async function setImmersiveMode(adb, enabled) {
+  await adbShell(adb, `settings put global policy_control immersive.full=${enabled ? '*' : ''}`);
+}
+
 function sendLongScreenshotProgress(peerId, serial, grantId, message) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   // Deliberately no requestId — this fires many times per operation, and the generic
@@ -2730,8 +2744,17 @@ async function handleLongScreenshotRequest(data, peerId) {
     return;
   }
   const startTime = Date.now();
+  let immersiveApplied = false;
   try {
     debugLogPush(`remote (host): long screenshot starting for ${serial}`, 'evt');
+    try {
+      await setImmersiveMode(info.adb, true);
+      immersiveApplied = true;
+      await new Promise((r) => setTimeout(r, 400)); // let the hide animation settle before capturing
+      debugLogPush('remote (host): long screenshot — hid status/nav bars for a clean capture', 'evt');
+    } catch (err) {
+      debugLogPush(`remote (host): long screenshot — could not hide system bars, continuing with pixel-based chrome cropping instead: ${err && err.message || err}`, 'warn');
+    }
     sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
     debugLogPush('remote (host): long screenshot — capturing frame 1 (adbScreencap)...', 'evt');
     const firstPng = await adbScreencap(info.adb, 15000);
@@ -2800,6 +2823,12 @@ async function handleLongScreenshotRequest(data, peerId) {
   } catch (err) {
     debugLogPush(`remote (host): long screenshot failed: ${err && err.stack || err}`, 'err');
     try { remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: false, error: String(err && err.message || err) }, { target: peerId }); } catch (_) {}
+  } finally {
+    // Always restore system bars if we hid them — even on error/timeout/control-lost, a
+    // failed capture must never leave the device stuck with no status/nav bar visible.
+    if (immersiveApplied) {
+      try { await setImmersiveMode(info.adb, false); debugLogPush('remote (host): long screenshot — restored status/nav bars', 'evt'); } catch (err) { debugLogPush(`remote (host): long screenshot — failed to restore system bars: ${err && err.message || err}`, 'err'); }
+    }
   }
 }
 

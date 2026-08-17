@@ -204,6 +204,11 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.25.7 — long screenshot: stopped trying to detect chrome, hide it instead
+After two rounds (v1.25.5, v1.25.6) of pixel-based chrome-boundary detection still failing on this app's dark, sparse-text theme, switched strategy entirely: instead of trying to *detect and crop* the status/navigation bar after the fact, *hide them during capture* so the frames never contain any chrome to begin with. `setImmersiveMode(adb, enabled)` toggles the same hidden `settings put global policy_control immersive.full=*` setting Android's own UI-automation/screenshot tooling has used since Android 4.4 (undocumented but stable, no root needed) — set before frame 1 is captured (with a 400ms settle delay for the hide animation), and guaranteed to be restored in a `finally` block regardless of success, error, timeout, or control being revoked mid-capture, so a failed run can never leave a device stuck with no status/nav bar.
+
+Best-effort and layered, not a hard dependency: some MDM-locked enterprise devices may reject `settings put global` outright, so a failure to hide bars is logged and swallowed rather than aborting the capture — `detectChromeBounds()` (v1.25.5/v1.25.6) still runs unconditionally as a defensive fallback in case bars are still present for any reason, but with bars actually hidden it should mostly find nothing to crop.
+
 ### v1.25.6 — long screenshot: nav bar still visible after v1.25.5 — chrome detection was too imprecise
 Real repro right after v1.25.5: nav bar still appeared mid-page, content still duplicated. Root cause was in `detectChromeBounds()` itself, not the overall approach: it compared rows by their AVERAGE per-pixel difference over an aggressively downscaled (60px-wide) thumbnail. This app's UI is a mostly-uniform dark background with sparse light text — on that theme, a genuinely-different (scrolled) content row is still *mostly* background pixels, so averaging the difference across the whole row width dilutes the few truly-changed text pixels down below the "this row is identical" threshold. The scan kept extending through real content, misjudging it as chrome, and the actual nav bar boundary was found in the wrong place (or not at all).
 
