@@ -914,6 +914,7 @@
                 <button class="btn btn-sm" onclick="sendControlKey(25)">Vol-</button>
                 <button class="btn btn-sm" onclick="sendControlKey(83)">Notifications</button>
                 <button class="btn btn-sm" id="btn-screenshot" onclick="requestScreenshot()" title="Capture and download a full-resolution screenshot">&#128247; Screenshot</button>
+                <button class="btn btn-sm" id="btn-long-screenshot" onclick="requestLongScreenshot()" title="Best-effort: scrolls to the end of the page and stitches a full-length screenshot. May misalign on sticky headers, ads, or animated content.">&#128220; Long Screenshot</button>
               </div>
               <div id="control-orientation-row" class="quick-btns">
                 <span id="control-orientation-status" class="badge">Orientation: unknown</span>
@@ -956,6 +957,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026081706"></script>
+<script type="module" src="bundle.js?v=2026081707"></script>
 </body>
 </html>

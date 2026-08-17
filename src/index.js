@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.24.0';
+const APP_VERSION = '1.25.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1653,7 +1653,8 @@ function makeRemoteActions(room, roomId, password, label) {
   for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'tabDataPush', 'bye',
     'controlRequest', 'controlResponse', 'controlRelease', 'controlRevoked', 'screenFrame', 'inputEvent', 'orientationStatus',
     'apkTransferStart', 'apkTransferChunk', 'apkTransferEnd', 'apkInstallResult',
-    'screenshotRequest', 'screenshotResult', 'viewerHeartbeat']) actions[name] = wrap(name);
+    'screenshotRequest', 'screenshotResult', 'longScreenshotRequest', 'longScreenshotProgress', 'longScreenshotResult',
+    'viewerHeartbeat']) actions[name] = wrap(name);
   actions._fallback = fallback;
   actions._sessionId = sessionId;
   return actions;
@@ -1763,6 +1764,7 @@ function startShareSession() {
   actions.apkTransferChunk.onMessage = (data, ctx) => handleApkTransferChunk(data, ctx.peerId);
   actions.apkTransferEnd.onMessage = (data, ctx) => handleApkTransferEnd(data, ctx.peerId);
   actions.screenshotRequest.onMessage = (data, ctx) => handleScreenshotRequest(data, ctx.peerId);
+  actions.longScreenshotRequest.onMessage = (data, ctx) => handleLongScreenshotRequest(data, ctx.peerId);
   actions.viewerHeartbeat.onMessage = (data, ctx) => registerViewerPresence(ctx.peerId, data);
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
@@ -2523,6 +2525,115 @@ async function handleScreenshotRequest(data, peerId) {
   }
 }
 
+// --- Remote Control: long (scrolling) screenshot (host) ---
+// There is no generic ADB/Android API for a "long screenshot" — it's an OEM
+// (Samsung/Xiaomi/etc.) system-UI feature, not something `adb shell` can invoke. This
+// approximates it at the app level: capture a frame, swipe up one "page," capture again,
+// and stitch each new frame onto the growing image by finding where its content overlaps
+// the previous frame (template-matching a thin strip, not a fixed pixel offset — apps
+// don't all scroll the same amount per swipe). Stops the moment a swipe stops producing
+// new content (treated as "reached the bottom") or after LONG_SCREENSHOT_MAX_FRAMES.
+// Best-effort by nature: sticky headers/footers, ads, video, or other content that
+// changes on its own between frames can produce a misaligned or duplicated seam.
+const LONG_SCREENSHOT_MAX_FRAMES = 15;
+const LONG_SCREENSHOT_SETTLE_MS = 600;
+const LONG_SCREENSHOT_TOTAL_TIMEOUT_MS = 100000;
+
+async function pngToCanvas(png) {
+  const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  canvas.getContext('2d').drawImage(bitmap, 0, 0);
+  return canvas;
+}
+
+// Finds where `prevCanvas`'s bottom edge re-appears inside `nextCanvas` (i.e. how far
+// the swipe actually scrolled the page), by sliding a thin strip from prev's bottom down
+// through next's upper-to-middle region and keeping the best (lowest-difference) match.
+// Returns the y-offset in `nextCanvas` below which content is genuinely new. Falls back
+// to a conservative fixed overlap if no good match is found (page changed unpredictably).
+function findScrollOverlap(prevCanvas, nextCanvas) {
+  const width = prevCanvas.width;
+  const stripHeight = Math.max(8, Math.round(prevCanvas.height * 0.03));
+  const sampleStep = Math.max(1, Math.round(width / 200));
+  const stripA = prevCanvas.getContext('2d').getImageData(0, prevCanvas.height - stripHeight, width, stripHeight).data;
+  const ctxB = nextCanvas.getContext('2d');
+  const searchFrom = Math.round(nextCanvas.height * 0.05);
+  const searchTo = Math.min(nextCanvas.height - stripHeight, Math.round(nextCanvas.height * 0.6));
+  let bestY = Math.round(nextCanvas.height * 0.15);
+  let bestScore = Infinity;
+  for (let y = searchFrom; y <= searchTo; y += 4) {
+    const stripB = ctxB.getImageData(0, y, width, stripHeight).data;
+    let sum = 0, n = 0;
+    for (let row = 0; row < stripHeight; row++) {
+      for (let col = 0; col < width; col += sampleStep) {
+        const idx = (row * width + col) * 4;
+        sum += Math.abs(stripA[idx] - stripB[idx]) + Math.abs(stripA[idx + 1] - stripB[idx + 1]) + Math.abs(stripA[idx + 2] - stripB[idx + 2]);
+        n++;
+      }
+    }
+    const score = sum / n;
+    if (score < bestScore) { bestScore = score; bestY = y; }
+  }
+  const matched = bestScore < 40; // empirical threshold on a 0-765 (3-channel) difference scale
+  return matched ? (bestY + stripHeight) : Math.round(nextCanvas.height * 0.15);
+}
+
+function sendLongScreenshotProgress(peerId, serial, grantId, message) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  // Deliberately no requestId — this fires many times per operation, and the generic
+  // dual-transport dedup in deliver() keys on (action, requestId), so reusing one
+  // requestId here would make every message after the first look like an already-seen
+  // duplicate and get silently dropped. A duplicated/out-of-order status line is harmless.
+  try { remoteSession.actions.longScreenshotProgress.send({ serial, grantId, message }, { target: peerId }); } catch (_) {}
+}
+
+async function handleLongScreenshotRequest(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { requestId, serial, grantId } = data || {};
+  if (!requestId || !isController(serial, peerId, grantId)) return;
+  const info = connectedDevices.get(serial);
+  if (!info) {
+    try { remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: false, error: 'Device not connected' }, { target: peerId }); } catch (_) {}
+    return;
+  }
+  const startTime = Date.now();
+  try {
+    sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
+    let lastFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
+    let stitched = lastFrame;
+    let frameCount = 1;
+    for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
+      if (!isController(serial, peerId, grantId) || Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) break;
+      const x = Math.round(lastFrame.width / 2);
+      const fromY = Math.round(lastFrame.height * 0.85);
+      const toY = Math.round(lastFrame.height * 0.15);
+      await adbShell(info.adb, `input swipe ${x} ${fromY} ${x} ${toY} 300`);
+      await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
+      sendLongScreenshotProgress(peerId, serial, grantId, `Capturing frame ${i + 1}...`);
+      const newFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
+      const sliceY = findScrollOverlap(lastFrame, newFrame);
+      const newHeight = newFrame.height - sliceY;
+      lastFrame = newFrame;
+      // Scrolling produced essentially no new content — reached the bottom of the page.
+      if (newHeight < Math.round(newFrame.height * 0.03)) { frameCount++; break; }
+      const grown = new OffscreenCanvas(stitched.width, stitched.height + newHeight);
+      const gctx = grown.getContext('2d');
+      gctx.drawImage(stitched, 0, 0);
+      gctx.drawImage(newFrame, 0, sliceY, newFrame.width, newHeight, 0, stitched.height, newFrame.width, newHeight);
+      stitched = grown;
+      frameCount++;
+    }
+    sendLongScreenshotProgress(peerId, serial, grantId, 'Finalizing...');
+    const blob = await stitched.convertToBlob({ type: 'image/png' });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    debugLogPush(`remote (host): long screenshot for ${serial}: ${frameCount} frame(s), ${stitched.width}x${stitched.height}, ${bytes.length} bytes`, 'ok');
+    remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: true, png: uint8ToBase64(bytes), frameCount }, { target: peerId });
+  } catch (err) {
+    debugLogPush(`remote (host): long screenshot failed: ${err && err.message || err}`, 'err');
+    try { remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: false, error: String(err && err.message || err) }, { target: peerId }); } catch (_) {}
+  }
+}
+
 function showShareModal() {
   hideShareModal();
   const link = location.origin + location.pathname + '#room=' + remoteSession.roomId + '&key=' + remoteSession.password;
@@ -2703,6 +2814,14 @@ function joinAsViewer(roomId, password) {
   actions.screenshotResult.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
     handleScreenshotResult(data);
+  };
+  actions.longScreenshotProgress.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    handleLongScreenshotProgress(data);
+  };
+  actions.longScreenshotResult.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    handleLongScreenshotResult(data);
   };
   actions.bye.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
@@ -3112,6 +3231,55 @@ function handleScreenshotResult(data) {
   link.click();
   document.body.removeChild(link);
   setApkStatus('Screenshot saved', 'ok');
+}
+
+// --- Remote Control: long (scrolling) screenshot (viewer) ---
+// Best-effort scroll-and-stitch capture — see the host-side comment on
+// handleLongScreenshotRequest() for how it works and its limitations (sticky
+// headers/ads/animation can cause a misaligned or duplicated seam). Can take a while
+// (several device screenshots + swipes + settle delays in sequence), so progress
+// messages keep the button's status text moving instead of looking hung.
+function requestLongScreenshot() {
+  const entry = getActiveControlEntry();
+  if (!entry || !remoteSession.hostPeerId) return;
+  const serial = remoteSession.mirror.activeSerial;
+  const requestId = crypto.randomUUID();
+  const btn = document.getElementById('btn-long-screenshot');
+  if (btn) btn.disabled = true;
+  setApkStatus('Starting long screenshot...', '');
+  try {
+    remoteSession.actions.longScreenshotRequest.send({ requestId, serial, grantId: entry.grantId }, { target: remoteSession.hostPeerId });
+  } catch (_) {
+    if (btn) btn.disabled = false;
+    setApkStatus('Failed to request long screenshot', 'err');
+  }
+}
+
+function handleLongScreenshotProgress(data) {
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial, grantId, message } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || entry.grantId !== grantId) return;
+  if (serial !== remoteSession.mirror.activeSerial) return;
+  setApkStatus(message, '');
+}
+
+function handleLongScreenshotResult(data) {
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial, grantId, ok, png, frameCount, error } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || entry.grantId !== grantId) return;
+  if (serial !== remoteSession.mirror.activeSerial) return;
+  const btn = document.getElementById('btn-long-screenshot');
+  if (btn) btn.disabled = false;
+  if (!ok) { setApkStatus('Long screenshot failed: ' + error, 'err'); return; }
+  const link = document.createElement('a');
+  link.href = 'data:image/png;base64,' + png;
+  link.download = 'long_screenshot_' + serial + '_' + Date.now() + '.png';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setApkStatus(`Long screenshot saved (${frameCount} frame${frameCount === 1 ? '' : 's'})`, 'ok');
 }
 
 // Wired once (guarded by _controlWired) and left in place for the life of the page —
