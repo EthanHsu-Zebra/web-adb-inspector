@@ -6,34 +6,72 @@
 <title>Web ADB Inspector</title>
 <style>
   :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --border: #30363d;
-    --text: #c9d1d9;
-    --muted: #8b949e;
-    --accent: #58a6ff;
-    --green: #3fb950;
-    --red: #ff5252;
-    --yellow: #d29922;
-    --orange: #db6d28;
+    /* Apple's dark-mode system-color palette (systemBlue/Green/Red/Yellow/Orange) —
+       swapped in for the design refresh so accents/badges/status colors read as
+       Apple's, not GitHub's, without touching any of the semantic var() call sites
+       that already use them throughout this file and src/index.js. */
+    --bg: #000000;
+    --bg-rgb: 0,0,0;
+    --surface: #1c1c1e;
+    --surface-rgb: 28,28,30;
+    --surface-2: #2c2c2e;
+    --border: rgba(255,255,255,0.09);
+    --text: #f2f2f7;
+    --muted: #98989f;
+    --accent: #0a84ff;
+    --accent-rgb: 10,132,255;
+    --green: #32d74b;
+    --red: #ff453a;
+    --yellow: #ffd60a;
+    --orange: #ff9f0a;
     --mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
     --font-scale: 1;
+    --radius: 10px;
+    --radius-lg: 16px;
+    /* Approximates a critically-damped spring's ease-out curve for CSS transitions —
+       see the apple-design skill: snappy start, no overshoot, settles smoothly. */
+    --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+    --fast: 120ms var(--ease-spring);
+    --med: 220ms var(--ease-spring);
   }
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif;
     font-size: calc(14px * var(--font-scale));
     background: var(--bg);
     color: var(--text);
     line-height: 1.5;
     min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
   }
   .hidden { display: none !important; }
   .empty-hint { text-align: center; color: var(--muted); padding: 1rem; font-style: italic; }
 
-  /* Header */
+  /* Response — feedback lives on press, not on release, and it's instant. Every
+     interactive element gets the same press scale + smooth (never linear) easing;
+     prefers-reduced-motion strips the transform but keeps color/opacity feedback. */
+  .btn, .btn-sm, .btn-connect, .btn-disconnect, .font-btn, .tab, .device-card, .pkg-item {
+    transition: transform var(--fast), background-color var(--med), color var(--med), border-color var(--med), opacity var(--med);
+  }
+  .btn:active, .btn-sm:active, .btn-connect:active, .btn-disconnect:active, .font-btn:active { transform: scale(0.96); }
+  .device-card:active { transform: scale(0.995); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+    .btn:active, .btn-sm:active, .btn-connect:active, .btn-disconnect:active, .font-btn:active, .device-card:active { transform: none !important; }
+  }
+
+  /* Thin, unobtrusive overlay-style scrollbars (WebKit/Blink) */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background-color: rgba(255,255,255,0.16); border-radius: 8px; background-clip: padding-box; border: 2px solid transparent; }
+  ::-webkit-scrollbar-thumb:hover { background-color: rgba(255,255,255,0.26); }
+
+  /* Header — floating translucent material (Apple toolbar: blur + saturate over a
+     semi-transparent surface, with a faint bright top edge catching the "light"). */
   .header {
-    background: var(--surface);
+    background: rgba(var(--surface-rgb), 0.72);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
     border-bottom: 1px solid var(--border);
     padding: 0.75rem 1.5rem;
     display: flex;
@@ -42,24 +80,27 @@
     flex-wrap: wrap;
     gap: 0.5rem;
     font-size: calc(1rem * var(--font-scale));
+    position: relative;
+    z-index: 5;
   }
-  .header h1 { font-size: calc(1rem * var(--font-scale)); font-weight: 600; }
+  .header h1 { font-size: calc(1rem * var(--font-scale)); font-weight: 600; letter-spacing: -0.01em; }
   .header h1 span { color: var(--accent); }
   .header-controls { display: flex; align-items: center; gap: 0.5rem; }
   .badge {
     font-size: calc(0.7rem * var(--font-scale));
-    padding: 0.2rem 0.5rem;
+    padding: 0.2rem 0.55rem;
     border-radius: 9999px;
-    background: var(--border);
+    background: rgba(255,255,255,0.08);
+    letter-spacing: 0.01em;
   }
-  .badge.ok { background: rgba(63,185,80,0.15); color: var(--green); }
-  .badge.err { background: rgba(255,82,82,0.15); color: var(--red); }
+  .badge.ok { background: rgba(50,215,75,0.15); color: var(--green); }
+  .badge.err { background: rgba(255,69,58,0.15); color: var(--red); }
   .btn {
     background: var(--accent);
-    color: #000;
+    color: #fff;
     border: none;
     padding: 0.35rem 0.85rem;
-    border-radius: 6px;
+    border-radius: var(--radius);
     font-size: calc(0.8rem * var(--font-scale));
     font-weight: 600;
     cursor: pointer;
@@ -67,19 +108,21 @@
   .btn:hover { opacity: 0.85; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-sm {
-    background: var(--border);
+    background: rgba(255,255,255,0.08);
     color: var(--text);
-    padding: 0.2rem 0.5rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: calc(var(--radius) - 2px);
     font-size: calc(0.7rem * var(--font-scale));
   }
-  .btn-export { background: var(--green); color: #000; padding: 0.3rem 0.7rem; font-size: calc(0.75rem * var(--font-scale)); font-weight: 600; }
+  .btn-sm:hover { background: rgba(255,255,255,0.14); }
+  .btn-export { background: var(--green); color: #04260c; padding: 0.3rem 0.7rem; font-size: calc(0.75rem * var(--font-scale)); font-weight: 600; }
   .font-btn {
-    background: var(--border);
+    background: rgba(255,255,255,0.08);
     color: var(--text);
     border: none;
     width: calc(24px * var(--font-scale));
     height: calc(24px * var(--font-scale));
-    border-radius: 4px;
+    border-radius: calc(var(--radius) - 4px);
     font-size: calc(0.9rem * var(--font-scale));
     cursor: pointer;
     display: flex;
@@ -88,7 +131,7 @@
     line-height: 1;
     padding: 0;
   }
-  .font-btn:hover { color: var(--accent); }
+  .font-btn:hover { color: var(--accent); background: rgba(255,255,255,0.14); }
 
   /* Main layout */
   .main { display: flex; min-height: calc(100vh - 48px); }
@@ -106,9 +149,9 @@
   .welcome-msg .icon { font-size: 3rem; margin-bottom: 1rem; }
   .welcome-msg p { font-size: calc(0.85rem * var(--font-scale)); }
   .device-card {
-    background: var(--bg);
+    background: var(--surface-2);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
     padding: 0.75rem;
     margin-bottom: 0.5rem;
     cursor: pointer;
@@ -129,7 +172,7 @@
     gap: 0.4rem;
   }
   .device-card:hover { border-color: var(--accent); }
-  .device-card.active { border-color: var(--accent); background: rgba(88,166,255,0.06); }
+  .device-card.active { border-color: var(--accent); background: rgba(10,132,255,0.06); }
   .device-checkbox {
     flex-shrink: 0;
     width: 15px;
@@ -144,7 +187,7 @@
     gap: 0.5rem;
     padding: 0.4rem 0.6rem;
     margin-bottom: 0.5rem;
-    background: rgba(88,166,255,0.08);
+    background: rgba(10,132,255,0.08);
     border: 1px solid var(--accent);
     border-radius: 6px;
   }
@@ -184,7 +227,7 @@
     opacity: 1;
     border-style: solid;
     border-color: var(--accent);
-    background: rgba(88,166,255,0.06);
+    background: rgba(10,132,255,0.06);
   }
   .connecting-label {
     font-size: calc(0.75rem * var(--font-scale));
@@ -203,7 +246,7 @@
     white-space: nowrap;
   }
   .btn-connect:hover {
-    background: rgba(63,185,80,0.15);
+    background: rgba(50,215,75,0.15);
   }
   .dev-info {
     flex: 1 1 auto;
@@ -230,7 +273,7 @@
     height: 8px;
     border-radius: 50%;
     background: var(--green);
-    box-shadow: 0 0 6px rgba(63,185,80,0.4);
+    box-shadow: 0 0 6px rgba(50,215,75,0.4);
   }
   .dev-status-dot-gray {
     background: var(--muted);
@@ -250,7 +293,7 @@
   .btn-disconnect:hover {
     color: var(--red);
     border-color: var(--red);
-    background: rgba(255,82,82,0.1);
+    background: rgba(255,69,58,0.1);
   }
 
   /* Content area */
@@ -301,15 +344,22 @@
   .tab:hover { color: var(--text); }
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
   .tab-content { display: none; }
-  .tab-content.active { display: block; }
+  /* Spatial consistency: a switched-in tab settles into place rather than popping —
+     a short opacity+lift cross-fade, not a slide (nothing to slide "from" here). */
+  .tab-content.active { display: block; animation: tabIn 200ms var(--ease-spring); }
+  @keyframes tabIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+  @media (prefers-reduced-motion: reduce) { .tab-content.active { animation: none; } }
 
-  /* Panels */
+  /* Panels — grouped-card material: soft border + subtle raised-edge highlight
+     instead of a flat 1px box, so panels read as cards rather than boxes. */
   .panel {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-top-color: rgba(255,255,255,0.06);
+    border-radius: var(--radius-lg);
     padding: 1rem;
     margin-bottom: 1rem;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.18);
   }
   .panel-header {
     display: flex;
@@ -347,7 +397,7 @@
     grid-template-columns: auto 1fr;
     gap: 0.5rem;
     padding: 0.2rem 0;
-    border-bottom: 1px solid rgba(48,54,61,0.4);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
   }
   .prop-key {
     color: var(--accent);
@@ -367,7 +417,7 @@
   /* Features & Packages */
   .feat-item, .pkg-item {
     padding: 0.15rem 0;
-    border-bottom: 1px solid rgba(48,54,61,0.4);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
     font-family: var(--mono);
     font-size: calc(0.75rem * var(--font-scale));
     display: flex;
@@ -375,18 +425,18 @@
     gap: 0.4rem;
   }
   .pkg-item { cursor: pointer; }
-  .pkg-item:hover { background: rgba(88,166,255,0.04); }
+  .pkg-item:hover { background: rgba(10,132,255,0.04); }
   .feat-type {
     font-size: calc(0.6rem * var(--font-scale));
     padding: 0.1rem 0.35rem;
     border-radius: 3px;
-    background: rgba(88,166,255,0.15);
+    background: rgba(10,132,255,0.15);
     color: var(--accent);
     font-weight: 600;
     text-transform: uppercase;
     flex-shrink: 0;
   }
-  .feat-type.other { background: rgba(139,148,158,0.15); color: var(--muted); }
+  .feat-type.other { background: rgba(152,152,159,0.15); color: var(--muted); }
   .feat-ver, .pkg-ver { color: var(--muted); font-size: calc(0.65rem * var(--font-scale)); flex-shrink: 0; }
   .pkg-badge {
     font-size: calc(0.6rem * var(--font-scale));
@@ -396,8 +446,8 @@
     text-transform: uppercase;
     flex-shrink: 0;
   }
-  .pkg-badge.priv { background: rgba(219,109,40,0.15); color: var(--orange); }
-  .pkg-badge.sys { background: rgba(139,148,158,0.15); color: var(--muted); }
+  .pkg-badge.priv { background: rgba(255,159,10,0.15); color: var(--orange); }
+  .pkg-badge.sys { background: rgba(152,152,159,0.15); color: var(--muted); }
   .pkg-toggle {
     margin-left: auto;
     font-size: calc(0.6rem * var(--font-scale));
@@ -416,7 +466,7 @@
   .pkg-path { word-break: break-all; font-family: var(--mono); font-size: calc(0.65rem * var(--font-scale)); }
   .pkg-perms { margin-top: 0.2rem; display: flex; flex-wrap: wrap; gap: 0.15rem; }
   .pkg-perm-item {
-    background: rgba(139,148,158,0.1);
+    background: rgba(152,152,159,0.1);
     padding: 0.08rem 0.3rem;
     border-radius: 3px;
     font-size: calc(0.62rem * var(--font-scale));
@@ -512,26 +562,36 @@
     .prop-row { grid-template-columns: 180px 1fr; }
   }
 
-/* Debug Console */
+/* Debug Console — this is the one panel that genuinely floats OVER scrolling
+   content (position:fixed), so it's the clearest place for a real frosted-glass
+   material: blur+saturate over a translucent fill, materializing in rather than
+   popping (blur+scale together, not a plain opacity fade — see apple-design skill
+   §12 "materialize, don't just fade"). */
 .debug-console {
   position: fixed;
   bottom: 0;
   left: 0;
   right: 0;
   height: 260px;
-  background: var(--bg);
-  border-top: 2px solid var(--yellow);
+  background: rgba(var(--bg-rgb), 0.78);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border-top: 1px solid rgba(255,214,10,0.35);
+  box-shadow: 0 -8px 32px rgba(0,0,0,0.35);
   display: flex;
   flex-direction: column;
   z-index: 1000;
+  animation: materializeUp 220ms var(--ease-spring);
 }
+@keyframes materializeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .debug-console { animation: none; } }
 .debug-console.hidden { display: none !important; }
 .debug-console-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 0.35rem 1rem;
-  background: var(--surface);
+  background: rgba(255,255,255,0.04);
   border-bottom: 1px solid var(--border);
   font-size: calc(0.75rem * var(--font-scale));
   color: var(--yellow);
@@ -552,10 +612,14 @@
 .debug-err { color: var(--red); }
 .debug-ok { color: var(--green); }
 
-/* Remote Session */
+/* Remote Session — floating alert strips get the same frosted-material treatment
+   as the header/debug console, tinted by severity (blue = informational, red =
+   an active, privileged control session) rather than a flat opaque fill. */
 .viewer-banner {
-  background: rgba(88,166,255,0.1);
-  border-bottom: 1px solid var(--accent);
+  background: rgba(10,132,255,0.12);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-bottom: 1px solid rgba(10,132,255,0.4);
   padding: 0.5rem 1.5rem;
   display: flex;
   align-items: center;
@@ -564,8 +628,10 @@
 }
 
 .control-active-banner {
-  background: rgba(255,82,82,0.1);
-  border-bottom: 1px solid var(--red);
+  background: rgba(255,69,58,0.12);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-bottom: 1px solid rgba(255,69,58,0.4);
   padding: 0.5rem 1.5rem;
   display: flex;
   align-items: center;
@@ -606,6 +672,37 @@
    easy to miss) — hide it and drive it via a clearly-visible <label for="..."> button
    instead, a standard accessible pattern (label click still opens the native picker). */
 .visually-hidden-file { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+/* Shared dialog chrome (Share/Help/USB-release modals, built dynamically in
+   src/index.js) — a dimming scrim behind a frosted sheet, matching the apple-design
+   skill's "modal task = surface + scrim" pairing instead of each dialog's own
+   ad-hoc inline palette. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: scrimIn 180ms var(--ease-spring);
+}
+.modal-box {
+  background: rgba(var(--surface-rgb), 0.92);
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  color: var(--text);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+  min-width: 360px;
+  max-width: 520px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 1px 0 rgba(255,255,255,0.06) inset;
+  animation: sheetIn 220ms var(--ease-spring);
+}
+@keyframes scrimIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes sheetIn { from { opacity: 0; transform: scale(0.96) translateY(4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .modal-overlay, .modal-box { animation: none; } }
 
 </style>
 </head>
@@ -859,6 +956,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026081705"></script>
+<script type="module" src="bundle.js?v=2026081706"></script>
 </body>
 </html>

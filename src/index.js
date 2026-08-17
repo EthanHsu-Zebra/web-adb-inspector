@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.23.1';
+const APP_VERSION = '1.24.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -259,17 +259,17 @@ function showADBReleaseDialog(vendorId) {
   }
   const overlay = document.createElement('div');
   overlay.id = 'adb-release-modal-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.className = 'modal-overlay';
   overlay.onclick = (e) => { if (e.target === overlay) hideADBReleaseDialog(); };
   const box = document.createElement('div');
-  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+  box.className = 'modal-box';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">' + esc(t) + '</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;white-space:pre-wrap;">' + esc(b) + '</p>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;">If none of that helps: reloading this page has reliably fixed this in testing — at the cost of disconnecting any other devices currently connected here.</p>' +
+    '<p style="font-size:13px;color:var(--muted);margin-bottom:16px;white-space:pre-wrap;">' + esc(b) + '</p>' +
+    '<p style="font-size:13px;color:var(--muted);margin-bottom:16px;">If none of that helps: reloading this page has reliably fixed this in testing — at the cost of disconnecting any other devices currently connected here.</p>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
     '<button class="btn btn-sm" id="adb-release-dismiss-btn">Dismiss</button>' +
-    '<button class="btn" id="adb-release-reload-btn" style="background:#f38ba8;">Reload Page</button>' +
+    '<button class="btn" id="adb-release-reload-btn" style="background:var(--red);">Reload Page</button>' +
     '</div>';
   overlay.appendChild(box);
   document.body.appendChild(overlay);
@@ -396,22 +396,26 @@ async function scanAvailableDevices() {
 async function showDevicePicker(devices) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+    overlay.className = 'modal-overlay';
     overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
 
     const box = document.createElement('div');
-    box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:320px;max-width:500px;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+    box.className = 'modal-box';
+    box.style.minWidth = '320px';
+    box.style.maxWidth = '500px';
+    box.style.maxHeight = '80vh';
+    box.style.overflowY = 'auto';
     box.innerHTML = '<h3 style="margin:0 0 16px;font-size:18px;">Select Device</h3>';
 
     const list = document.createElement('div');
     for (const dev of devices) {
       const row = document.createElement('div');
-      row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:12px;border-radius:8px;cursor:pointer;transition:background 0.15s;border:1px solid transparent;margin-bottom:4px;';
-      row.onmouseover = () => { row.style.background = '#313244'; row.style.borderColor = '#89b4fa'; };
+      row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:12px;border-radius:10px;cursor:pointer;transition:background 150ms, border-color 150ms;border:1px solid transparent;margin-bottom:4px;';
+      row.onmouseover = () => { row.style.background = 'rgba(255,255,255,0.06)'; row.style.borderColor = 'var(--accent)'; };
       row.onmouseout = () => { row.style.background = 'transparent'; row.style.borderColor = 'transparent'; };
       const name = dev.name || 'USB Device';
       const serial = dev.serial || 'N/A';
-      row.innerHTML = `<div style="flex:1;"><div style="font-weight:500;">${name}</div><div style="font-size:12px;color:#a6adc6;">${serial}</div></div><div style="font-size:12px;color:#a6adc6;">${dev.vendorId && dev.productId ? 'VID:'+dev.vendorId+' PID:'+dev.productId : ''}</div>`;
+      row.innerHTML = `<div style="flex:1;"><div style="font-weight:500;">${name}</div><div style="font-size:12px;color:var(--muted);">${serial}</div></div><div style="font-size:12px;color:var(--muted);">${dev.vendorId && dev.productId ? 'VID:'+dev.vendorId+' PID:'+dev.productId : ''}</div>`;
       row.onclick = () => { cleanup(); connectDevice(dev).catch(e => setStatus('Failed: ' + e.message, 'err')); resolve(); };
       list.appendChild(row);
     }
@@ -419,7 +423,8 @@ async function showDevicePicker(devices) {
 
     const cancel = document.createElement('button');
     cancel.textContent = 'Cancel';
-    cancel.style.cssText = 'margin-top:16px;padding:8px 20px;border-radius:6px;border:1px solid #585b70;background:#313244;color:#cdd6f4;cursor:pointer;font-size:14px;';
+    cancel.className = 'btn btn-sm';
+    cancel.style.marginTop = '16px';
     cancel.onclick = () => { cleanup(); resolve(); };
     box.appendChild(cancel);
 
@@ -1371,12 +1376,14 @@ function showHelpModal() {
   hideHelpModal();
   const overlay = document.createElement('div');
   overlay.id = 'help-modal-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.className = 'modal-overlay';
   overlay.onclick = (e) => { if (e.target === overlay) hideHelpModal(); };
 
   const box = document.createElement('div');
-  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:560px;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
-  const row = (term, def) => '<div style="margin-bottom:10px;"><div style="font-weight:600;color:#89b4fa;">' + esc(term) + '</div><div style="font-size:13px;color:#a6adc6;">' + def + '</div></div>';
+  box.className = 'modal-box';
+  box.style.maxHeight = '80vh';
+  box.style.overflowY = 'auto';
+  const row = (term, def) => '<div style="margin-bottom:10px;"><div style="font-weight:600;color:var(--accent);">' + esc(term) + '</div><div style="font-size:13px;color:var(--muted);">' + def + '</div></div>';
   box.innerHTML =
     '<h3 style="margin:0 0 14px;font-size:18px;">Device List Help</h3>' +
     row('Connected', 'Actively connected via ADB right now. Click a card to view its Properties/Features/Packages/Shell.') +
@@ -2106,18 +2113,21 @@ function showControlRequestPrompt() {
   const info = connectedDevices.get(next.serial);
   const deviceName = (info && info._displayName) || next.serial;
   const queuedNote = remoteSession.controlRequestQueue.length > 1
-    ? ` <span style="color:var(--muted, #8b949e);">(${remoteSession.controlRequestQueue.length - 1} more request(s) waiting)</span>` : '';
+    ? ` <span style="color:var(--muted);">(${remoteSession.controlRequestQueue.length - 1} more request(s) waiting)</span>` : '';
   const overlay = document.createElement('div');
   overlay.id = 'control-request-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1001;';
+  overlay.className = 'modal-overlay';
+  overlay.style.zIndex = '1001';
   const box = document.createElement('div');
-  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:320px;max-width:460px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+  box.className = 'modal-box';
+  box.style.minWidth = '320px';
+  box.style.maxWidth = '460px';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">Remote Control Request</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:16px;">A connected viewer wants to remotely control <strong>' + esc(deviceName) + '</strong> — see its screen and send taps, swipes, and text.' + queuedNote + '</p>' +
+    '<p style="font-size:13px;color:var(--muted);margin-bottom:16px;">A connected viewer wants to remotely control <strong>' + esc(deviceName) + '</strong> — see its screen and send taps, swipes, and text.' + queuedNote + '</p>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
     '<button class="btn btn-sm" id="control-deny-btn">Deny</button>' +
-    '<button class="btn" id="control-grant-btn" style="color:#a6e3a1;">Grant Control</button></div>';
+    '<button class="btn" id="control-grant-btn" style="background:var(--green);color:#04260c;">Grant Control</button></div>';
   overlay.appendChild(box);
   document.body.appendChild(overlay);
   document.getElementById('control-grant-btn').onclick = () => grantControlRequest();
@@ -2518,21 +2528,21 @@ function showShareModal() {
   const link = location.origin + location.pathname + '#room=' + remoteSession.roomId + '&key=' + remoteSession.password;
   const overlay = document.createElement('div');
   overlay.id = 'share-modal-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.className = 'modal-overlay';
   overlay.onclick = (e) => { if (e.target === overlay) hideShareModal(); };
 
   const box = document.createElement('div');
-  box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;min-width:360px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+  box.className = 'modal-box';
   box.innerHTML =
     '<h3 style="margin:0 0 12px;font-size:18px;">Share Remote Session</h3>' +
-    '<p style="font-size:13px;color:#a6adc6;margin-bottom:12px;">Anyone with this link can view this device\'s status and run shell commands on it immediately, with no approval step — treat it like a password. Use "Regenerate Link" if it leaks.</p>' +
+    '<p style="font-size:13px;color:var(--muted);margin-bottom:12px;">Anyone with this link can view this device\'s status and run shell commands on it immediately, with no approval step — treat it like a password. Use "Regenerate Link" if it leaks.</p>' +
     '<div style="display:flex;gap:6px;margin-bottom:12px;">' +
-    '<input id="share-link-input" type="text" readonly value="' + esc(link) + '" style="flex:1;background:#11111b;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:12px;">' +
+    '<input id="share-link-input" type="text" readonly value="' + esc(link) + '" style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-family:monospace;font-size:12px;">' +
     '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
-    '<div style="font-size:12px;color:#a6adc6;margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
     '<button class="btn btn-sm" id="share-regen-btn">Regenerate Link</button>' +
-    '<button class="btn btn-sm" id="share-stop-btn" style="color:#f38ba8;">Stop Sharing</button>' +
+    '<button class="btn btn-sm" id="share-stop-btn" style="color:var(--red);">Stop Sharing</button>' +
     '<button class="btn" id="share-close-btn">Done</button></div>';
   overlay.appendChild(box);
   document.body.appendChild(overlay);
