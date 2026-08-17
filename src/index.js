@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.19.2';
+const APP_VERSION = '1.20.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -3391,15 +3391,30 @@ async function fetchAttestation(targetSerial, background) {
     const ft = vals[4] || '';
     const kMint = ft.includes('android.hardware.security.keymint');
     const sBox = ft.includes('strongbox');
+    // [Check, Value, Status, Source, Tooltip] — same 5-column shape as the RKP tab's
+    // rows, rendered with the same renderRKPTable() so both tabs show a hover tooltip on
+    // the value and a Source column with the exact command each check ran.
     const rows = [
-      ['Verified Boot', bs || 'N/A', bs === 'orange' || bs === 'green' ? 'ok' : (bs ? 'warn' : 'unknown')],
-      ['VBMeta Security', vs || 'N/A', vs === 'software' ? 'ok' : (vs ? 'warn' : 'unknown')],
-      ['DM-Verity', vm || 'N/A', vm === 'enforce' ? 'ok' : (vm ? 'warn' : 'unknown')],
-      ['Flash Locked', fl || 'N/A', fl === 'true' || fl === '1' ? 'ok' : (fl ? 'warn' : 'unknown')],
-      ['KeyMint', kMint ? 'Yes' : 'No', kMint ? 'ok' : 'warn'],
-      ['StrongBox', sBox ? 'Yes' : 'No', sBox ? 'ok' : 'warn'],
+      ['Verified Boot', bs || 'N/A', bs === 'orange' || bs === 'green' ? 'ok' : (bs ? 'warn' : 'unknown'),
+        'getprop ro.boot.verifiedbootstate',
+        'Android Verified Boot (AVB) state. green = full chain of trust verified from bootloader to system image; orange = verified but user-unlocked/custom (e.g. a custom ROM or root); red/unset = verification failed or unavailable.'],
+      ['VBMeta Security', vs || 'N/A', vs === 'software' ? 'ok' : (vs ? 'warn' : 'unknown'),
+        'getprop ro.boot.vbmeta.security_level',
+        'Security level of the VBMeta partition\'s verification path. software = standard software-based AVB verification.'],
+      ['DM-Verity', vm || 'N/A', vm === 'enforce' ? 'ok' : (vm ? 'warn' : 'unknown'),
+        'getprop ro.boot.veritymode',
+        'Device-Mapper Verity mode, which protects the system partition against tampering by verifying blocks against a trusted hash tree as they\'re read. enforce = actively blocking access to modified blocks; logging = detects but does not block (weaker).'],
+      ['Flash Locked', fl || 'N/A', fl === 'true' || fl === '1' ? 'ok' : (fl ? 'warn' : 'unknown'),
+        'getprop ro.boot.flash.locked',
+        'Bootloader lock state. true/1 = locked, which is required for a complete verified-boot chain of trust and for most hardware attestation use cases to be considered trustworthy.'],
+      ['KeyMint', kMint ? 'Yes' : 'No', kMint ? 'ok' : 'warn',
+        'pm list features | grep android.hardware.security.keymint',
+        'Whether the device exposes the KeyMint HAL — the Android 12+ hardware-backed key management interface that StrongBox/TEE-backed keys and attestation depend on.'],
+      ['StrongBox', sBox ? 'Yes' : 'No', sBox ? 'ok' : 'warn',
+        'pm list features | grep strongbox',
+        'Whether the device has a StrongBox dedicated secure element — a separate, more tamper-resistant hardware security module for key storage, distinct from the general TEE.'],
     ];
-    html = renderStatusTable(rows);
+    html = renderRKPTable(rows);
   } catch (err) {
     html = '<span style="color:#ff5252">Error: ' + esc(String(err.message || err)) + '</span>';
   }
@@ -3414,6 +3429,35 @@ async function fetchAttestation(targetSerial, background) {
 
 async function safeGetProp(adb, prop) {
   try { return (await adb.getProp(prop)).trim(); } catch(e) { return ''; }
+}
+
+// Some devices don't register every `cmd <service>` shell interface this app probes (e.g.
+// no `key_attestation` or `remote_provisioning` service at all). Running `cmd <service>`
+// for an unregistered one still exits "successfully" but prints something like "Can't
+// find service: <service>" — indistinguishable, to naive string matching, from a real
+// negative result. `cmd -l` lists every currently registered service; checking it first
+// means "not supported on this device" is reported as exactly that, never mistaken for
+// "checked and failed." Cached per adb connection (WeakMap keyed by the adb object itself,
+// which is freshly created on every device connect) since several checks share one device.
+const cmdServiceListCache = new WeakMap();
+function getCmdServiceList(adb) {
+  if (!cmdServiceListCache.has(adb)) {
+    cmdServiceListCache.set(adb, (async () => {
+      try {
+        const text = await adbShell(adb, 'cmd -l');
+        return new Set(text.split('\n').map(s => s.trim()).filter(Boolean));
+      } catch (_) {
+        return null; // couldn't determine — fail open (see isCmdServiceAvailable)
+      }
+    })());
+  }
+  return cmdServiceListCache.get(adb);
+}
+// Fails open (returns true) if `cmd -l` itself couldn't be read — better to attempt the
+// real check than to hide every result just because this one meta-check had a hiccup.
+async function isCmdServiceAvailable(adb, serviceName) {
+  const services = await getCmdServiceList(adb);
+  return services === null ? true : services.has(serviceName);
 }
 
 // Android 15 generic HAL detection via service list (not vendor ro.hardware.* props).
@@ -3431,9 +3475,14 @@ async function checkHalService(adb, halName) {
 // Google provisioned keys — this does.
 async function checkAttestationCapability(adb) {
   try {
-    // Step 1: KeyMint attestation ID/version list (proves HAL supports attestation)
-    const verOut = await adbShell(adb,
-      'cmd key_attestation 2>&1; echo "EXIT:$?"');
+    // Step 1: KeyMint attestation ID/version list (proves HAL supports attestation) — only
+    // if `key_attestation` is actually a registered `cmd` service on this device (see
+    // isCmdServiceAvailable()'s comment); otherwise `cmd key_attestation` would just print
+    // a "Can't find service" line that could be misread as a real negative result.
+    const keyAttestationSupported = await isCmdServiceAvailable(adb, 'key_attestation');
+    const verOut = keyAttestationSupported
+      ? await adbShell(adb, 'cmd key_attestation 2>&1; echo "EXIT:$?"')
+      : '';
 
     // Step 2: Attempt real attestation via KeyMint — write a tiny Java helper that
     // generates an attestation key and reports whether KeyMint returned a cert chain.
@@ -3441,9 +3490,11 @@ async function checkAttestationCapability(adb) {
     // via `cmd statsd` is not available; the cleanest path is `pm path` to check that
     // the system shell can run our snippet through `cmd keymaster` legacy or `cmd
     // keystore`. For Android 12+ we use `cmd keystore` to query whether the device
-    // already has a provisioned key pool:
-    const poolOut = await adbShell(adb,
-      'cmd keystore --help 2>&1 | head -20');
+    // already has a provisioned key pool — again, only if `keystore` is registered.
+    const keystoreSupported = await isCmdServiceAvailable(adb, 'keystore');
+    const poolOut = keystoreSupported
+      ? await adbShell(adb, 'cmd keystore --help 2>&1 | head -20')
+      : '';
 
     // Step 3: Network reachability to Google's attestation endpoint (TLS, not just ICMP)
     const tlsOut = await adbShell(adb,
@@ -3465,16 +3516,19 @@ async function checkAttestationCapability(adb) {
     // Pass criteria: HAL supports attestation (version > 0) AND TLS handshake to Google works
     // This proves: device has the KeyMint HAL loaded + can talk to Google's attestation servers.
     // Actual cert-chain validation requires Java code on device (out of scope for adb shell).
-    const ok = hasVersion100 && tlsReachable;
+    const ok = keyAttestationSupported && hasVersion100 && tlsReachable;
 
     return {
       ok,
-      attestationVersion: versionMatch ? versionMatch[1] : 'unknown',
+      keyAttestationSupported,
+      attestationVersion: keyAttestationSupported ? (versionMatch ? versionMatch[1] : 'unknown') : 'N/A',
       tlsReachable,
-      raw: `attest-ver:${hasVersion100 ? 'OK' : 'no'} | tls:${tlsReachable ? 'OK' : 'FAIL'} | ${verOut.trim().split('\n')[0] || 'no output'}`,
+      raw: keyAttestationSupported
+        ? `attest-ver:${hasVersion100 ? 'OK' : 'no'} | tls:${tlsReachable ? 'OK' : 'FAIL'} | ${verOut.trim().split('\n')[0] || 'no output'}`
+        : 'key_attestation service not registered on this device (checked via cmd -l)',
     };
   } catch(e) {
-    return { ok: false, attestationVersion: 'ERR', tlsReachable: false, raw: String(e.message || e) };
+    return { ok: false, keyAttestationSupported: false, attestationVersion: 'ERR', tlsReachable: false, raw: String(e.message || e) };
   }
 }
 
@@ -3499,11 +3553,17 @@ async function checkRkpProvisioning(adb) {
     } catch (_) {}
   }
 
+  // `remote_provisioning` isn't a registered `cmd` service on every device — check first
+  // (see isCmdServiceAvailable()'s comment) so an unsupported device reports exactly that,
+  // rather than misreading a "Can't find service" line as "zero components found."
+  const remoteProvisioningSupported = await isCmdServiceAvailable(adb, 'remote_provisioning');
   let components = [];
-  try {
-    const listOut = await adbShell(adb, 'cmd remote_provisioning list');
-    components = listOut.split('\n').map(s => s.trim()).filter(Boolean);
-  } catch (_) {}
+  if (remoteProvisioningSupported) {
+    try {
+      const listOut = await adbShell(adb, 'cmd remote_provisioning list');
+      components = listOut.split('\n').map(s => s.trim()).filter(Boolean);
+    } catch (_) {}
+  }
 
   let hostname = '', teeRkpOnly = '';
   try { hostname = (await adbShell(adb, 'getprop remote_provisioning.hostname')).trim(); } catch (_) {}
@@ -3511,6 +3571,8 @@ async function checkRkpProvisioning(adb) {
 
   // The definitive check: try to certify every enumerated component and see whether
   // a real certificate chain comes back. Do NOT infer "provisioned" from anything else.
+  // (components stays empty when remote_provisioning isn't supported, so this loop is
+  // naturally a no-op in that case — no separate gating needed here.)
   const certified = [];
   for (const name of components) {
     let provisioned = false, note = '';
@@ -3524,20 +3586,11 @@ async function checkRkpProvisioning(adb) {
     certified.push({ name, provisioned, note });
   }
 
-  return { pkgInstalled, pkgEnabled, pkgVersion, components, hostname, teeRkpOnly, certified };
+  return { pkgInstalled, pkgEnabled, pkgVersion, components, hostname, teeRkpOnly, certified, remoteProvisioningSupported };
 }
 
-function renderStatusTable(rows) {
-  return '<table class="status-table"><thead><tr><th>Check</th><th>Value</th><th>Status</th></tr></thead><tbody>' +
-    rows.map(([check, value, status, tip]) => {
-      const sc = 'status-' + status;
-      const sl = status === 'ok' ? 'PASS' : status === 'warn' ? 'WARN' : status === 'fail' ? 'FAIL' : 'N/A';
-      const tooltip = tip ? ' title="' + esc(tip) + '"' : '';
-      return '<tr><td>' + esc(check) + '</td><td' + tooltip + '>' + esc(value || 'N/A') + '</td><td class="' + sc + '">' + sl + '</td></tr>';
-    }).join('') + '</tbody></table>';
-}
-
-// RKP table: 5 columns with collapsible source/tooltip
+// RKP table: 5 columns with collapsible source/tooltip — also used by fetchAttestation()
+// now, so both tabs get the same hover-tooltip + Source column treatment.
 function renderRKPTable(rows) {
   return '<table class="status-table rkp-table"><thead><tr><th>Check</th><th>Value</th><th>Status</th><th>Source</th></tr></thead><tbody>' +
     rows.map(([check, value, status, source, tip]) => {
@@ -3994,19 +4047,27 @@ async function fetchRKP(targetSerial, background) {
     // 1) Real attestation capability test (HAL version + TLS handshake, not just ping)
     const attest = await checkAttestationCapability(info.adb);
 
-    // 2) KeyMint / attestation (real HAL commands)
+    // 2) KeyMint / attestation (real HAL commands) — gated on cmd -l (see
+    // isCmdServiceAvailable()'s comment) so an unsupported service reports as such
+    // instead of risking a "Can't find service" line being read as a real result.
+    const keystoreSupported = await isCmdServiceAvailable(info.adb, 'keystore');
     let kMint = false, ksOut = '';
-    try {
-      ksOut = await adbShell(info.adb, 'cmd keystore');
-      kMint = ksOut.toLowerCase().includes('keymint');
-    } catch(e) {}
+    if (keystoreSupported) {
+      try {
+        ksOut = await adbShell(info.adb, 'cmd keystore');
+        kMint = ksOut.toLowerCase().includes('keymint');
+      } catch(e) {}
+    }
 
+    const keyAttestationSupported = await isCmdServiceAvailable(info.adb, 'key_attestation');
     let attestOk = false, attestOut = '';
-    try {
-      attestOut = await adbShell(info.adb, 'cmd key_attestation');
-      const low = attestOut.toLowerCase();
-      attestOk = low.includes('attestation') && !low.includes('not found') && !low.startsWith('error');
-    } catch(e) {}
+    if (keyAttestationSupported) {
+      try {
+        attestOut = await adbShell(info.adb, 'cmd key_attestation');
+        const low = attestOut.toLowerCase();
+        attestOk = low.includes('attestation') && !low.includes('not found') && !low.startsWith('error');
+      } catch(e) {}
+    }
 
     let keymintVer = '';
     try {
@@ -4067,12 +4128,15 @@ async function fetchRKP(targetSerial, background) {
           'Whether the RKP daemon package is currently enabled.']);
       }
     }
-    if (rkp.components.length) {
+    if (!rkp.remoteProvisioningSupported) {
+      rows.push(['RKP Components', 'N/A — remote_provisioning service not registered', 'unknown', 'cmd -l (checked before cmd remote_provisioning list)',
+        'This device does not expose a remote_provisioning shell service at all (confirmed via cmd -l) — the check was skipped rather than risk misreading a "Can\'t find service" line as "zero components."']);
+    } else if (rkp.components.length) {
       rows.push(['RKP Components', rkp.components.join(', '), 'ok', 'cmd remote_provisioning list',
         'IRemotelyProvisionedComponent instances exposed by the device (e.g. default = TEE, strongbox = StrongBox dedicated secure element).']);
     } else {
       rows.push(['RKP Components', 'None found', 'unknown', 'cmd remote_provisioning list',
-        'Either this device does not expose the Remote Provisioning shell command, or it has no RKP-capable components.']);
+        'The remote_provisioning service is registered but reported no RKP-capable components.']);
     }
     if (rkp.hostname) {
       rows.push(['RKP Backend', rkp.hostname, 'ok', 'getprop remote_provisioning.hostname',
@@ -4094,22 +4158,42 @@ async function fetchRKP(targetSerial, background) {
     }
 
     // Attestation capability row (HAL attestation ID/version + TLS reach to Google)
-    rows.push([
-      'Attestation Capability',
-      attest.ok ? `Operational (v${attest.attestationVersion}, TLS to Google OK)`
-                : `Limited (HAL v${attest.attestationVersion}, TLS: ${attest.tlsReachable ? 'OK' : 'FAIL'})`,
-      attest.ok ? 'ok' : 'warn',
-      'cmd key_attestation + nc play.googleapis.com:443',
-      'Real attestation test: queries KeyMint HAL for attestation versions (proves HAL supports attestation) + TLS handshake to play.googleapis.com:443 (proves device can reach Google attestation servers). Network ping alone does NOT prove RKP — this combination verifies the prerequisite paths.'
-    ]);
+    if (!attest.keyAttestationSupported) {
+      rows.push([
+        'Attestation Capability',
+        `N/A — key_attestation service not registered (TLS to Google: ${attest.tlsReachable ? 'OK' : 'FAIL'})`,
+        'unknown',
+        'cmd -l (checked before cmd key_attestation) + nc play.googleapis.com:443',
+        'This device does not expose a key_attestation shell service at all (confirmed via cmd -l) — the HAL-version check was skipped rather than risk misreading a "Can\'t find service" line as a real result. TLS reachability to Google was still checked independently.',
+      ]);
+    } else {
+      rows.push([
+        'Attestation Capability',
+        attest.ok ? `Operational (v${attest.attestationVersion}, TLS to Google OK)`
+                  : `Limited (HAL v${attest.attestationVersion}, TLS: ${attest.tlsReachable ? 'OK' : 'FAIL'})`,
+        attest.ok ? 'ok' : 'warn',
+        'cmd key_attestation + nc play.googleapis.com:443',
+        'Real attestation test: queries KeyMint HAL for attestation versions (proves HAL supports attestation) + TLS handshake to play.googleapis.com:443 (proves device can reach Google attestation servers). Network ping alone does NOT prove RKP — this combination verifies the prerequisite paths.'
+      ]);
+    }
 
     // KeyMint
-    rows.push(['KeyMint Provider', kMint ? 'Active' : (ksOut.substring(0, 60) || 'Not found'),
-      kMint ? 'ok' : 'warn', 'cmd keystore',
-      'KeyMint is the Android 12+ key management HAL. Active = hardware-backed keys work.']);
-    rows.push(['Key Attestation', attestOk ? 'Operational' : (attestOut.substring(0, 60) || 'Not available'),
-      attestOk ? 'ok' : 'warn', 'cmd key_attestation',
-      'Proves keys are hardware-backed. Operational = device generates attestation certs.']);
+    if (!keystoreSupported) {
+      rows.push(['KeyMint Provider', 'N/A — keystore service not registered', 'unknown', 'cmd -l (checked before cmd keystore)',
+        'This device does not expose a keystore shell service at all (confirmed via cmd -l) — the check was skipped rather than risk misreading a "Can\'t find service" line as "not active."']);
+    } else {
+      rows.push(['KeyMint Provider', kMint ? 'Active' : (ksOut.substring(0, 60) || 'Not found'),
+        kMint ? 'ok' : 'warn', 'cmd keystore',
+        'KeyMint is the Android 12+ key management HAL. Active = hardware-backed keys work.']);
+    }
+    if (!keyAttestationSupported) {
+      rows.push(['Key Attestation', 'N/A — key_attestation service not registered', 'unknown', 'cmd -l (checked before cmd key_attestation)',
+        'This device does not expose a key_attestation shell service at all (confirmed via cmd -l) — the check was skipped rather than risk misreading a "Can\'t find service" line as "not available."']);
+    } else {
+      rows.push(['Key Attestation', attestOk ? 'Operational' : (attestOut.substring(0, 60) || 'Not available'),
+        attestOk ? 'ok' : 'warn', 'cmd key_attestation',
+        'Proves keys are hardware-backed. Operational = device generates attestation certs.']);
+    }
     rows.push(['KeyMint Feature', keymintVer || '',
       keymintVer ? 'ok' : 'warn', 'pm list features | grep keymint',
       'HAL version from pm list features.']);
