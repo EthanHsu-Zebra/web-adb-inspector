@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.3';
+const APP_VERSION = '1.25.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2554,13 +2554,28 @@ async function pngToCanvas(png) {
 // (page changed unpredictably).
 //
 // Runs the actual sliding search on a small downscaled proxy (~150px wide), not the raw
-// full-resolution frame. The first version of this did the search directly on full-res
-// canvases and called getImageData() once per candidate row (~300+ times per frame
-// transition, each pulling a full-width strip) — synchronous, no yield points, and
-// expensive enough (multiplied by up to 14 frame transitions) to freeze the host tab's
-// main thread for the whole operation ("long screenshot is not responsive" — v1.25.0
-// report). Downscaling first cuts the search to two getImageData() calls total and a
-// few hundred thousand trivial array reads, which runs in low single-digit milliseconds.
+// full-resolution frame — see the v1.25.1 comment history for why (was freezing the host
+// tab otherwise).
+//
+// v1.25.4 fix, from a real repro (Attestation tab, a long list of similarly-structured
+// per-certificate rows): the stitched output had the toolbar/labels repeating and kept
+// growing well past the actual end of the page. Two compounding bugs:
+// 1. The strip search never considered a near-zero offset (started at 5% of height), so
+//    once the page truly stopped scrolling — two now-IDENTICAL frames — it could never
+//    recognize "nothing changed" and was forced to accept some other, worse-scoring
+//    candidate further down as if real progress had been made, forever (until the frame
+//    cap). Fixed with an explicit global "did anything change at all" check up front,
+//    comparing the whole two frames directly (no offset) — a real scroll always misaligns
+//    most content when compared unshifted, so this reliably separates "reached the
+//    bottom" from "actually scrolled," independent of the strip search below.
+// 2. A long list of near-identical-looking rows (each cert has the same field labels)
+//    is an "aperture problem" for simple template matching — several different vertical
+//    offsets can score similarly well, and the single global-minimum score sometimes
+//    picked a coincidental match several repeated rows further down than the true, modest
+//    scroll amount, skipping (and then re-adding a duplicate of) everything in between.
+//    Fixed by preferring the SMALLEST offset among all near-tied candidates, not
+//    strictly the single lowest-scoring one — the true per-swipe scroll distance is
+//    always the closest plausible match, never a distant coincidental one.
 function findScrollOverlap(prevCanvas, nextCanvas) {
   const THUMB_WIDTH = 150;
   const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
@@ -2572,14 +2587,33 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
   };
   const thumbA = toThumb(prevCanvas);
   const thumbB = toThumb(nextCanvas);
-  const stripHeight = Math.max(4, Math.round(thumbA.height * 0.03));
-  const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
-  const searchFrom = Math.round(thumbB.height * 0.05);
-  const searchTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
-  const bandHeight = Math.max(1, searchTo - searchFrom + stripHeight);
-  const dataB = thumbB.getContext('2d').getImageData(0, Math.max(0, searchFrom), THUMB_WIDTH, bandHeight).data;
 
-  let bestOffset = Math.round(thumbB.height * 0.15) - searchFrom; // fallback, in dataB-local rows
+  // Global check first: compare the two (downscaled) frames directly, unshifted. A real
+  // scroll — even a small one — misaligns most content pixel-for-pixel against the
+  // un-scrolled comparison, so this stays reliably high whenever something actually
+  // moved, and reliably near-zero only when the page genuinely stopped changing (modulo
+  // a ticking clock/battery icon, which affects too few pixels to matter here).
+  const minHeight = Math.min(thumbA.height, thumbB.height);
+  const wholeA = thumbA.getContext('2d').getImageData(0, 0, THUMB_WIDTH, minHeight).data;
+  const wholeB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, minHeight).data;
+  let globalDiff = 0, globalN = 0;
+  for (let row = 0; row < minHeight; row += 2) {
+    const rowOff = row * THUMB_WIDTH * 4;
+    for (let col = 0; col < THUMB_WIDTH; col += 2) {
+      const idx = rowOff + col * 4;
+      globalDiff += Math.abs(wholeA[idx] - wholeB[idx]) + Math.abs(wholeA[idx + 1] - wholeB[idx + 1]) + Math.abs(wholeA[idx + 2] - wholeB[idx + 2]);
+      globalN++;
+    }
+  }
+  if (globalN === 0 || globalDiff / globalN < 12) return nextCanvas.height; // unchanged — caller reads this as "no new content"
+
+  const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
+  const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
+  const searchTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
+  const bandHeight = Math.max(1, searchTo + stripHeight);
+  const dataB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, bandHeight).data;
+
+  const scores = [];
   let bestScore = Infinity;
   for (let y = 0; y + stripHeight <= bandHeight; y++) {
     let sum = 0, n = 0;
@@ -2594,10 +2628,17 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
       }
     }
     const score = sum / n;
-    if (score < bestScore) { bestScore = score; bestOffset = y; }
+    scores.push(score);
+    if (score < bestScore) bestScore = score;
+  }
+
+  const tolerance = 8;
+  let bestOffset = Math.round(thumbB.height * 0.15);
+  for (let y = 0; y < scores.length; y++) {
+    if (scores[y] <= bestScore + tolerance) { bestOffset = y; break; }
   }
   const matched = bestScore < 40; // empirical threshold on a 0-765 (3-channel) difference scale
-  const sliceYThumb = matched ? (searchFrom + bestOffset + stripHeight) : Math.round(thumbB.height * 0.15);
+  const sliceYThumb = matched ? (bestOffset + stripHeight) : Math.round(thumbB.height * 0.15);
   return Math.round(sliceYThumb / scale); // back to nextCanvas's real (full-res) coordinates
 }
 
