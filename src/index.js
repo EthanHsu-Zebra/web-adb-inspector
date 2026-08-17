@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.20.0';
+const APP_VERSION = '1.21.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1637,7 +1637,8 @@ function makeRemoteActions(room, roomId, password, label) {
 
   const actions = {};
   for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'tabDataPush', 'bye',
-    'controlRequest', 'controlResponse', 'controlRelease', 'controlRevoked', 'screenFrame', 'inputEvent']) actions[name] = wrap(name);
+    'controlRequest', 'controlResponse', 'controlRelease', 'controlRevoked', 'screenFrame', 'inputEvent', 'orientationStatus',
+    'apkTransferStart', 'apkTransferChunk', 'apkTransferEnd', 'apkInstallResult']) actions[name] = wrap(name);
   actions._fallback = fallback;
   actions._sessionId = sessionId;
   return actions;
@@ -1734,7 +1735,7 @@ function startShareSession() {
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room, roomId, password, 'host');
-  remoteSession = { role: 'host', room, roomId, password, viewers: new Set(), actions, controlBySerial: new Map(), controlRequestQueue: [] };
+  remoteSession = { role: 'host', room, roomId, password, viewers: new Set(), actions, controlBySerial: new Map(), controlRequestQueue: [], apkTransfers: new Map() };
   pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
@@ -1743,6 +1744,9 @@ function startShareSession() {
   actions.controlRequest.onMessage = (data, ctx) => handleControlRequest(data, ctx.peerId);
   actions.controlRelease.onMessage = (data, ctx) => handleControlRelease(data, ctx.peerId);
   actions.inputEvent.onMessage = (data, ctx) => handleInputEvent(data, ctx.peerId);
+  actions.apkTransferStart.onMessage = (data, ctx) => handleApkTransferStart(data, ctx.peerId);
+  actions.apkTransferChunk.onMessage = (data, ctx) => handleApkTransferChunk(data, ctx.peerId);
+  actions.apkTransferEnd.onMessage = (data, ctx) => handleApkTransferEnd(data, ctx.peerId);
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
     remoteSession.viewers.add(peerId);
@@ -1981,6 +1985,11 @@ function handlePeerLeaveHost(peerId) {
     hideControlRequestPrompt();
     if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
   }
+  if (remoteSession.apkTransfers) {
+    for (const [id, t] of Array.from(remoteSession.apkTransfers)) {
+      if (t.peerId === peerId) remoteSession.apkTransfers.delete(id);
+    }
+  }
   updateShareModalViewerCount();
 }
 
@@ -2073,6 +2082,8 @@ function grantControlRequest() {
       showControlActiveBanner();
       debugLogPush(`remote (host): granted control of ${serial} to peerId=${peerId}`, 'ok');
       startScreencapLoop(peerId, serial, grantId);
+      const info = connectedDevices.get(serial);
+      if (info) queryOrientation(info.adb).then((status) => sendOrientationStatus(peerId, serial, grantId, status));
     }
   }
   if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
@@ -2170,7 +2181,31 @@ function toSafeInt(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function handleInputEvent(data, peerId) {
+// Queries the current screen-rotation lock state via `wm user-rotation`. Typical output:
+// "Rotation lock: disabled" or "Rotation lock: enabled\nRotation: 1" (rotation index
+// 0-3 = 0°/90°/180°/270°, matching Surface.ROTATION_* constants — NOT literal degrees).
+// Some devices/Android versions don't support this command at all; `supported:false`
+// lets the UI show "Unknown" instead of a misleading default.
+async function queryOrientation(adb) {
+  try {
+    const out = await adbShell(adb, 'wm user-rotation');
+    const lockedMatch = out.match(/Rotation lock:\s*(enabled|disabled)/i);
+    if (!lockedMatch) return { supported: false, locked: false, rotation: 0 };
+    const locked = /enabled/i.test(lockedMatch[1]);
+    const rotMatch = out.match(/Rotation:\s*(\d+)/i);
+    const rotation = rotMatch ? (parseInt(rotMatch[1], 10) % 4) : 0;
+    return { supported: true, locked, rotation };
+  } catch (_) {
+    return { supported: false, locked: false, rotation: 0 };
+  }
+}
+
+function sendOrientationStatus(peerId, serial, grantId, status) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  try { remoteSession.actions.orientationStatus.send({ serial, grantId, ...status }, { target: peerId }); } catch (_) {}
+}
+
+async function handleInputEvent(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   const { serial, grantId, seq } = data || {};
   const entry = remoteSession.controlBySerial.get(serial);
@@ -2179,6 +2214,29 @@ function handleInputEvent(data, peerId) {
   entry.lastInputSeq = seq;
   const info = connectedDevices.get(serial);
   if (!info) return;
+
+  // Rotation needs a read-modify-write round trip (query current state, compute the next
+  // one, apply it, report back) — handled separately from the simple fire-and-forget
+  // keyevent/tap/swipe/text commands below.
+  if (data.type === 'rotate' || data.type === 'setAutoRotate') {
+    try {
+      if (data.type === 'setAutoRotate') {
+        await adbShell(info.adb, 'wm user-rotation free');
+      } else {
+        const current = await queryOrientation(info.adb);
+        const base = current.supported ? current.rotation : 0;
+        const delta = data.direction === 'left' ? -1 : 1;
+        const next = ((base + delta) % 4 + 4) % 4;
+        await adbShell(info.adb, `wm user-rotation lock ${next}`);
+      }
+      const updated = await queryOrientation(info.adb);
+      sendOrientationStatus(peerId, serial, grantId, updated);
+    } catch (err) {
+      debugLogPush(`remote (host): orientation command failed: ${err && err.message || err}`, 'warn');
+    }
+    return;
+  }
+
   let cmd;
   switch (data.type) {
     case 'tap': cmd = `input tap ${toSafeInt(data.x)} ${toSafeInt(data.y)}`; break;
@@ -2201,6 +2259,118 @@ function notifyDeviceRemoved(serial) {
   if (remoteSession.controlRequestQueue.length !== before) {
     hideControlRequestPrompt();
     if (remoteSession.controlRequestQueue.length) showControlRequestPrompt();
+  }
+  if (remoteSession.apkTransfers) {
+    for (const [id, t] of Array.from(remoteSession.apkTransfers)) {
+      if (t.serial === serial) remoteSession.apkTransfers.delete(id);
+    }
+  }
+}
+
+// --- Remote Session: APK install (host) ---
+// Bundled into the existing control grant rather than its own separate approval step —
+// a viewer already had to be granted screen/input control for this specific device
+// before they can push a file to it at all, and requiring a SECOND approval mid-session
+// would just be friction on top of a decision the host already made. In-memory only
+// (remoteSession.apkTransfers, host-only state, never persisted) — cleared as soon as
+// each transfer finishes or the peer/session ends.
+const MAX_APK_SIZE = 200 * 1024 * 1024; // 200MB — generous for any real APK, bounds a bad/malicious client's memory footprint
+
+function base64ToUint8Array(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function isController(serial, peerId, grantId) {
+  const entry = remoteSession?.controlBySerial?.get(serial);
+  return !!entry && entry.peerId === peerId && entry.grantId === grantId;
+}
+
+function sendApkInstallResult(peerId, serial, grantId, transferId, ok, message) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  try { remoteSession.actions.apkInstallResult.send({ serial, grantId, transferId, ok, message }, { target: peerId }); } catch (_) {}
+}
+
+function handleApkTransferStart(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const { transferId, serial, grantId, filename, size, totalChunks } = data || {};
+  if (!transferId || !serial || !isController(serial, peerId, grantId)) return;
+  if (!Number.isFinite(size) || size <= 0 || size > MAX_APK_SIZE) {
+    sendApkInstallResult(peerId, serial, grantId, transferId, false, `File too large or invalid (${size} bytes, max ${MAX_APK_SIZE / 1024 / 1024}MB)`);
+    return;
+  }
+  if (!Number.isInteger(totalChunks) || totalChunks <= 0 || totalChunks > 4096) {
+    sendApkInstallResult(peerId, serial, grantId, transferId, false, 'Invalid chunk count');
+    return;
+  }
+  if (!remoteSession.apkTransfers) remoteSession.apkTransfers = new Map();
+  remoteSession.apkTransfers.set(transferId, {
+    serial, peerId, grantId, filename: String(filename || 'app.apk').replace(/[^\w.\-]/g, '_'),
+    size, totalChunks, chunks: new Array(totalChunks), received: 0,
+  });
+  debugLogPush(`remote (host): apk transfer started: transferId=${transferId} serial=${serial} filename=${filename} size=${size} chunks=${totalChunks}`, 'evt');
+}
+
+function handleApkTransferChunk(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.apkTransfers) return;
+  const { transferId, serial, grantId, index, data: chunkB64 } = data || {};
+  const transfer = remoteSession.apkTransfers.get(transferId);
+  if (!transfer || transfer.serial !== serial || transfer.peerId !== peerId || transfer.grantId !== grantId) return;
+  if (!isController(serial, peerId, grantId)) return;
+  if (!Number.isInteger(index) || index < 0 || index >= transfer.totalChunks) return;
+  try {
+    // Assignment by index is idempotent — a duplicate delivery (dual-transport) of the
+    // same chunk just overwrites itself with identical bytes, no dedup bookkeeping needed.
+    if (!transfer.chunks[index]) transfer.received++;
+    transfer.chunks[index] = base64ToUint8Array(chunkB64);
+  } catch (err) {
+    debugLogPush(`remote (host): apk chunk decode failed: transferId=${transferId} index=${index}: ${err && err.message || err}`, 'err');
+  }
+}
+
+async function handleApkTransferEnd(data, peerId) {
+  if (!remoteSession || remoteSession.role !== 'host' || !remoteSession.apkTransfers) return;
+  const { transferId, serial, grantId } = data || {};
+  const transfer = remoteSession.apkTransfers.get(transferId);
+  if (!transfer || transfer.serial !== serial || transfer.peerId !== peerId || transfer.grantId !== grantId) return;
+  remoteSession.apkTransfers.delete(transferId);
+  if (!isController(serial, peerId, grantId)) return;
+  if (transfer.received !== transfer.totalChunks) {
+    sendApkInstallResult(peerId, serial, grantId, transferId, false, `Transfer incomplete: received ${transfer.received}/${transfer.totalChunks} chunks`);
+    return;
+  }
+  const info = connectedDevices.get(serial);
+  if (!info) {
+    sendApkInstallResult(peerId, serial, grantId, transferId, false, 'Device not connected');
+    return;
+  }
+  const remotePath = '/data/local/tmp/' + transfer.filename;
+  debugLogPush(`remote (host): apk transfer complete, installing: transferId=${transferId} serial=${serial} path=${remotePath} size=${transfer.size}`, 'evt');
+  try {
+    const bytes = new Uint8Array(transfer.size);
+    let offset = 0;
+    for (const chunk of transfer.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    const sync = await info.adb.sync();
+    try {
+      await sync.write({
+        filename: remotePath,
+        file: new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }),
+        permission: 0o644,
+      });
+    } finally {
+      await sync.dispose();
+    }
+    const installOut = await adbShellTimed(info.adb, `pm install -r ${shQuote(remotePath)}`, 120000);
+    const ok = /^Success/m.test(installOut);
+    debugLogPush(`remote (host): pm install result: ${installOut.trim().slice(0, 300)}`, ok ? 'ok' : 'err');
+    sendApkInstallResult(peerId, serial, grantId, transferId, ok, installOut.trim().slice(0, 500) || (ok ? 'Success' : 'Install failed'));
+    try { await info.adb.rm(remotePath, { force: true }); } catch (_) {}
+  } catch (err) {
+    debugLogPush(`remote (host): apk install failed: ${err && err.message || err}`, 'err');
+    sendApkInstallResult(peerId, serial, grantId, transferId, false, String(err && err.message || err));
+    try { await info.adb.rm(remotePath, { force: true }); } catch (_) {}
   }
 }
 
@@ -2341,6 +2511,14 @@ function joinAsViewer(roomId, password) {
   actions.controlRevoked.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
     handleControlRevoked(data);
+  };
+  actions.orientationStatus.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    handleOrientationStatus(data);
+  };
+  actions.apkInstallResult.onMessage = (data, ctx) => {
+    if (ctx.peerId !== remoteSession.hostPeerId) return;
+    handleApkInstallResult(data);
   };
   actions.bye.onMessage = (data, ctx) => {
     if (ctx.peerId !== remoteSession.hostPeerId) return;
@@ -2512,7 +2690,7 @@ function handleControlResponse(data) {
   }
   remoteSession.controlBySerial[serial] = {
     active: true, grantId: data.grantId, lastAppliedSeq: -1, inputSeq: 0,
-    lastFrameW: 0, lastFrameH: 0, lastJpeg: null,
+    lastFrameW: 0, lastFrameH: 0, lastJpeg: null, orientation: null,
   };
   if (serial === remoteSession.mirror.activeSerial) renderControlTab();
 }
@@ -2574,23 +2752,31 @@ function renderControlTab() {
   const relBtn = document.getElementById('btn-release-control');
   const screenWrap = document.getElementById('control-screen-wrap');
   const hwButtons = document.getElementById('control-hw-buttons');
+  const orientationRow = document.getElementById('control-orientation-row');
   const textRow = document.getElementById('control-text-row');
+  const apkRow = document.getElementById('control-apk-row');
   const img = document.getElementById('control-screen-img');
+  resetApkProgressUI();
   if (entry && entry.active) {
     setControlStatus('In control of ' + serial);
     reqBtn?.classList.add('hidden');
     relBtn?.classList.remove('hidden');
     screenWrap?.classList.remove('hidden');
     hwButtons?.classList.remove('hidden');
+    orientationRow?.classList.remove('hidden');
     textRow?.classList.remove('hidden');
+    apkRow?.classList.remove('hidden');
     if (img) img.src = entry.lastJpeg ? ('data:image/jpeg;base64,' + entry.lastJpeg) : '';
+    setOrientationBadge(entry.orientation);
   } else {
     setControlStatus(serial ? 'Not in control' : 'Select a device to request control');
     if (reqBtn) { reqBtn.classList.remove('hidden'); reqBtn.disabled = !serial; }
     relBtn?.classList.add('hidden');
     screenWrap?.classList.add('hidden');
     hwButtons?.classList.add('hidden');
+    orientationRow?.classList.add('hidden');
     textRow?.classList.add('hidden');
+    apkRow?.classList.add('hidden');
     if (img) img.src = '';
   }
 }
@@ -2620,6 +2806,92 @@ function sendControlText() {
   if (!input || !input.value) return;
   sendInputEvent('text', { text: input.value });
   input.value = '';
+}
+
+function sendControlRotate(direction) { sendInputEvent('rotate', { direction }); }
+function sendControlAutoRotate() { sendInputEvent('setAutoRotate', { enabled: true }); }
+
+function setOrientationBadge(status) {
+  const el = document.getElementById('control-orientation-status');
+  if (!el) return;
+  if (!status || !status.supported) { el.textContent = 'Orientation: unknown'; return; }
+  el.textContent = status.locked
+    ? 'Orientation: locked ' + (['0°', '90°', '180°', '270°'][status.rotation] || '?')
+    : 'Orientation: auto-rotate';
+}
+
+function handleOrientationStatus(data) {
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial, grantId } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || !entry.active || entry.grantId !== grantId) return;
+  entry.orientation = { supported: data.supported, locked: data.locked, rotation: data.rotation };
+  if (serial === remoteSession.mirror.activeSerial) setOrientationBadge(entry.orientation);
+}
+
+// --- Remote Control: APK install (viewer) ---
+// Bundled into the existing control grant — see the matching comment on the host side
+// (handleApkTransferStart etc.) for why this doesn't get its own separate approval step.
+const APK_CHUNK_SIZE = 200 * 1024; // raw bytes per chunk (~266KB after base64)
+const MAX_APK_UPLOAD_SIZE = 200 * 1024 * 1024; // keep in sync with the host's MAX_APK_SIZE
+
+function setApkStatus(text, kind) {
+  const el = document.getElementById('control-apk-status');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'badge' + (kind === 'err' ? ' err' : kind === 'ok' ? ' ok' : '');
+}
+
+function resetApkProgressUI() {
+  setApkStatus('', '');
+  const input = document.getElementById('control-apk-input');
+  if (input) { input.disabled = false; input.value = ''; }
+}
+
+async function installApk(fileInput) {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+  const entry = getActiveControlEntry();
+  if (!entry) { setApkStatus('Not in control of this device', 'err'); fileInput.value = ''; return; }
+  if (!file.name.toLowerCase().endsWith('.apk')) { setApkStatus('Please select a .apk file', 'err'); fileInput.value = ''; return; }
+  if (file.size > MAX_APK_UPLOAD_SIZE) { setApkStatus(`File too large (max ${MAX_APK_UPLOAD_SIZE / 1024 / 1024}MB)`, 'err'); fileInput.value = ''; return; }
+  const serial = remoteSession.mirror.activeSerial;
+  const grantId = entry.grantId;
+  fileInput.disabled = true;
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const totalChunks = Math.max(1, Math.ceil(buf.length / APK_CHUNK_SIZE));
+    const transferId = crypto.randomUUID();
+    setApkStatus(`Uploading ${file.name} (0/${totalChunks})...`, '');
+    remoteSession.actions.apkTransferStart.send({ transferId, serial, grantId, filename: file.name, size: buf.length, totalChunks }, { target: remoteSession.hostPeerId });
+    for (let i = 0; i < totalChunks; i++) {
+      const chunk = buf.subarray(i * APK_CHUNK_SIZE, Math.min(buf.length, (i + 1) * APK_CHUNK_SIZE));
+      remoteSession.actions.apkTransferChunk.send({ transferId, serial, grantId, index: i, data: uint8ToBase64(chunk) }, { target: remoteSession.hostPeerId });
+      setApkStatus(`Uploading ${file.name} (${i + 1}/${totalChunks})...`, '');
+      // Yield periodically so hundreds of sends in a row don't block the event loop —
+      // the underlying transports handle their own pacing, but issuing them all in one
+      // synchronous burst would still freeze the tab's own UI updates until it's done.
+      if (i % 8 === 7) await new Promise((r) => setTimeout(r, 0));
+    }
+    remoteSession.actions.apkTransferEnd.send({ transferId, serial, grantId }, { target: remoteSession.hostPeerId });
+    setApkStatus(`Installing ${file.name}...`, '');
+  } catch (err) {
+    setApkStatus('Upload failed: ' + (err && err.message || err), 'err');
+    fileInput.disabled = false;
+  }
+  fileInput.value = '';
+}
+
+function handleApkInstallResult(data) {
+  if (!remoteSession || remoteSession.role !== 'viewer' || !data) return;
+  const { serial, grantId, ok, message } = data;
+  const entry = remoteSession.controlBySerial[serial];
+  if (!entry || entry.grantId !== grantId) return;
+  const input = document.getElementById('control-apk-input');
+  if (input) input.disabled = false;
+  if (serial === remoteSession.mirror.activeSerial) {
+    setApkStatus(ok ? ('Installed: ' + message) : ('Failed: ' + message), ok ? 'ok' : 'err');
+  }
 }
 
 // Wired once (guarded by _controlWired) and left in place for the life of the page —
@@ -4031,6 +4303,9 @@ window.sendControlText = sendControlText;
 window.grantControlRequest = grantControlRequest;
 window.denyControlRequest = denyControlRequest;
 window.stopControlSession = stopControlSession;
+window.sendControlRotate = sendControlRotate;
+window.sendControlAutoRotate = sendControlAutoRotate;
+window.installApk = installApk;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 // targetSerial/background — same purpose and contract as fetchAttestation()'s, see its

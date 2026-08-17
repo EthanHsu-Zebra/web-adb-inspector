@@ -792,10 +792,23 @@
             <button class="btn btn-sm" onclick="sendControlKey(3)">Home</button>
             <button class="btn btn-sm" onclick="sendControlKey(187)">Recent</button>
             <button class="btn btn-sm" onclick="sendControlKey(26)">Power</button>
+            <button class="btn btn-sm" onclick="sendControlKey(24)">Vol+</button>
+            <button class="btn btn-sm" onclick="sendControlKey(25)">Vol-</button>
+            <button class="btn btn-sm" onclick="sendControlKey(83)">Notifications</button>
+          </div>
+          <div id="control-orientation-row" class="quick-btns hidden">
+            <span id="control-orientation-status" class="badge">Orientation: unknown</span>
+            <button class="btn btn-sm" onclick="sendControlRotate('left')" title="Rotate left (wm user-rotation lock)">&#8634; Rotate Left</button>
+            <button class="btn btn-sm" onclick="sendControlRotate('right')" title="Rotate right (wm user-rotation lock)">&#8635; Rotate Right</button>
+            <button class="btn btn-sm" onclick="sendControlAutoRotate()" title="wm user-rotation free">Auto-Rotate</button>
           </div>
           <div id="control-text-row" class="control-text-row hidden">
             <input id="control-text-input" type="text" placeholder="Type text to send to the device..." onkeydown="if(event.key==='Enter')sendControlText()" autocomplete="off" spellcheck="false">
             <button class="btn btn-sm" onclick="sendControlText()">Send Text</button>
+          </div>
+          <div id="control-apk-row" class="control-text-row hidden">
+            <input id="control-apk-input" type="file" accept=".apk" onchange="installApk(this)" title="Select an APK to push and install on the device">
+            <span id="control-apk-status" class="badge"></span>
           </div>
         </div>
       </div>
@@ -816,6 +829,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026081113"></script>
+<script type="module" src="bundle.js?v=2026081701"></script>
 </body>
 </html>
