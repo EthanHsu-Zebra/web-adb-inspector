@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.7';
+const APP_VERSION = '1.25.8';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2698,20 +2698,6 @@ function detectChromeBounds(canvasA, canvasB) {
   return { top: Math.round(top * unscale), bottom: canvasA.height - Math.round(bottomCount * unscale) };
 }
 
-// Hides (or restores) the status bar + on-screen navigation bar via the same hidden
-// "immersive mode" global setting Android's own automation/testing tooling uses to get
-// clean UI screenshots — `policy_control` isn't a documented public API, but it's been
-// stable since Android 4.4 and works without root. This sidesteps the whole class of
-// pixel-based chrome-detection bugs found in v1.25.5/v1.25.6 (a mostly-dark, sparse-text
-// theme kept fooling pixel-diff heuristics into misjudging where chrome ends) by simply
-// not having any chrome in the captured frames to begin with. Best-effort: some
-// MDM-locked enterprise devices may reject `settings put global`, so a failure here is
-// logged and swallowed rather than aborting the whole capture — detectChromeBounds()
-// below still runs as a defensive fallback in case bars are still present.
-async function setImmersiveMode(adb, enabled) {
-  await adbShell(adb, `settings put global policy_control immersive.full=${enabled ? '*' : ''}`);
-}
-
 function sendLongScreenshotProgress(peerId, serial, grantId, message) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   // Deliberately no requestId — this fires many times per operation, and the generic
@@ -2744,17 +2730,8 @@ async function handleLongScreenshotRequest(data, peerId) {
     return;
   }
   const startTime = Date.now();
-  let immersiveApplied = false;
   try {
     debugLogPush(`remote (host): long screenshot starting for ${serial}`, 'evt');
-    try {
-      await setImmersiveMode(info.adb, true);
-      immersiveApplied = true;
-      await new Promise((r) => setTimeout(r, 400)); // let the hide animation settle before capturing
-      debugLogPush('remote (host): long screenshot — hid status/nav bars for a clean capture', 'evt');
-    } catch (err) {
-      debugLogPush(`remote (host): long screenshot — could not hide system bars, continuing with pixel-based chrome cropping instead: ${err && err.message || err}`, 'warn');
-    }
     sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
     debugLogPush('remote (host): long screenshot — capturing frame 1 (adbScreencap)...', 'evt');
     const firstPng = await adbScreencap(info.adb, 15000);
@@ -2771,6 +2748,20 @@ async function handleLongScreenshotRequest(data, peerId) {
       c.getContext('2d').drawImage(canvas, 0, chromeBounds.top, canvas.width, h, 0, 0, canvas.width, h);
       return c;
     };
+    // Withhold-and-defer margin: chrome detection (pixel-based above; hiding system bars
+    // outright was tried in v1.25.7 and confirmed NOT to work on this device — likely
+    // Android ignoring the legacy policy_control global setting) still couldn't reliably
+    // tell where the on-screen nav bar starts on this app's theme. Rather than trust that
+    // detection, NEVER permanently commit the bottom ~12% of any frame while still
+    // mid-capture — it's simply deferred to reappear in the next frame instead (which it
+    // always will: a single swipe from 85%->15% of height overlaps far more than 12%
+    // between consecutive frames), and the true final state (nav bar and all, exactly
+    // like a normal single screenshot) is appended exactly once at the very end, from
+    // whichever frame turns out to be last. This can't lose content — everything is
+    // committed either mid-loop or in that final append — and can't show chrome mid-page,
+    // since nothing is ever committed from a frame's tail while still actively scrolling.
+    const TAIL_MARGIN_FRACTION = 0.12;
+    let pendingTail = null; // {canvas, y, h} — most recently withheld bottom slice, appended once at the end
     let frameCount = 1;
     for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
       if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
@@ -2789,31 +2780,53 @@ async function handleLongScreenshotRequest(data, peerId) {
       if (!chromeBounds) {
         chromeBounds = detectChromeBounds(rawFirstFrame, newFrameRaw);
         debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
-        lastFrame = cropToContent(rawFirstFrame);
-        stitched = lastFrame;
+        const firstContent = cropToContent(rawFirstFrame);
+        const tailPx = Math.round(firstContent.height * TAIL_MARGIN_FRACTION);
+        const safeHeight = Math.max(0, firstContent.height - tailPx);
+        stitched = new OffscreenCanvas(firstContent.width, safeHeight);
+        stitched.getContext('2d').drawImage(firstContent, 0, 0, firstContent.width, safeHeight, 0, 0, firstContent.width, safeHeight);
+        pendingTail = { canvas: firstContent, y: safeHeight, h: firstContent.height - safeHeight };
+        lastFrame = firstContent;
       }
       const newFrame = cropToContent(newFrameRaw);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: finding overlap (content region ${newFrame.width}x${newFrame.height})...`, 'evt');
       const sliceY = findScrollOverlap(lastFrame, newFrame);
       await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas draw
-      const newHeight = newFrame.height - sliceY;
-      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: sliceY=${sliceY} newHeight=${newHeight} (frame height=${newFrame.height})`, 'evt');
+      const newHeightFull = newFrame.height - sliceY;
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: sliceY=${sliceY} newHeight=${newHeightFull} (frame height=${newFrame.height})`, 'evt');
       lastFrame = newFrame;
       // Scrolling produced essentially no new content — reached the bottom of the page.
-      if (newHeight < Math.round(newFrame.height * 0.03)) {
+      // pendingTail is left as-is (from whichever frame was last committed) and gets
+      // appended below once the loop exits — nothing from THIS near-duplicate frame
+      // needs committing.
+      if (newHeightFull < Math.round(newFrame.height * 0.03)) {
         debugLogPush(`remote (host): long screenshot — frame ${i + 1} added no new content, treating as end of page`, 'evt');
         frameCount++;
         break;
       }
-      const grown = new OffscreenCanvas(stitched.width, stitched.height + newHeight);
-      const gctx = grown.getContext('2d');
-      gctx.drawImage(stitched, 0, 0);
-      gctx.drawImage(newFrame, 0, sliceY, newFrame.width, newHeight, 0, stitched.height, newFrame.width, newHeight);
-      stitched = grown;
+      const tailPx = Math.round(newFrame.height * TAIL_MARGIN_FRACTION);
+      const appendEnd = Math.max(sliceY, newFrame.height - tailPx);
+      const appendHeight = appendEnd - sliceY;
+      if (appendHeight > 0) {
+        const grown = new OffscreenCanvas(stitched.width, stitched.height + appendHeight);
+        const gctx = grown.getContext('2d');
+        gctx.drawImage(stitched, 0, 0);
+        gctx.drawImage(newFrame, 0, sliceY, newFrame.width, appendHeight, 0, stitched.height, newFrame.width, appendHeight);
+        stitched = grown;
+      }
+      pendingTail = { canvas: newFrame, y: appendEnd, h: newFrame.height - appendEnd };
       frameCount++;
       debugLogPush(`remote (host): long screenshot — stitched now ${stitched.width}x${stitched.height} (${frameCount} frames)`, 'evt');
     }
-    if (!stitched) stitched = lastFrame; // page never scrolled at all — only frame 1 exists, never cropped
+    if (!stitched) stitched = lastFrame; // extreme edge case: loop never ran (shouldn't happen, LONG_SCREENSHOT_MAX_FRAMES >= 2)
+    if (pendingTail && pendingTail.h > 0) {
+      debugLogPush(`remote (host): long screenshot — closing out with final ${pendingTail.h}px tail`, 'evt');
+      const grown = new OffscreenCanvas(stitched.width, stitched.height + pendingTail.h);
+      const gctx = grown.getContext('2d');
+      gctx.drawImage(stitched, 0, 0);
+      gctx.drawImage(pendingTail.canvas, 0, pendingTail.y, pendingTail.canvas.width, pendingTail.h, 0, stitched.height, pendingTail.canvas.width, pendingTail.h);
+      stitched = grown;
+    }
     sendLongScreenshotProgress(peerId, serial, grantId, 'Finalizing...');
     debugLogPush('remote (host): long screenshot — encoding final PNG...', 'evt');
     const blob = await stitched.convertToBlob({ type: 'image/png' });
@@ -2823,12 +2836,6 @@ async function handleLongScreenshotRequest(data, peerId) {
   } catch (err) {
     debugLogPush(`remote (host): long screenshot failed: ${err && err.stack || err}`, 'err');
     try { remoteSession.actions.longScreenshotResult.send({ requestId, serial, grantId, ok: false, error: String(err && err.message || err) }, { target: peerId }); } catch (_) {}
-  } finally {
-    // Always restore system bars if we hid them — even on error/timeout/control-lost, a
-    // failed capture must never leave the device stuck with no status/nav bar visible.
-    if (immersiveApplied) {
-      try { await setImmersiveMode(info.adb, false); debugLogPush('remote (host): long screenshot — restored status/nav bars', 'evt'); } catch (err) { debugLogPush(`remote (host): long screenshot — failed to restore system bars: ${err && err.message || err}`, 'err'); }
-    }
   }
 }
 
