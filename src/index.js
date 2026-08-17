@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.2';
+const APP_VERSION = '1.25.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -4756,6 +4756,7 @@ window.sendControlAutoRotate = sendControlAutoRotate;
 window.sendControlRotateTo = sendControlRotateTo;
 window.installApk = installApk;
 window.requestScreenshot = requestScreenshot;
+window.requestLongScreenshot = requestLongScreenshot;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 // targetSerial/background — same purpose and contract as fetchAttestation()'s, see its
