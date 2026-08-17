@@ -631,6 +631,13 @@
   <button class="btn btn-sm" onclick="leaveRemoteSession()">Leave Session</button>
 </div>
 
+<div id="host-share-banner" class="viewer-banner hidden">
+  <span>Sharing this device — link is live</span>
+  <span id="host-share-viewer-count" class="badge">0 viewers</span>
+  <button class="btn btn-sm" onclick="startShareSession()">Share Link</button>
+  <button class="btn btn-sm" onclick="stopShareSession()">Stop Sharing</button>
+</div>
+
 <!-- Populated entirely at runtime by showControlActiveBanner() — one row per
      currently-controlled device, each with its own Stop button (control is per-device,
      so more than one row can show at once). -->
@@ -852,6 +859,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026081703"></script>
+<script type="module" src="bundle.js?v=2026081704"></script>
 </body>
 </html>

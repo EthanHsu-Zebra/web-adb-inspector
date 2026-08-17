@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.22.1';
+const APP_VERSION = '1.23.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -89,9 +89,16 @@ const REMOTE_TURN_CONFIG = [
 // host and viewer often shared no relay in common. A dedicated relay we control removes
 // both problems entirely.
 const REMOTE_RELAY_URLS = ['wss://web-adb-inspector-relay.onrender.com'];
+// Viewer presence: how often each viewer sends viewerHeartbeat, and how long a peer can
+// go without ANY sign of life (heartbeat, hello, or a real trystero P2P join) before the
+// host prunes it from remoteSession.viewers. See startShareSession()'s prune interval —
+// this exists because room.onPeerLeave (the fast, immediate path) only fires for a real
+// P2P connection; a fallback-only viewer closing their tab never triggers it at all.
+const VIEWER_HEARTBEAT_MS = 8000;
+const VIEWER_STALE_MS = 25000;
 let remoteSession = null;
 function isViewerMode() { return !!(remoteSession && remoteSession.role === 'viewer'); }
-// host:   { role:'host', room, roomId, password, viewers:Set<peerId>,
+// host:   { role:'host', room, roomId, password, viewers:Map<peerId,lastSeenAt>,
 //           actions:{hello,devicePush,cmdRequest,cmdResponse,bye} }
 // viewer: { role:'viewer', room, roomId, password, hostPeerId:null,
 //           actions:{...}, pendingRequests:Map<requestId,{cmd}>,
@@ -1639,7 +1646,7 @@ function makeRemoteActions(room, roomId, password, label) {
   for (const name of ['hello', 'devicePush', 'cmdRequest', 'cmdResponse', 'pathComplete', 'pathCompleteResult', 'tabDataPush', 'bye',
     'controlRequest', 'controlResponse', 'controlRelease', 'controlRevoked', 'screenFrame', 'inputEvent', 'orientationStatus',
     'apkTransferStart', 'apkTransferChunk', 'apkTransferEnd', 'apkInstallResult',
-    'screenshotRequest', 'screenshotResult']) actions[name] = wrap(name);
+    'screenshotRequest', 'screenshotResult', 'viewerHeartbeat']) actions[name] = wrap(name);
   actions._fallback = fallback;
   actions._sessionId = sessionId;
   return actions;
@@ -1736,7 +1743,7 @@ function startShareSession() {
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room, roomId, password, 'host');
-  remoteSession = { role: 'host', room, roomId, password, viewers: new Set(), actions, controlBySerial: new Map(), controlRequestQueue: [], apkTransfers: new Map() };
+  remoteSession = { role: 'host', room, roomId, password, viewers: new Map(), actions, controlBySerial: new Map(), controlRequestQueue: [], apkTransfers: new Map() };
   pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
@@ -1749,15 +1756,38 @@ function startShareSession() {
   actions.apkTransferChunk.onMessage = (data, ctx) => handleApkTransferChunk(data, ctx.peerId);
   actions.apkTransferEnd.onMessage = (data, ctx) => handleApkTransferEnd(data, ctx.peerId);
   actions.screenshotRequest.onMessage = (data, ctx) => handleScreenshotRequest(data, ctx.peerId);
+  actions.viewerHeartbeat.onMessage = (data, ctx) => {
+    if (!remoteSession || remoteSession.role !== 'host') return;
+    remoteSession.viewers.set(ctx.peerId, Date.now());
+    updateShareModalViewerCount();
+  };
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
-    remoteSession.viewers.add(peerId);
+    remoteSession.viewers.set(peerId, Date.now());
     updateShareModalViewerCount();
   };
   room.onPeerLeave = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer left: peerId=${peerId}`, 'warn');
     handlePeerLeaveHost(peerId);
   };
+  // Belt-and-suspenders for a real, previously-documented gap: room.onPeerLeave only
+  // fires for a viewer trystero has an actual P2P connection to — a fallback-only viewer
+  // (WebRTC blocked on their network, see makeRemoteActions()) never triggers it at all,
+  // so closing their tab left them counted forever with no way to tell. viewerHeartbeat
+  // (sent every ~8s by every viewer, see joinAsViewer()) refreshes remoteSession.viewers'
+  // timestamp; this sweep prunes anyone who hasn't been heard from — via heartbeat, hello,
+  // OR a real P2P join — in a while, reusing the exact same cleanup handlePeerLeaveHost()
+  // already does for a real disconnect (control/apkTransfers/queue teardown included).
+  remoteSession.viewerPruneInterval = setInterval(() => {
+    if (!remoteSession || remoteSession.role !== 'host') return;
+    const staleBefore = Date.now() - VIEWER_STALE_MS;
+    for (const [peerId, lastSeenAt] of Array.from(remoteSession.viewers)) {
+      if (lastSeenAt < staleBefore) {
+        debugLogPush(`remote (host): viewer peerId=${peerId} timed out (no heartbeat/activity for ${Math.round((Date.now() - lastSeenAt) / 1000)}s) — removing`, 'warn');
+        handlePeerLeaveHost(peerId);
+      }
+    }
+  }, VIEWER_HEARTBEAT_MS);
 
   debugLogPush(`remote session started: roomId=${roomId} appId=${REMOTE_APP_ID}`, 'ok');
   debugLogPush(`startShareSession: connectedDevices=[${Array.from(connectedDevices.keys()).join(', ')}] activeSerial=${activeSerial}`, 'evt');
@@ -1787,11 +1817,13 @@ function startShareSession() {
       prefetchTabsForViewers(serial);
     }
   }
+  showHostShareBanner();
   showShareModal();
 }
 
 async function stopShareSession() {
   if (!remoteSession || remoteSession.role !== 'host') return;
+  if (remoteSession.viewerPruneInterval) clearInterval(remoteSession.viewerPruneInterval);
   try { remoteSession.actions.bye.send({ reason: 'host_stopped' }); } catch (_) {}
   await new Promise((res) => setTimeout(res, 200));
   try { remoteSession.actions._fallback.close(); } catch (_) {}
@@ -1800,6 +1832,7 @@ async function stopShareSession() {
   hideShareModal();
   hideControlRequestPrompt();
   hideControlActiveBanner();
+  hideHostShareBanner();
   setStatus('Remote session ended', 'warn');
 }
 
@@ -1938,7 +1971,7 @@ async function prefetchTabsForViewers(serial) {
 function handleViewerHello(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   debugLogPush(`remote viewer hello: peerId=${peerId}`, 'evt');
-  remoteSession.viewers.add(peerId);
+  remoteSession.viewers.set(peerId, Date.now());
   try { remoteSession.actions.devicePush.send(buildDeviceSnapshot(), { target: peerId }); } catch (_) {}
   // pushTabHtml() only fires on a fresh fetch (device selection, or a manual CSR/probe
   // click) for whichever device is CURRENTLY active — a viewer joining after the host
@@ -2492,8 +2525,24 @@ function hideShareModal() {
 }
 
 function updateShareModalViewerCount() {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const count = remoteSession.viewers.size;
   const el = document.getElementById('share-viewer-count');
-  if (el && remoteSession && remoteSession.role === 'host') el.textContent = String(remoteSession.viewers.size);
+  if (el) el.textContent = String(count);
+  // Also reflected in the persistent host-side banner (showHostShareBanner()), which
+  // stays visible even after the Share modal itself is closed — the modal-only count
+  // was easy to lose track of once you'd already copied the link and moved on.
+  const bannerCount = document.getElementById('host-share-viewer-count');
+  if (bannerCount) bannerCount.textContent = count === 1 ? '1 viewer' : count + ' viewers';
+}
+
+function showHostShareBanner() {
+  document.getElementById('host-share-banner')?.classList.remove('hidden');
+  updateShareModalViewerCount();
+}
+
+function hideHostShareBanner() {
+  document.getElementById('host-share-banner')?.classList.add('hidden');
 }
 
 // --- Remote Session: Viewer ---
@@ -2528,6 +2577,14 @@ function joinAsViewer(roomId, password) {
   for (let i = 0; i < 4; i++) {
     setTimeout(() => { try { actions.hello.send({ appVersion: APP_VERSION }); } catch (_) {} }, i * 2000);
   }
+
+  // Periodic proof-of-life for the host's viewer count/prune sweep (see VIEWER_STALE_MS's
+  // comment) — broadcasts (no target needed) so it works the same whether or not
+  // hostPeerId has been identified yet, and regardless of which transport is actually
+  // reachable. Cleared in leaveRemoteSession() and when the host disconnects.
+  remoteSession.heartbeatInterval = setInterval(() => {
+    try { actions.viewerHeartbeat.send({}); } catch (_) {}
+  }, VIEWER_HEARTBEAT_MS);
 
   // A room can hold more than one viewer (mesh topology — every peer sees every other
   // peer's onPeerJoin, not just the host's). Whoever connects first used to get blindly
@@ -2624,6 +2681,7 @@ function joinAsViewer(roomId, password) {
 
 function leaveRemoteSession() {
   if (!remoteSession || remoteSession.role !== 'viewer') return;
+  if (remoteSession.heartbeatInterval) clearInterval(remoteSession.heartbeatInterval);
   try {
     if (remoteSession.hostPeerId) remoteSession.actions.bye.send({ reason: 'viewer_left' }, { target: remoteSession.hostPeerId });
   } catch (_) {}
@@ -2667,6 +2725,7 @@ function showHostDisconnectedBanner() {
   setViewerStatus('Host disconnected', 'err');
   const input = document.getElementById('viewer-shell-input');
   if (input) input.disabled = true;
+  if (remoteSession?.heartbeatInterval) clearInterval(remoteSession.heartbeatInterval);
 }
 
 // Each device gets its own persisted shell console (mirrors dataCache.shellBySerial
