@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.22.0';
+const APP_VERSION = '1.22.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2367,10 +2367,33 @@ async function handleApkTransferEnd(data, peerId) {
   const { transferId, serial, grantId } = data || {};
   const transfer = remoteSession.apkTransfers.get(transferId);
   if (!transfer || transfer.serial !== serial || transfer.peerId !== peerId || transfer.grantId !== grantId) return;
+  if (!isController(serial, peerId, grantId)) { remoteSession.apkTransfers.delete(transferId); return; }
+  // apkTransferEnd carries no requestId, so the generic dual-transport dedup in
+  // deliver() doesn't apply to it — a P2P + fallback duplicate delivery of the SAME End
+  // message would otherwise run this whole function twice concurrently (both awaiting
+  // the same transfer, both eventually installing) and double-run `pm install`.
+  if (transfer.ending) return;
+  transfer.ending = true;
+  // apkTransferChunk and apkTransferEnd are different trystero actions — each is its own
+  // underlying data-channel stream, and different streams over the same connection have
+  // no cross-stream delivery-order guarantee. That means this End signal can legitimately
+  // be PROCESSED before every chunk has landed, even though the viewer sent it last
+  // (confirmed: a real report of "received 0/8 chunks" — the transfer object existed, so
+  // Start had arrived, but zero chunks had been applied yet when End ran). Wait briefly
+  // for stragglers instead of failing immediately; chunk application only needs to catch
+  // up, not be re-requested — handleApkTransferChunk() keeps updating the same transfer
+  // object regardless of when this loop is running.
+  if (transfer.received < transfer.totalChunks) {
+    debugLogPush(`remote (host): apkTransferEnd arrived early (${transfer.received}/${transfer.totalChunks} chunks so far) — waiting for stragglers`, 'warn');
+  }
+  const deadline = Date.now() + 10000;
+  while (transfer.received < transfer.totalChunks && remoteSession.apkTransfers.has(transferId) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
   remoteSession.apkTransfers.delete(transferId);
-  if (!isController(serial, peerId, grantId)) return;
   if (transfer.received !== transfer.totalChunks) {
-    sendApkInstallResult(peerId, serial, grantId, transferId, false, `Transfer incomplete: received ${transfer.received}/${transfer.totalChunks} chunks`);
+    debugLogPush(`remote (host): apk transfer still incomplete after waiting: ${transfer.received}/${transfer.totalChunks}`, 'err');
+    sendApkInstallResult(peerId, serial, grantId, transferId, false, `Transfer incomplete: received ${transfer.received}/${transfer.totalChunks} chunks after waiting`);
     return;
   }
   const info = connectedDevices.get(serial);

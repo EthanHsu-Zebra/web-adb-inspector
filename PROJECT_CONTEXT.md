@@ -195,6 +195,11 @@ Each card has a checkbox (`toggleDeviceSelection('connected'|'available', serial
 
 ## 7. Known Bugs and Fixes
 
+### v1.22.1 — APK install regressed to "Transfer incomplete: received 0/N chunks"
+Real report: an install that worked before (v1.21.0) started reliably failing with "received 0/8 chunks" — the transfer object existed (so `apkTransferStart` had been processed) but `apkTransferEnd` ran while zero chunks had been applied yet, even though the viewer sends all chunks before End. Root cause: `apkTransferChunk` and `apkTransferEnd` are different trystero *actions*, each its own underlying data-channel stream — different streams over the same connection have **no cross-stream delivery-order guarantee**. Sending End last doesn't mean it arrives last; it's entirely possible (and, per this report, was actually happening) for End to be processed before some or all chunks land.
+
+Fixed by making `handleApkTransferEnd()` tolerant of this instead of failing on the spot: if not all chunks have arrived yet, it polls every 200ms for up to 10s waiting for stragglers (`handleApkTransferChunk()` keeps updating the same transfer object regardless of when this wait loop is running) before giving up. Also added a `transfer.ending` guard — `apkTransferEnd` carries no `requestId`, so the generic dual-transport dedup in `deliver()` doesn't cover it, meaning a P2P+fallback duplicate delivery of the same End message could otherwise run this whole function twice concurrently and double-run `pm install`. The symmetric risk (a chunk arriving before `apkTransferStart` has been processed, currently silently dropped since `handleApkTransferChunk()` finds no transfer object yet) is **not** fixed here — not evidenced by this specific report (which showed Start had already succeeded), and buffering orphan chunks would add real complexity for an unconfirmed failure mode; worth revisiting if a future report shows partial-but-nonzero chunk loss instead of the "0 received" pattern this fix targets.
+
 ### v1.22.0 — orientation "unknown" fix, Portrait/Landscape/Screenshot, side-by-side layout
 Follow-up to v1.21.0's rotation/APK-install additions, four items:
 
