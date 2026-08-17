@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.0';
+const APP_VERSION = '1.25.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2549,33 +2549,56 @@ async function pngToCanvas(png) {
 // Finds where `prevCanvas`'s bottom edge re-appears inside `nextCanvas` (i.e. how far
 // the swipe actually scrolled the page), by sliding a thin strip from prev's bottom down
 // through next's upper-to-middle region and keeping the best (lowest-difference) match.
-// Returns the y-offset in `nextCanvas` below which content is genuinely new. Falls back
-// to a conservative fixed overlap if no good match is found (page changed unpredictably).
+// Returns the y-offset (in nextCanvas's FULL-RESOLUTION coordinates) below which content
+// is genuinely new. Falls back to a conservative fixed overlap if no good match is found
+// (page changed unpredictably).
+//
+// Runs the actual sliding search on a small downscaled proxy (~150px wide), not the raw
+// full-resolution frame. The first version of this did the search directly on full-res
+// canvases and called getImageData() once per candidate row (~300+ times per frame
+// transition, each pulling a full-width strip) — synchronous, no yield points, and
+// expensive enough (multiplied by up to 14 frame transitions) to freeze the host tab's
+// main thread for the whole operation ("long screenshot is not responsive" — v1.25.0
+// report). Downscaling first cuts the search to two getImageData() calls total and a
+// few hundred thousand trivial array reads, which runs in low single-digit milliseconds.
 function findScrollOverlap(prevCanvas, nextCanvas) {
-  const width = prevCanvas.width;
-  const stripHeight = Math.max(8, Math.round(prevCanvas.height * 0.03));
-  const sampleStep = Math.max(1, Math.round(width / 200));
-  const stripA = prevCanvas.getContext('2d').getImageData(0, prevCanvas.height - stripHeight, width, stripHeight).data;
-  const ctxB = nextCanvas.getContext('2d');
-  const searchFrom = Math.round(nextCanvas.height * 0.05);
-  const searchTo = Math.min(nextCanvas.height - stripHeight, Math.round(nextCanvas.height * 0.6));
-  let bestY = Math.round(nextCanvas.height * 0.15);
+  const THUMB_WIDTH = 150;
+  const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
+  const toThumb = (canvas) => {
+    const h = Math.max(1, Math.round(canvas.height * scale));
+    const c = new OffscreenCanvas(THUMB_WIDTH, h);
+    c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
+    return c;
+  };
+  const thumbA = toThumb(prevCanvas);
+  const thumbB = toThumb(nextCanvas);
+  const stripHeight = Math.max(4, Math.round(thumbA.height * 0.03));
+  const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
+  const searchFrom = Math.round(thumbB.height * 0.05);
+  const searchTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
+  const bandHeight = Math.max(1, searchTo - searchFrom + stripHeight);
+  const dataB = thumbB.getContext('2d').getImageData(0, Math.max(0, searchFrom), THUMB_WIDTH, bandHeight).data;
+
+  let bestOffset = Math.round(thumbB.height * 0.15) - searchFrom; // fallback, in dataB-local rows
   let bestScore = Infinity;
-  for (let y = searchFrom; y <= searchTo; y += 4) {
-    const stripB = ctxB.getImageData(0, y, width, stripHeight).data;
+  for (let y = 0; y + stripHeight <= bandHeight; y++) {
     let sum = 0, n = 0;
     for (let row = 0; row < stripHeight; row++) {
-      for (let col = 0; col < width; col += sampleStep) {
-        const idx = (row * width + col) * 4;
-        sum += Math.abs(stripA[idx] - stripB[idx]) + Math.abs(stripA[idx + 1] - stripB[idx + 1]) + Math.abs(stripA[idx + 2] - stripB[idx + 2]);
+      const rowA = row * THUMB_WIDTH * 4;
+      const rowB = (y + row) * THUMB_WIDTH * 4;
+      for (let col = 0; col < THUMB_WIDTH; col += 2) {
+        const idxA = rowA + col * 4;
+        const idxB = rowB + col * 4;
+        sum += Math.abs(dataA[idxA] - dataB[idxB]) + Math.abs(dataA[idxA + 1] - dataB[idxB + 1]) + Math.abs(dataA[idxA + 2] - dataB[idxB + 2]);
         n++;
       }
     }
     const score = sum / n;
-    if (score < bestScore) { bestScore = score; bestY = y; }
+    if (score < bestScore) { bestScore = score; bestOffset = y; }
   }
   const matched = bestScore < 40; // empirical threshold on a 0-765 (3-channel) difference scale
-  return matched ? (bestY + stripHeight) : Math.round(nextCanvas.height * 0.15);
+  const sliceYThumb = matched ? (searchFrom + bestOffset + stripHeight) : Math.round(thumbB.height * 0.15);
+  return Math.round(sliceYThumb / scale); // back to nextCanvas's real (full-res) coordinates
 }
 
 function sendLongScreenshotProgress(peerId, serial, grantId, message) {
@@ -2612,6 +2635,7 @@ async function handleLongScreenshotRequest(data, peerId) {
       sendLongScreenshotProgress(peerId, serial, grantId, `Capturing frame ${i + 1}...`);
       const newFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
       const sliceY = findScrollOverlap(lastFrame, newFrame);
+      await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas draw
       const newHeight = newFrame.height - sliceY;
       lastFrame = newFrame;
       // Scrolling produced essentially no new content — reached the bottom of the page.
