@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.23.0';
+const APP_VERSION = '1.23.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1743,7 +1743,7 @@ function startShareSession() {
   const password = genPassword();
   const room = joinRoom({ appId: REMOTE_APP_ID, password, turnConfig: REMOTE_TURN_CONFIG, rtcPolyfill: makeDiagnosticRTCPeerConnection('host'), relayConfig: { urls: REMOTE_RELAY_URLS, redundancy: REMOTE_RELAY_URLS.length, warnOnRelayFailure: true } }, roomId, makeJoinCallbacks('host'));
   const actions = makeRemoteActions(room, roomId, password, 'host');
-  remoteSession = { role: 'host', room, roomId, password, viewers: new Map(), actions, controlBySerial: new Map(), controlRequestQueue: [], apkTransfers: new Map() };
+  remoteSession = { role: 'host', room, roomId, password, viewers: new Map(), peerAliases: new Map(), actions, controlBySerial: new Map(), controlRequestQueue: [], apkTransfers: new Map() };
   pollIceState(room, 'host', 60);
 
   actions.hello.onMessage = (data, ctx) => handleViewerHello(data, ctx.peerId);
@@ -1756,14 +1756,14 @@ function startShareSession() {
   actions.apkTransferChunk.onMessage = (data, ctx) => handleApkTransferChunk(data, ctx.peerId);
   actions.apkTransferEnd.onMessage = (data, ctx) => handleApkTransferEnd(data, ctx.peerId);
   actions.screenshotRequest.onMessage = (data, ctx) => handleScreenshotRequest(data, ctx.peerId);
-  actions.viewerHeartbeat.onMessage = (data, ctx) => {
-    if (!remoteSession || remoteSession.role !== 'host') return;
-    remoteSession.viewers.set(ctx.peerId, Date.now());
-    updateShareModalViewerCount();
-  };
+  actions.viewerHeartbeat.onMessage = (data, ctx) => registerViewerPresence(ctx.peerId, data);
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (host): WebRTC peer joined: peerId=${peerId}`, 'ok');
-    remoteSession.viewers.set(peerId, Date.now());
+    // No payload here (raw trystero event) — if this peerId's sessionId alias isn't
+    // known yet, this briefly counts as its own entry until the next hello/heartbeat
+    // (already in flight — see joinAsViewer) resolves and merges it. See
+    // registerViewerPresence() above for the merge itself.
+    remoteSession.viewers.set(remoteSession.peerAliases.get(peerId) || peerId, Date.now());
     updateShareModalViewerCount();
   };
   room.onPeerLeave = (peerId) => {
@@ -1968,10 +1968,31 @@ async function prefetchTabsForViewers(serial) {
   debugLogPush(`prefetchTabsForViewers(${serial}): done, hostTabHtmlCache now has [${Object.keys(hostTabHtmlCache[serial] || {}).join(', ')}]`, 'evt');
 }
 
+// A single physical viewer tab can be seen under TWO different ctx.peerId values —
+// its real trystero peerId (P2P) and the fallback channel's per-tab sessionId (see
+// makeRemoteActions' comment) — depending on which transport happens to deliver a
+// given message. hello/viewerHeartbeat now carry the sender's own sessionId in their
+// payload, so once EITHER transport delivers one, the host learns that this ctxPeerId
+// and that sessionId are the same viewer, and collapses them to one remoteSession.viewers
+// entry (keyed by the sessionId, since that's the one stable identity available on both
+// transports) instead of double-counting one tab as two viewers.
+function registerViewerPresence(ctxPeerId, data) {
+  if (!remoteSession || remoteSession.role !== 'host') return;
+  const sid = data && typeof data.sessionId === 'string' ? data.sessionId : null;
+  if (sid) {
+    remoteSession.peerAliases.set(ctxPeerId, sid);
+    if (sid !== ctxPeerId) remoteSession.viewers.delete(ctxPeerId);
+    remoteSession.viewers.set(sid, Date.now());
+  } else {
+    remoteSession.viewers.set(remoteSession.peerAliases.get(ctxPeerId) || ctxPeerId, Date.now());
+  }
+  updateShareModalViewerCount();
+}
+
 function handleViewerHello(data, peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   debugLogPush(`remote viewer hello: peerId=${peerId}`, 'evt');
-  remoteSession.viewers.set(peerId, Date.now());
+  registerViewerPresence(peerId, data);
   try { remoteSession.actions.devicePush.send(buildDeviceSnapshot(), { target: peerId }); } catch (_) {}
   // pushTabHtml() only fires on a fresh fetch (device selection, or a manual CSR/probe
   // click) for whichever device is CURRENTLY active — a viewer joining after the host
@@ -2008,6 +2029,12 @@ function handleViewerHello(data, peerId) {
 function handlePeerLeaveHost(peerId) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   remoteSession.viewers.delete(peerId);
+  // peerId here may be either identity (see registerViewerPresence) — also drop
+  // whichever OTHER key was learned to be an alias of it, so a real P2P disconnect
+  // (which only ever gives us the real peerId) fully clears a viewer that also has a
+  // sessionId-keyed entry, instead of leaving that half behind until it goes stale.
+  const alias = remoteSession.peerAliases.get(peerId);
+  if (alias) { remoteSession.viewers.delete(alias); remoteSession.peerAliases.delete(peerId); }
   // They're already gone — no point sending controlRevoked, just clean up locally.
   let hadControl = false;
   for (const [serial, entry] of Array.from(remoteSession.controlBySerial)) {
@@ -2575,15 +2602,22 @@ function joinAsViewer(roomId, password) {
   // times, since pub/sub doesn't buffer for a subscriber that joins the topic a
   // moment late) so the host can identify and greet this viewer even with zero P2P.
   for (let i = 0; i < 4; i++) {
-    setTimeout(() => { try { actions.hello.send({ appVersion: APP_VERSION }); } catch (_) {} }, i * 2000);
+    setTimeout(() => { try { actions.hello.send({ appVersion: APP_VERSION, sessionId: actions._sessionId }); } catch (_) {} }, i * 2000);
   }
 
   // Periodic proof-of-life for the host's viewer count/prune sweep (see VIEWER_STALE_MS's
   // comment) — broadcasts (no target needed) so it works the same whether or not
   // hostPeerId has been identified yet, and regardless of which transport is actually
   // reachable. Cleared in leaveRemoteSession() and when the host disconnects.
+  //
+  // sessionId is included so the host can tell that a real trystero peerId and this
+  // fallback-channel sessionId are the SAME physical viewer (see makeRemoteActions'
+  // comment: every dual-transport message shows up with a DIFFERENT ctx.peerId
+  // depending on which transport happened to deliver it) — without it, one tab that's
+  // reachable over both P2P and the fallback relay gets counted as two viewers, since
+  // hello/heartbeat carry no requestId and so aren't deduped like cmdRequest/cmdResponse.
   remoteSession.heartbeatInterval = setInterval(() => {
-    try { actions.viewerHeartbeat.send({}); } catch (_) {}
+    try { actions.viewerHeartbeat.send({ sessionId: actions._sessionId }); } catch (_) {}
   }, VIEWER_HEARTBEAT_MS);
 
   // A room can hold more than one viewer (mesh topology — every peer sees every other
@@ -2595,7 +2629,7 @@ function joinAsViewer(roomId, password) {
   // connection order: only devicePush (host-exclusive) sets hostPeerId.
   room.onPeerJoin = (peerId) => {
     debugLogPush(`remote (viewer): WebRTC peer joined: peerId=${peerId}`, 'ok');
-    try { actions.hello.send({ appVersion: APP_VERSION }, { target: peerId }); } catch (_) {}
+    try { actions.hello.send({ appVersion: APP_VERSION, sessionId: actions._sessionId }, { target: peerId }); } catch (_) {}
     if (!remoteSession.hostPeerId) setViewerStatus('Peer connected, waiting for host...', 'connecting');
   };
   room.onPeerLeave = (peerId) => {
