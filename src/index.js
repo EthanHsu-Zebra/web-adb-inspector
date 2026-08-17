@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.4';
+const APP_VERSION = '1.25.5';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2642,6 +2642,50 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
   return Math.round(sliceYThumb / scale); // back to nextCanvas's real (full-res) coordinates
 }
 
+// Detects the device's fixed chrome (status bar at the top, on-screen navigation bar at
+// the bottom) by comparing two frames that genuinely have different scrolled content —
+// whatever rows stay pixel-identical between them can only be system chrome, since real
+// app content changes with scroll but chrome never does. This matters because otherwise
+// findScrollOverlap()'s reference strip (taken from a frame's bottom edge) is often
+// dominated by nav-bar pixels: since the nav bar sits outside the alignment search's
+// range, that strip either matches nowhere in-bounds — silently falling back to a rough,
+// often-wrong fixed-overlap guess — or, worse, gets pasted mid-page as its own visible
+// artifact (v1.25.4 report: nav bar icons appearing over body text, duplicate content
+// around them). Capped at 12% of height from each edge (real status/nav bars are never
+// close to that large) so a degenerate all-identical comparison can't eat real content.
+// Returns {top, bottom} in FULL-RESOLUTION row coordinates — content is rows [top, bottom).
+function detectChromeBounds(canvasA, canvasB) {
+  const THUMB_WIDTH = 60;
+  const scale = THUMB_WIDTH / canvasA.width;
+  const toThumb = (canvas) => {
+    const h = Math.max(1, Math.round(canvas.height * scale));
+    const c = new OffscreenCanvas(THUMB_WIDTH, h);
+    c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
+    return c;
+  };
+  const thumbA = toThumb(canvasA);
+  const thumbB = toThumb(canvasB);
+  const height = Math.min(thumbA.height, thumbB.height);
+  const dataA = thumbA.getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data;
+  const dataB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data;
+  const rowDiff = (row) => {
+    const off = row * THUMB_WIDTH * 4;
+    let sum = 0;
+    for (let col = 0; col < THUMB_WIDTH; col++) {
+      const idx = off + col * 4;
+      sum += Math.abs(dataA[idx] - dataB[idx]) + Math.abs(dataA[idx + 1] - dataB[idx + 1]) + Math.abs(dataA[idx + 2] - dataB[idx + 2]);
+    }
+    return sum / THUMB_WIDTH;
+  };
+  const maxChromeRows = Math.round(height * 0.12);
+  let top = 0;
+  while (top < maxChromeRows && rowDiff(top) < 12) top++;
+  let bottomCount = 0;
+  while (bottomCount < maxChromeRows && rowDiff(height - 1 - bottomCount) < 12) bottomCount++;
+  const unscale = canvasA.width / THUMB_WIDTH;
+  return { top: Math.round(top * unscale), bottom: canvasA.height - Math.round(bottomCount * unscale) };
+}
+
 function sendLongScreenshotProgress(peerId, serial, grantId, message) {
   if (!remoteSession || remoteSession.role !== 'host') return;
   // Deliberately no requestId — this fires many times per operation, and the generic
@@ -2680,24 +2724,41 @@ async function handleLongScreenshotRequest(data, peerId) {
     debugLogPush('remote (host): long screenshot — capturing frame 1 (adbScreencap)...', 'evt');
     const firstPng = await adbScreencap(info.adb, 15000);
     debugLogPush(`remote (host): long screenshot — frame 1 captured, ${firstPng.length} bytes, decoding...`, 'evt');
-    let lastFrame = await pngToCanvas(firstPng);
+    let rawFirstFrame = await pngToCanvas(firstPng);
+    let lastFrame = rawFirstFrame; // re-cropped to content-only once chromeBounds is known below
     debugLogPush(`remote (host): long screenshot — frame 1 decoded, ${lastFrame.width}x${lastFrame.height}`, 'evt');
-    let stitched = lastFrame;
+    let stitched = null;
+    let chromeBounds = null;
+    const cropToContent = (canvas) => {
+      if (!chromeBounds) return canvas;
+      const h = Math.max(1, chromeBounds.bottom - chromeBounds.top);
+      const c = new OffscreenCanvas(canvas.width, h);
+      c.getContext('2d').drawImage(canvas, 0, chromeBounds.top, canvas.width, h, 0, 0, canvas.width, h);
+      return c;
+    };
     let frameCount = 1;
     for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
       if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
       if (Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) { debugLogPush('remote (host): long screenshot — overall timeout reached, stopping early', 'warn'); break; }
-      const x = Math.round(lastFrame.width / 2);
-      const fromY = Math.round(lastFrame.height * 0.85);
-      const toY = Math.round(lastFrame.height * 0.15);
+      const x = Math.round(rawFirstFrame.width / 2);
+      const fromY = Math.round(rawFirstFrame.height * 0.85);
+      const toY = Math.round(rawFirstFrame.height * 0.15);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: swiping (${x},${fromY}) -> (${x},${toY})`, 'evt');
       await adbShell(info.adb, `input swipe ${x} ${fromY} ${x} ${toY} 300`);
       await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
       sendLongScreenshotProgress(peerId, serial, grantId, `Capturing frame ${i + 1}...`);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: capturing...`, 'evt');
       const png = await adbScreencap(info.adb, 15000);
-      const newFrame = await pngToCanvas(png);
-      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: captured (${png.length} bytes), finding overlap...`, 'evt');
+      const newFrameRaw = await pngToCanvas(png);
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: captured (${png.length} bytes)`, 'evt');
+      if (!chromeBounds) {
+        chromeBounds = detectChromeBounds(rawFirstFrame, newFrameRaw);
+        debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
+        lastFrame = cropToContent(rawFirstFrame);
+        stitched = lastFrame;
+      }
+      const newFrame = cropToContent(newFrameRaw);
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: finding overlap (content region ${newFrame.width}x${newFrame.height})...`, 'evt');
       const sliceY = findScrollOverlap(lastFrame, newFrame);
       await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas draw
       const newHeight = newFrame.height - sliceY;
@@ -2717,6 +2778,7 @@ async function handleLongScreenshotRequest(data, peerId) {
       frameCount++;
       debugLogPush(`remote (host): long screenshot — stitched now ${stitched.width}x${stitched.height} (${frameCount} frames)`, 'evt');
     }
+    if (!stitched) stitched = lastFrame; // page never scrolled at all — only frame 1 exists, never cropped
     sendLongScreenshotProgress(peerId, serial, grantId, 'Finalizing...');
     debugLogPush('remote (host): long screenshot — encoding final PNG...', 'evt');
     const blob = await stitched.convertToBlob({ type: 'image/png' });
