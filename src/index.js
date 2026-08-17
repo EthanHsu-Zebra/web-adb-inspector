@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.5';
+const APP_VERSION = '1.25.6';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2653,9 +2653,20 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
 // artifact (v1.25.4 report: nav bar icons appearing over body text, duplicate content
 // around them). Capped at 12% of height from each edge (real status/nav bars are never
 // close to that large) so a degenerate all-identical comparison can't eat real content.
+//
+// v1.25.6 fix, from a real repro (nav bar still visible mid-page after v1.25.5): the
+// first version used a per-ROW AVERAGE difference over an aggressively downscaled (60px
+// wide) thumbnail. On a mostly-uniform dark-background UI with sparse light text (this
+// app's actual theme), a genuinely-different content row is still MOSTLY background —
+// averaging across the whole row width dilutes the few truly-different text pixels down
+// below the "identical" threshold, so the scan overran real content as if it were chrome.
+// Fixed two ways: use a much less aggressive downscale (300px, not 60px) so text detail
+// survives instead of blurring away, and compare by the MAX per-pixel difference in a
+// row, not the average — chrome rows are bit-for-bit identical end to end, so even one
+// genuinely different pixel correctly disqualifies a row, however sparse the change.
 // Returns {top, bottom} in FULL-RESOLUTION row coordinates — content is rows [top, bottom).
 function detectChromeBounds(canvasA, canvasB) {
-  const THUMB_WIDTH = 60;
+  const THUMB_WIDTH = 300;
   const scale = THUMB_WIDTH / canvasA.width;
   const toThumb = (canvas) => {
     const h = Math.max(1, Math.round(canvas.height * scale));
@@ -2670,18 +2681,19 @@ function detectChromeBounds(canvasA, canvasB) {
   const dataB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data;
   const rowDiff = (row) => {
     const off = row * THUMB_WIDTH * 4;
-    let sum = 0;
+    let maxDiff = 0;
     for (let col = 0; col < THUMB_WIDTH; col++) {
       const idx = off + col * 4;
-      sum += Math.abs(dataA[idx] - dataB[idx]) + Math.abs(dataA[idx + 1] - dataB[idx + 1]) + Math.abs(dataA[idx + 2] - dataB[idx + 2]);
+      const d = Math.abs(dataA[idx] - dataB[idx]) + Math.abs(dataA[idx + 1] - dataB[idx + 1]) + Math.abs(dataA[idx + 2] - dataB[idx + 2]);
+      if (d > maxDiff) maxDiff = d;
     }
-    return sum / THUMB_WIDTH;
+    return maxDiff;
   };
   const maxChromeRows = Math.round(height * 0.12);
   let top = 0;
-  while (top < maxChromeRows && rowDiff(top) < 12) top++;
+  while (top < maxChromeRows && rowDiff(top) < 20) top++;
   let bottomCount = 0;
-  while (bottomCount < maxChromeRows && rowDiff(height - 1 - bottomCount) < 12) bottomCount++;
+  while (bottomCount < maxChromeRows && rowDiff(height - 1 - bottomCount) < 20) bottomCount++;
   const unscale = canvasA.width / THUMB_WIDTH;
   return { top: Math.round(top * unscale), bottom: canvasA.height - Math.round(bottomCount * unscale) };
 }
