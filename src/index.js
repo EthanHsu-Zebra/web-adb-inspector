@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.6';
+const APP_VERSION = '1.27.7';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -3114,10 +3114,24 @@ async function handleLongScreenshotRequest(data, peerId) {
       if (!chromeBounds) {
         // Establishing chrome bounds from a single frame pair is unreliable — see
         // detectChromeBounds()'s v1.27.0 comment — so hold off on cropping or stitching
-        // ANYTHING until at least 3 raw frames (2 independent pairs) are in hand.
+        // ANYTHING until at least 4 raw frames are in hand.
+        //
+        // v1.27.7: rawFirstFrame (captured AT the very top) is deliberately EXCLUDED from
+        // the frames passed to detectChromeBounds — real repro (chrome bounds detected as
+        // top=25, when it should be ~360, swallowing 11+ real items as "content" once the
+        // mismatch corrupted the alignment math). This app's title bar collapses once
+        // scrolling begins, so rawFirstFrame (title fully expanded, only frame ever in that
+        // state) is genuinely a DIFFERENT, taller height of chrome than every later frame
+        // (already collapsed, and never re-expands since the capture loop only scrolls
+        // forward) — comparing it against post-collapse frames can only ever agree on the
+        // post-collapse frames' much shorter boundary, not rawFirstFrame's true, taller one.
+        // Detecting from frames[1:] alone (3 post-collapse frames, 2 pairs — same rigor as
+        // before) finds the correct steady-state boundary; applying it to rawFirstFrame too
+        // costs at most a sliver of leftover expanded-title text at the very top of the
+        // final image, not a large content misalignment.
         rawFrameBuffer.push(newFrameRaw);
-        if (rawFrameBuffer.length < 3) continue;
-        chromeBounds = detectChromeBounds(...rawFrameBuffer);
+        if (rawFrameBuffer.length < 4) continue;
+        chromeBounds = detectChromeBounds(...rawFrameBuffer.slice(1));
         debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
         lastFrame = cropToContent(rawFrameBuffer[0]);
         pendingStart = 0;
