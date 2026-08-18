@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.26.4';
+const APP_VERSION = '1.27.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2678,7 +2678,11 @@ function bestStripMatch(dataA, dataB, width, stripHeight, bandHeight) {
     scores.push(score);
     if (score < bestScore) bestScore = score;
   }
-  const tolerance = 0.01; // 1 percentage point, for near-tied candidates
+  // v1.27.0: tightened from 0.01 — that tolerance was loose enough to accept a candidate
+  // that was merely CLOSE in score to the true best, not genuinely tied with it, causing
+  // it to lock onto a nearby-but-wrong offset instead of scanning through to the real
+  // tied cluster (confirmed via direct score-array inspection on a real repro).
+  const tolerance = 0.003;
   let bestOffset = 0;
   for (let y = 0; y < scores.length; y++) {
     if (scores[y] <= bestScore + tolerance) { bestOffset = y; break; }
@@ -2687,13 +2691,40 @@ function bestStripMatch(dataA, dataB, width, stripHeight, bandHeight) {
 }
 
 // `expectedFraction`: the caller's best current estimate of where the overlap should
-// land, as a fraction of nextCanvas's height (0.30 — a generic guess from the swipe
-// geometry — until calibrated from a real measurement; see v1.26.3 below). Returns
-// {sliceY, measuredFraction}: sliceY in nextCanvas's FULL-RESOLUTION coordinates,
-// measuredFraction the ACTUAL measured overlap (only meaningful when a confident match
-// was found) so the caller can calibrate its estimate for the next call.
+// land, as a fraction of nextCanvas's height — used only for the final no-match fallback
+// guess now (see v1.27.0 below, which removed the narrow/wide two-tier search this used
+// to drive). Returns {sliceY, measuredFraction}: sliceY in nextCanvas's FULL-RESOLUTION
+// coordinates, measuredFraction the ACTUAL measured overlap (only meaningful when a
+// confident match was found) so the caller can calibrate its estimate for the next call.
+//
+// v1.27.0 rewrite, from a real repro (a list item's label landing without its value, then
+// jumping backward to an earlier item — the aperture problem, still biting after
+// v1.25.4/v1.26.1/v1.26.3's window tuning and v1.26.4's score-dilution fix). Root-caused
+// via direct offline replay against captured device frames (score-array dumps, brute-force
+// full-frame search, pixel-exact ground truth) to TWO independent, compounding bugs:
+//
+// 1. The narrow/wide two-tier search could let a mediocre match in the narrow band block
+//    ever trying the wide band: whenever this page's true scroll-per-swipe distance
+//    exceeded the narrow band's range (a real, transition-specific amount — not a fixed
+//    fraction — confirmed by direct measurement), the narrow search would still stumble
+//    onto SOME candidate scoring just under MATCH_THRESHOLD elsewhere in its restricted
+//    window and return with false confidence, never reaching the wide search that would
+//    have found the actual, far-better match. Fixed by dropping the two-tier split
+//    entirely and always searching the full band in one pass — `expectedFraction` no
+//    longer needs to narrow the search, since bestStripMatch()'s own scoring already
+//    picks the true best match; it's only used now for the (rare) total-fallback case.
+// 2. A fixed-size reference strip taken from the prev frame's raw bottom edge is often
+//    mostly trailing BLANK space after the last real content (e.g. padding after an
+//    item's value, before the frame edge) — and blank matches blank almost anywhere in
+//    the next frame, diluting the score into a false, arbitrary "confident" match even
+//    with v1.26.4's fraction-based scoring. Worse, if the shared content sits close to
+//    the next frame's own top edge, a tall window can't even reach the correct alignment
+//    (the true match would require testing a negative candidate offset). Fixed by
+//    anchoring the reference strip to the prev frame's LAST actual content, trimming
+//    trailing blank space, and shrinking the strip to tightly wrap just that last dense
+//    content block instead of a fixed fraction of the frame height.
 function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
-  const THUMB_WIDTH = 150;
+  const THUMB_WIDTH = 540;
   const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
   const toThumb = (canvas) => {
     const h = Math.max(1, Math.round(canvas.height * scale));
@@ -2706,66 +2737,66 @@ function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
 
   if (framesUnchanged(prevCanvas, nextCanvas)) return { sliceY: nextCanvas.height, measuredFraction: null }; // unchanged — caller reads sliceY as "no new content"
 
-  const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
-  const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
-  const MATCH_THRESHOLD = 0.03; // bestStripMatch() now scores 0-1 (fraction of meaningfully-differing pixels)
-
-  // v1.26.3 fix, from a real repro (item skipped mid-page, different content duplicated
-  // near the end): a GENERIC ±16% margin around a one-size-fits-all 30% guess was still
-  // wide enough, on this page's specific scroll behavior, to occasionally lock onto the
-  // wrong candidate. Once the first transition gives a real, page-specific measurement
-  // of how far this exact page/gesture combination actually scrolls, every later
-  // transition searches a much TIGHTER band around that measured value instead of the
-  // generic guess — far less room for the aperture problem (v1.25.4/v1.26.1) to bite.
-  const margin = expectedFraction === CALIBRATION_DEFAULT_FRACTION ? 0.16 : 0.08;
-  const narrowFrom = Math.max(0, Math.round(thumbB.height * (expectedFraction - margin)));
-  const narrowTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * (expectedFraction + margin)));
-  const narrowBandHeight = Math.max(1, narrowTo - narrowFrom + stripHeight);
-  const narrowData = thumbB.getContext('2d').getImageData(0, narrowFrom, THUMB_WIDTH, narrowBandHeight).data;
-  const narrow = bestStripMatch(dataA, narrowData, THUMB_WIDTH, stripHeight, narrowBandHeight);
-
-  if (narrow.bestScore < MATCH_THRESHOLD) {
-    const sliceYThumb = narrowFrom + narrow.bestOffset + stripHeight;
-    return { sliceY: Math.round(sliceYThumb / scale), measuredFraction: sliceYThumb / thumbB.height };
+  const defaultStripHeight = Math.max(6, Math.round(thumbA.height * 0.12));
+  const rowHasContent = (data, y) => {
+    const off = y * THUMB_WIDTH * 4;
+    for (let col = 0; col < THUMB_WIDTH; col += 2) {
+      const idx = off + col * 4;
+      if (data[idx] > 70 || data[idx + 1] > 70 || data[idx + 2] > 70) return true;
+    }
+    return false;
+  };
+  const dataAFull = thumbA.getContext('2d').getImageData(0, 0, THUMB_WIDTH, thumbA.height).data;
+  let refBottom = thumbA.height;
+  while (refBottom > 0 && !rowHasContent(dataAFull, refBottom - 1)) refBottom--;
+  const MIN_STRIP = Math.max(6, Math.round(thumbA.height * 0.08));
+  const BLANK_RUN_STOP = Math.max(4, Math.round(thumbA.height * 0.015));
+  let contentTop = refBottom;
+  let blankRun = 0;
+  while (contentTop > 0 && refBottom - contentTop < defaultStripHeight) {
+    const y = contentTop - 1;
+    if (rowHasContent(dataAFull, y)) {
+      blankRun = 0;
+    } else {
+      blankRun++;
+      if (blankRun >= BLANK_RUN_STOP && refBottom - contentTop >= MIN_STRIP) break;
+    }
+    contentTop--;
   }
+  const stripHeight = Math.max(MIN_STRIP, refBottom - contentTop);
+  const dataA = thumbA.getContext('2d').getImageData(0, refBottom - stripHeight, THUMB_WIDTH, stripHeight).data;
+  // v1.27.0: 0.10 (tuned against an offline nearest-neighbor downscale simulation) rejected
+  // a genuine, correctly-positioned match in the real browser — OffscreenCanvas's actual
+  // bilinear downscaling blurs text somewhat more, nudging real matches' scores up to
+  // ~0.116 in a live test against real captured device frames. 0.18 comfortably clears
+  // that with margin while still well below the ~0.35+ scores seen on wrong candidates.
+  const MATCH_THRESHOLD = 0.18; // bestStripMatch() scores 0-1 (fraction of meaningfully-differing pixels)
 
-  // Near the true end of a page, a swipe often can't reach its full expected distance —
-  // there's less remaining content for the list to reveal, so it "rubber-bands" short.
-  // When that happens the real overlap sits outside the narrow band above, and — before
-  // this fix — findScrollOverlap silently fell back to just ASSUMING the estimated
-  // overlap anyway, understating how much of the frame was actually old content and
-  // duplicating it into the stitched output (v1.26.2 report: repeated content in the
-  // last couple of frames). Falling back to the original wide 0%-60% scan here, only
-  // when the narrow search found no confident match, recovers the true (larger) overlap
-  // for this one irregular transition without giving up the narrow search's
-  // aperture-problem protection for every normal mid-page transition.
-  const wideTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
-  const wideBandHeight = Math.max(1, wideTo + stripHeight);
-  const wideData = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, wideBandHeight).data;
-  const wide = bestStripMatch(dataA, wideData, THUMB_WIDTH, stripHeight, wideBandHeight);
+  const bandHeight = Math.max(1, thumbB.height - stripHeight + stripHeight);
+  const bandData = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, bandHeight).data;
+  const full = bestStripMatch(dataA, bandData, THUMB_WIDTH, stripHeight, bandHeight);
 
-  if (wide.bestScore < MATCH_THRESHOLD) {
-    // Deliberately measuredFraction: null even though this IS a confident match — a
-    // wide-search hit means this transition was irregular (see comment above), and the
-    // caller should not let one irregular transition recalibrate its expectation for
-    // whatever regular transitions might still follow it.
-    const sliceYThumb = wide.bestOffset + stripHeight;
-    return { sliceY: Math.round(sliceYThumb / scale), measuredFraction: null };
+  if (full.bestScore < MATCH_THRESHOLD) {
+    // matchEnd corresponds to refBottom in thumbA, not thumbA.height — extrapolate forward
+    // by the trimmed trailing-blank amount to recover "where prevCanvas's true bottom edge
+    // maps to in nextCanvas", which is what sliceY is defined to mean.
+    const matchEnd = full.bestOffset + stripHeight;
+    const sliceYThumb = matchEnd + (thumbA.height - refBottom);
+    return { sliceY: Math.round(sliceYThumb / scale), measuredFraction: sliceYThumb / thumbB.height };
   }
   return { sliceY: Math.round(thumbB.height * expectedFraction / scale), measuredFraction: null };
 }
 
-// Detects the device's fixed chrome (status bar at the top, on-screen navigation bar at
-// the bottom) by comparing two frames that genuinely have different scrolled content —
-// whatever rows stay pixel-identical between them can only be system chrome, since real
-// app content changes with scroll but chrome never does. This matters because otherwise
+// Detects the device's fixed chrome (status bar/title at the top, on-screen navigation bar
+// at the bottom) by comparing frames that genuinely have different scrolled content —
+// whatever rows stay pixel-identical across them can only be system chrome, since real app
+// content changes with scroll but chrome never does. This matters because otherwise
 // findScrollOverlap()'s reference strip (taken from a frame's bottom edge) is often
 // dominated by nav-bar pixels: since the nav bar sits outside the alignment search's
 // range, that strip either matches nowhere in-bounds — silently falling back to a rough,
 // often-wrong fixed-overlap guess — or, worse, gets pasted mid-page as its own visible
 // artifact (v1.25.4 report: nav bar icons appearing over body text, duplicate content
-// around them). Capped at 12% of height from each edge (real status/nav bars are never
-// close to that large) so a degenerate all-identical comparison can't eat real content.
+// around them).
 //
 // v1.25.6 fix, from a real repro (nav bar still visible mid-page after v1.25.5): the
 // first version used a per-ROW AVERAGE difference over an aggressively downscaled (60px
@@ -2777,9 +2808,22 @@ function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
 // survives instead of blurring away, and compare by the MAX per-pixel difference in a
 // row, not the average — chrome rows are bit-for-bit identical end to end, so even one
 // genuinely different pixel correctly disqualifies a row, however sparse the change.
+//
+// v1.27.0 fix, from a real repro (a properties list item's label+value split across two
+// frames with one line silently missing): this device's title bar spans two lines and is
+// ~19% of screen height, taller than the old 12% cap — the scan hit the cap before ever
+// reaching the real chrome/content boundary, so a chunk of true chrome got treated as
+// scrollable content. Comparing only ONE frame pair can't safely raise that cap either:
+// two frames can coincidentally show identical BLANK background well past the real chrome
+// boundary (inter-item padding, not chrome), which silently deletes whatever real,
+// differing content a LATER frame pair shows at that same row. Fixed by taking every
+// consecutive pair from the whole captured sequence and only trusting a row as chrome if
+// it's unchanged in EVERY pair — a coincidental blank match in one pair essentially never
+// survives being checked against all the others — which safely supports a much higher cap.
 // Returns {top, bottom} in FULL-RESOLUTION row coordinates — content is rows [top, bottom).
-function detectChromeBounds(canvasA, canvasB) {
+function detectChromeBounds(...canvases) {
   const THUMB_WIDTH = 300;
+  const canvasA = canvases[0];
   const scale = THUMB_WIDTH / canvasA.width;
   const toThumb = (canvas) => {
     const h = Math.max(1, Math.round(canvas.height * scale));
@@ -2787,12 +2831,16 @@ function detectChromeBounds(canvasA, canvasB) {
     c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
     return c;
   };
-  const thumbA = toThumb(canvasA);
-  const thumbB = toThumb(canvasB);
-  const height = Math.min(thumbA.height, thumbB.height);
-  const dataA = thumbA.getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data;
-  const dataB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data;
-  const rowDiff = (row) => {
+  const thumbs = canvases.map(toThumb);
+  const height = Math.min(...thumbs.map((t) => t.height));
+  const pairs = [];
+  for (let i = 0; i + 1 < thumbs.length; i++) {
+    pairs.push([
+      thumbs[i].getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data,
+      thumbs[i + 1].getContext('2d').getImageData(0, 0, THUMB_WIDTH, height).data,
+    ]);
+  }
+  const rowDiff = (dataA, dataB, row) => {
     const off = row * THUMB_WIDTH * 4;
     let maxDiff = 0;
     for (let col = 0; col < THUMB_WIDTH; col++) {
@@ -2802,11 +2850,12 @@ function detectChromeBounds(canvasA, canvasB) {
     }
     return maxDiff;
   };
-  const maxChromeRows = Math.round(height * 0.12);
+  const rowUnchangedInAllPairs = (row) => pairs.every(([a, b]) => rowDiff(a, b, row) < 20);
+  const maxChromeRows = Math.round(height * 0.3);
   let top = 0;
-  while (top < maxChromeRows && rowDiff(top) < 20) top++;
+  while (top < maxChromeRows && rowUnchangedInAllPairs(top)) top++;
   let bottomCount = 0;
-  while (bottomCount < maxChromeRows && rowDiff(height - 1 - bottomCount) < 20) bottomCount++;
+  while (bottomCount < maxChromeRows && rowUnchangedInAllPairs(height - 1 - bottomCount)) bottomCount++;
   const unscale = canvasA.width / THUMB_WIDTH;
   return { top: Math.round(top * unscale), bottom: canvasA.height - Math.round(bottomCount * unscale) };
 }
@@ -2851,6 +2900,52 @@ async function scrollToTop(adb, peerId, serial, grantId, isStillController, dead
   return current;
 }
 
+// A stitch seam is only safe to cut at if it's a genuine gap BETWEEN two items — not just
+// "blank in this one frame", which can't tell a real inter-item gap apart from a gap that
+// looks blank locally but whose counterpart in the other frame is mid-content (or doesn't
+// exist there at all — the same aperture-problem root cause fixed in v1.27.0's
+// findScrollOverlap rewrite above). Cross-validate: a row is only accepted as a cut point
+// if BOTH frames show a real multi-row blank run at the position the current alignment
+// (`offset`) says corresponds to it in the other frame.
+//
+// v1.27.0 fix, from a real repro (a properties list item's label appearing then jumping to
+// a different item, no value ever shown for it): a fixed-fraction margin, snapped only
+// against the ONE frame it was computed in, can coincidentally sit inside a short item's
+// own label-to-value spacing — indistinguishable, from that frame alone, from the (larger)
+// gap between two different items — and snapping into the wrong one skips or duplicates
+// real content. Requiring the corresponding row in the OTHER frame to also be blank
+// rejects that false positive: a real inter-item gap is shared physical content visible
+// (roughly) at the aligned position in both frames, while a same-item internal gap is not.
+function findSafeSplitRow(canvasA, canvasB, candidateInB, offset, maxRadius) {
+  // candidateInB: row in canvasB's coordinate space. offset maps it to canvasA's:
+  // canvasA_row = canvasB_row + offset.
+  const dataA = canvasA.getContext('2d').getImageData(0, 0, canvasA.width, canvasA.height).data;
+  const dataB = canvasB.getContext('2d').getImageData(0, 0, canvasB.width, canvasB.height).data;
+  const rowHasContent = (data, width, y) => {
+    const off = y * width * 4;
+    for (let col = 0; col < width; col += 2) {
+      const idx = off + col * 4;
+      if (data[idx] > 70 || data[idx + 1] > 70 || data[idx + 2] > 70) return true;
+    }
+    return false;
+  };
+  const minRun = Math.max(8, Math.round(canvasB.height * 0.012));
+  const blankRun = (data, width, height, start) => {
+    for (let k = 0; k < minRun; k++) {
+      const y = start + k;
+      if (y < 0 || y >= height || rowHasContent(data, width, y)) return false;
+    }
+    return true;
+  };
+  const isSafe = (rowInB) => blankRun(dataB, canvasB.width, canvasB.height, rowInB) && blankRun(dataA, canvasA.width, canvasA.height, rowInB + offset);
+  if (isSafe(candidateInB)) return candidateInB;
+  for (let r = 1; r <= maxRadius; r++) {
+    if (isSafe(candidateInB - r)) return candidateInB - r;
+    if (isSafe(candidateInB + r)) return candidateInB + r;
+  }
+  return Math.max(0, candidateInB); // no jointly-safe gap found nearby — accept the raw margin position
+}
+
 async function handleLongScreenshotRequest(data, peerId) {
   debugLogPush(`remote (host): longScreenshotRequest received from peerId=${peerId}: ${JSON.stringify(data)}`, 'evt');
   if (!remoteSession || remoteSession.role !== 'host') {
@@ -2880,13 +2975,11 @@ async function handleLongScreenshotRequest(data, peerId) {
     debugLogPush('remote (host): long screenshot — scrolling to top...', 'evt');
     const isStillController = () => isController(serial, peerId, grantId);
     let rawFirstFrame = await scrollToTop(info.adb, peerId, serial, grantId, isStillController, startTime + LONG_SCREENSHOT_TOTAL_TIMEOUT_MS);
-    let lastFrame = rawFirstFrame; // re-cropped to content-only once chromeBounds is known below
-    debugLogPush(`remote (host): long screenshot — starting from top, ${lastFrame.width}x${lastFrame.height}`, 'evt');
+    debugLogPush(`remote (host): long screenshot — starting from top, ${rawFirstFrame.width}x${rawFirstFrame.height}`, 'evt');
     sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
     let stitched = null;
     let chromeBounds = null;
     const cropToContent = (canvas) => {
-      if (!chromeBounds) return canvas;
       const h = Math.max(1, chromeBounds.bottom - chromeBounds.top);
       const c = new OffscreenCanvas(canvas.width, h);
       c.getContext('2d').drawImage(canvas, 0, chromeBounds.top, canvas.width, h, 0, 0, canvas.width, h);
@@ -2901,26 +2994,61 @@ async function handleLongScreenshotRequest(data, peerId) {
     // (withheld) one, so gluing the next frame's new content directly onto the shortened
     // stitched image skipped exactly one margin's worth of real content at every single
     // frame transition — the missing/overlapping text in the v1.25.8 report.
-    //
-    // Fixed by reaching BACKWARD instead of deferring FORWARD: each new frame's append
-    // starts `tailPx` rows before its measured overlap point, recovering the previous
-    // frame's withheld margin from this fresh, still-uncommitted capture instead of ever
-    // needing to commit the previous frame's own (possibly chrome-containing) tail. That
-    // recovered region lines up with zero gap and zero duplication (worked out
-    // algebraically: if frame N's overlap sits at S_next+sliceY = S_prev+H_prev, then
-    // S_next+(sliceY-tailPx) = S_prev+(H_prev-tailPx), exactly where the previous append
-    // stopped). Only the FINAL frame — the one with no successor to recover from — has
-    // its own true tail committed once, at the very end, closing the image out normally
-    // (nav bar and all, same as a plain screenshot).
     const TAIL_MARGIN_FRACTION = 0.12;
-    let withheldFrame = null; // {canvas, from} — most recent frame's not-yet-committed tail
+    let lastFrame = null; // content-cropped; the most recent frame not yet fully committed
+    let pendingStart = 0; // how much of lastFrame (from its own top) has already been committed
     let frameCount = 1;
-    // Calibrated per-page from the first real measurement, then reused (with a much
-    // tighter search margin) for every later transition — see v1.26.3's comment on
-    // findScrollOverlap(). Deliberately NOT updated from a wide-search-fallback or
-    // no-confident-match result, so one irregular (e.g. near-the-end) transition can't
-    // throw off the calibration used for whatever frames come after it.
+    // Calibrated per-page from the first real measurement, then reused for every later
+    // transition — see findScrollOverlap()'s v1.26.3/v1.27.0 comments. Deliberately NOT
+    // updated from a no-confident-match fallback result, so one irregular (e.g.
+    // near-the-end) transition can't throw off the calibration used for later frames.
     let calibratedFraction = CALIBRATION_DEFAULT_FRACTION;
+    let reachedEnd = false;
+
+    // v1.27.0: each frame's committed span is decided ONCE, jointly with the frame before
+    // it, instead of each frame independently guessing its own start and end margins. The
+    // two independent guesses could each look locally reasonable yet disagree about where
+    // physically to cut — e.g. one frame's own tail-margin heuristic lands after a short
+    // item's label+value while the next frame's start-margin heuristic ALSO lands after
+    // that same item, and the item is skipped entirely (a real repro this fixes). Here,
+    // recoverStart is found once (cross-validated against both frames via
+    // findSafeSplitRow), and the previous frame's end point is simply derived from it via
+    // the measured alignment (`offset`) — the two can no longer disagree.
+    const applyTransition = (newFrame) => {
+      const { sliceY, measuredFraction } = findScrollOverlap(lastFrame, newFrame, calibratedFraction);
+      if (measuredFraction !== null) {
+        debugLogPush(`remote (host): long screenshot — calibrating expected fraction ${calibratedFraction.toFixed(3)} -> ${measuredFraction.toFixed(3)}`, 'evt');
+        calibratedFraction = measuredFraction;
+      }
+      const newHeightFull = newFrame.height - sliceY;
+      debugLogPush(`remote (host): long screenshot — frame ${frameCount + 1}: sliceY=${sliceY} newHeight=${newHeightFull} (frame height=${newFrame.height})`, 'evt');
+      frameCount++;
+      // Scrolling produced essentially no new content — reached the bottom of the page.
+      // lastFrame/pendingStart (from the previous, still-uncommitted transition) get
+      // closed out once, below, after the loop exits — this frame contributes nothing.
+      if (newHeightFull < Math.round(newFrame.height * 0.03)) {
+        debugLogPush(`remote (host): long screenshot — frame ${frameCount} added no new content, treating as end of page`, 'evt');
+        reachedEnd = true;
+        return;
+      }
+      const tailPx = Math.round(newFrame.height * TAIL_MARGIN_FRACTION);
+      const offset = lastFrame.height - sliceY; // lastFrame_row = newFrame_row + offset
+      const recoverStartRaw = Math.max(0, sliceY - tailPx);
+      const recoverStart = findSafeSplitRow(lastFrame, newFrame, recoverStartRaw, offset, tailPx);
+      const appendEndPrev = recoverStart + offset; // lastFrame's contribution ends here, in ITS coordinate space
+      const appendHeight = appendEndPrev - pendingStart;
+      if (appendHeight > 0) {
+        const grown = new OffscreenCanvas(lastFrame.width, (stitched ? stitched.height : 0) + appendHeight);
+        const gctx = grown.getContext('2d');
+        if (stitched) gctx.drawImage(stitched, 0, 0);
+        gctx.drawImage(lastFrame, 0, pendingStart, lastFrame.width, appendHeight, 0, grown.height - appendHeight, lastFrame.width, appendHeight);
+        stitched = grown;
+      }
+      lastFrame = newFrame;
+      pendingStart = recoverStart;
+    };
+
+    const rawFrameBuffer = [rawFirstFrame];
     for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
       if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
       if (Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) { debugLogPush('remote (host): long screenshot — overall timeout reached, stopping early', 'warn'); break; }
@@ -2935,60 +3063,38 @@ async function handleLongScreenshotRequest(data, peerId) {
       const png = await adbScreencap(info.adb, 15000);
       const newFrameRaw = await pngToCanvas(png);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: captured (${png.length} bytes)`, 'evt');
+      await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas work
+
       if (!chromeBounds) {
-        chromeBounds = detectChromeBounds(rawFirstFrame, newFrameRaw);
+        // Establishing chrome bounds from a single frame pair is unreliable — see
+        // detectChromeBounds()'s v1.27.0 comment — so hold off on cropping or stitching
+        // ANYTHING until at least 3 raw frames (2 independent pairs) are in hand.
+        rawFrameBuffer.push(newFrameRaw);
+        if (rawFrameBuffer.length < 3) continue;
+        chromeBounds = detectChromeBounds(...rawFrameBuffer);
         debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
-        const firstContent = cropToContent(rawFirstFrame);
-        const tailPx = Math.round(firstContent.height * TAIL_MARGIN_FRACTION);
-        const safeHeight = Math.max(0, firstContent.height - tailPx);
-        stitched = new OffscreenCanvas(firstContent.width, safeHeight);
-        stitched.getContext('2d').drawImage(firstContent, 0, 0, firstContent.width, safeHeight, 0, 0, firstContent.width, safeHeight);
-        withheldFrame = { canvas: firstContent, from: safeHeight };
-        lastFrame = firstContent;
+        lastFrame = cropToContent(rawFrameBuffer[0]);
+        pendingStart = 0;
+        for (let j = 1; j < rawFrameBuffer.length && !reachedEnd; j++) applyTransition(cropToContent(rawFrameBuffer[j]));
+        if (reachedEnd) break;
+        continue;
       }
-      const newFrame = cropToContent(newFrameRaw);
-      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: finding overlap (content region ${newFrame.width}x${newFrame.height}, expected fraction=${calibratedFraction.toFixed(3)})...`, 'evt');
-      const { sliceY, measuredFraction } = findScrollOverlap(lastFrame, newFrame, calibratedFraction);
-      if (measuredFraction !== null) {
-        debugLogPush(`remote (host): long screenshot — frame ${i + 1}: calibrating expected fraction ${calibratedFraction.toFixed(3)} -> ${measuredFraction.toFixed(3)}`, 'evt');
-        calibratedFraction = measuredFraction;
-      }
-      await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas draw
-      const newHeightFull = newFrame.height - sliceY;
-      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: sliceY=${sliceY} newHeight=${newHeightFull} (frame height=${newFrame.height})`, 'evt');
-      lastFrame = newFrame;
-      // Scrolling produced essentially no new content — reached the bottom of the page.
-      // withheldFrame (from the previous frame, which has no successor to recover from
-      // anymore) gets committed once, below, after the loop exits.
-      if (newHeightFull < Math.round(newFrame.height * 0.03)) {
-        debugLogPush(`remote (host): long screenshot — frame ${i + 1} added no new content, treating as end of page`, 'evt');
-        frameCount++;
-        break;
-      }
-      const tailPx = Math.round(newFrame.height * TAIL_MARGIN_FRACTION);
-      const recoverStart = Math.max(0, sliceY - tailPx); // reach back to recover the PREVIOUS frame's withheld margin
-      const appendEnd = Math.max(recoverStart, newFrame.height - tailPx); // withhold THIS frame's own margin in turn
-      const appendHeight = appendEnd - recoverStart;
-      if (appendHeight > 0) {
-        const grown = new OffscreenCanvas(stitched.width, stitched.height + appendHeight);
-        const gctx = grown.getContext('2d');
-        gctx.drawImage(stitched, 0, 0);
-        gctx.drawImage(newFrame, 0, recoverStart, newFrame.width, appendHeight, 0, stitched.height, newFrame.width, appendHeight);
-        stitched = grown;
-      }
-      withheldFrame = { canvas: newFrame, from: appendEnd };
-      frameCount++;
-      debugLogPush(`remote (host): long screenshot — stitched now ${stitched.width}x${stitched.height} (${frameCount} frames)`, 'evt');
+
+      applyTransition(cropToContent(newFrameRaw));
+      if (reachedEnd) break;
+      debugLogPush(`remote (host): long screenshot — stitched now ${stitched ? stitched.width : 0}x${stitched ? stitched.height : 0} (${frameCount} frames)`, 'evt');
     }
-    if (!stitched) stitched = lastFrame; // extreme edge case: loop never ran (shouldn't happen, LONG_SCREENSHOT_MAX_FRAMES >= 2)
-    if (withheldFrame) {
-      const tailH = withheldFrame.canvas.height - withheldFrame.from;
+    // chromeBounds never established (loop stopped, e.g. control lost, before 3 frames) —
+    // fall back to a plain single-frame screenshot rather than losing the capture entirely.
+    if (!lastFrame) { stitched = rawFirstFrame; frameCount = 1; }
+    else {
+      const tailH = lastFrame.height - pendingStart;
       if (tailH > 0) {
         debugLogPush(`remote (host): long screenshot — closing out with final ${tailH}px tail`, 'evt');
-        const grown = new OffscreenCanvas(stitched.width, stitched.height + tailH);
+        const grown = new OffscreenCanvas(lastFrame.width, (stitched ? stitched.height : 0) + tailH);
         const gctx = grown.getContext('2d');
-        gctx.drawImage(stitched, 0, 0);
-        gctx.drawImage(withheldFrame.canvas, 0, withheldFrame.from, withheldFrame.canvas.width, tailH, 0, stitched.height, withheldFrame.canvas.width, tailH);
+        if (stitched) gctx.drawImage(stitched, 0, 0);
+        gctx.drawImage(lastFrame, 0, pendingStart, lastFrame.width, tailH, 0, grown.height - tailH, lastFrame.width, tailH);
         stitched = grown;
       }
     }
