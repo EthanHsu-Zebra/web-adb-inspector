@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.26.3';
+const APP_VERSION = '1.26.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2644,26 +2644,41 @@ function framesUnchanged(canvasA, canvasB) {
 // best (lowest-difference) match, preferring the SMALLEST offset among near-tied
 // candidates — see v1.25.4's aperture-problem comment on findScrollOverlap(). Offsets
 // are in `dataB`-local thumbnail rows (add back `searchFrom` for absolute position).
+//
+// v1.26.4 fix, from a real repro that survived every previous window-tuning attempt
+// (v1.25.4/v1.26.1/v1.26.3): the score itself was the bug, not the search window. This
+// app's theme is a mostly-uniform dark background with sparse light text (the exact same
+// characteristic that fooled detectChromeBounds()'s original average-based check, fixed
+// in v1.25.6, but never applied here). Averaging the per-pixel difference over an entire
+// strip means a WRONG candidate — a different but similarly-formatted row, e.g. another
+// "N -> Label" line in a long properties list — dilutes down to a deceptively low average
+// score, since only a small fraction of the strip (the text glyphs) actually differs.
+// Fixed the same way as detectChromeBounds(): count the FRACTION of pixels that differ by
+// more than a threshold, instead of averaging raw differences — genuinely-identical
+// content now scores at or near zero regardless of how large the shared background is,
+// while a wrong candidate's differing text glyphs can't be diluted away.
 function bestStripMatch(dataA, dataB, width, stripHeight, bandHeight) {
+  const PIXEL_DIFF_THRESHOLD = 30; // per-pixel summed-3-channel diff considered "different"
   const scores = [];
   let bestScore = Infinity;
   for (let y = 0; y + stripHeight <= bandHeight; y++) {
-    let sum = 0, n = 0;
+    let diffCount = 0, n = 0;
     for (let row = 0; row < stripHeight; row++) {
       const rowA = row * width * 4;
       const rowB = (y + row) * width * 4;
       for (let col = 0; col < width; col += 2) {
         const idxA = rowA + col * 4;
         const idxB = rowB + col * 4;
-        sum += Math.abs(dataA[idxA] - dataB[idxB]) + Math.abs(dataA[idxA + 1] - dataB[idxB + 1]) + Math.abs(dataA[idxA + 2] - dataB[idxB + 2]);
+        const d = Math.abs(dataA[idxA] - dataB[idxB]) + Math.abs(dataA[idxA + 1] - dataB[idxB + 1]) + Math.abs(dataA[idxA + 2] - dataB[idxB + 2]);
+        if (d > PIXEL_DIFF_THRESHOLD) diffCount++;
         n++;
       }
     }
-    const score = sum / n;
+    const score = diffCount / n; // fraction of sampled pixels that differ meaningfully
     scores.push(score);
     if (score < bestScore) bestScore = score;
   }
-  const tolerance = 8;
+  const tolerance = 0.01; // 1 percentage point, for near-tied candidates
   let bestOffset = 0;
   for (let y = 0; y < scores.length; y++) {
     if (scores[y] <= bestScore + tolerance) { bestOffset = y; break; }
@@ -2693,7 +2708,7 @@ function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
 
   const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
   const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
-  const MATCH_THRESHOLD = 40; // empirical threshold on a 0-765 (3-channel) difference scale
+  const MATCH_THRESHOLD = 0.03; // bestStripMatch() now scores 0-1 (fraction of meaningfully-differing pixels)
 
   // v1.26.3 fix, from a real repro (item skipped mid-page, different content duplicated
   // near the end): a GENERIC ±16% margin around a one-size-fits-all 30% guess was still
