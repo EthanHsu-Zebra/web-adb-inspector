@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.4';
+const APP_VERSION = '1.27.5';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2547,7 +2547,16 @@ const LONG_SCREENSHOT_SWIPE_DURATION_MS = 1000;
 // Safety cap on how many "scroll up" swipes scrollToTop() will try before giving up and
 // just starting from wherever it's landed — mirrors LONG_SCREENSHOT_MAX_FRAMES's role for
 // the downward capture.
-const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 15;
+//
+// v1.27.5: raised from 15 after a real repro (worked when already at the top, but
+// starting scrolled deep into a long list never reached it) — v1.27.4's fix addressed
+// stopping too EARLY (a false "unchanged" reading), but this is the opposite failure:
+// simply running out of attempts before covering a genuinely long scroll distance, if
+// each swipe's real on-screen scroll effect is smaller than its geometric drag distance
+// (fling/momentum physics vary by app). More headroom costs nothing when the list is
+// short (the 2-consecutive-unchanged check in scrollToTop() still stops as soon as the
+// top is genuinely reached) and actually reaches the top when it's a long scroll away.
+const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 40;
 // Generic starting guess for findScrollOverlap()'s expected-overlap fraction, used only
 // for the very first frame transition (before any page-specific measurement exists) —
 // derived from the swipe geometry (85%->15% = 70% raw drag => ~30% leftover overlap).
