@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.10';
+const APP_VERSION = '1.27.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2547,16 +2547,7 @@ const LONG_SCREENSHOT_SWIPE_DURATION_MS = 1000;
 // Safety cap on how many "scroll up" swipes scrollToTop() will try before giving up and
 // just starting from wherever it's landed — mirrors LONG_SCREENSHOT_MAX_FRAMES's role for
 // the downward capture.
-//
-// v1.27.5: raised from 15 after a real repro (worked when already at the top, but
-// starting scrolled deep into a long list never reached it) — v1.27.4's fix addressed
-// stopping too EARLY (a false "unchanged" reading), but this is the opposite failure:
-// simply running out of attempts before covering a genuinely long scroll distance, if
-// each swipe's real on-screen scroll effect is smaller than its geometric drag distance
-// (fling/momentum physics vary by app). More headroom costs nothing when the list is
-// short (the 2-consecutive-unchanged check in scrollToTop() still stops as soon as the
-// top is genuinely reached) and actually reaches the top when it's a long scroll away.
-const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 40;
+const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 15;
 // Generic starting guess for findScrollOverlap()'s expected-overlap fraction, used only
 // for the very first frame transition (before any page-specific measurement exists) —
 // derived from the swipe geometry (85%->15% = 70% raw drag => ~30% leftover overlap).
@@ -2887,69 +2878,25 @@ function sendLongScreenshotProgress(peerId, serial, grantId, message) {
 // Returns the final (topmost) frame, decoded, so the caller can reuse it as frame 1
 // without an extra redundant capture.
 async function scrollToTop(adb, peerId, serial, grantId, isStillController, deadline) {
-  // v1.27.4: require TWO consecutive "unchanged" readings before declaring the top
-  // reached, not just one — real repro (worked perfectly when already at the top, but
-  // starting scrolled deep into the list stopped short of the real top). framesUnchanged()
-  // is a blunt global-average check, and this app's theme (sparse light text on a mostly
-  // uniform dark background — the same characteristic behind several other fixes in this
-  // file) means two DIFFERENT scroll positions can occasionally still average out as
-  // "unchanged". Starting already at the top only ever needs one comparison to succeed, so
-  // that case was never at risk; starting deep in a long list means many more swipe/compare
-  // cycles, each one a fresh chance for a coincidental false positive to stop early. One
-  // extra confirmation swipe (only paid once, right at the end) is a small cost for
-  // actually reaching the top instead of silently stopping partway.
-  const scrollUpUntilStable = async (startFrame) => {
-    let current = startFrame;
-    let unchangedStreak = 0;
-    for (let i = 0; i < LONG_SCREENSHOT_MAX_TOP_SCROLLS; i++) {
-      if (!isStillController() || Date.now() > deadline) break;
-      const x = Math.round(current.width / 2);
-      // Reverse of the capture loop's swipe: drag from near-top to near-bottom (finger
-      // moves down => content moves down => reveals content that was above, scrolling UP).
-      const fromY = Math.round(current.height * 0.15);
-      const toY = Math.round(current.height * 0.85);
-      await adbShell(adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
-      await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
-      sendLongScreenshotProgress(peerId, serial, grantId, `Scrolling to top (${i + 1})...`);
-      const next = await pngToCanvas(await adbScreencap(adb, 15000));
-      const unchanged = framesUnchanged(current, next);
-      current = next;
-      unchangedStreak = unchanged ? unchangedStreak + 1 : 0;
-      if (unchangedStreak >= 2) {
-        debugLogPush(`remote (host): long screenshot — reached top after ${i + 1} scroll-up swipe(s)`, 'evt');
-        break;
-      }
-    }
-    return current;
-  };
-
-  let current = await scrollUpUntilStable(await pngToCanvas(await adbScreencap(adb, 15000)));
-
-  // v1.27.10: real repro (chrome-bounds detection wildly inconsistent run-to-run — 22px in
-  // one run, 374px in another, for the SAME device/page) traced to a collapsing
-  // toolbar/title: the frame captured here, genuinely at list position 0, has the title
-  // fully EXPANDED — the only frame ever in that state, since every later frame has already
-  // scrolled past the point where it collapses. Whatever chrome-bounds value gets detected
-  // from LATER (collapsed) frames doesn't apply to this one, corrupting the content-height
-  // parity every alignment measurement depends on (see detectChromeBounds()'s v1.27.7
-  // comment and the reverted v1.27.8/9 attempt to detect-and-compensate after the fact,
-  // which couldn't reliably tell a genuine mismatch apart from a spurious match).
-  //
-  // Fixed at the source instead: force the toolbar to collapse BEFORE settling at the top,
-  // by swiping forward (same distance as the real capture loop's swipes, so the collapse
-  // threshold is definitely crossed) and back up again. Most CollapsingToolbar-style
-  // implementations only RE-expand on a positive overscroll pull-down past the top
-  // boundary, not from an ordinary scroll-up that stops exactly at position 0 — so the
-  // toolbar should stay collapsed once returned here, giving every later chrome-bounds
-  // measurement a frame that's actually representative of the top frame's real geometry.
-  const x = Math.round(current.width / 2);
-  const primeFromY = Math.round(current.height * 0.70);
-  const primeToY = Math.round(current.height * 0.45);
-  for (let k = 0; k < 2; k++) {
-    await adbShell(adb, `input swipe ${x} ${primeFromY} ${x} ${primeToY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
+  let current = await pngToCanvas(await adbScreencap(adb, 15000));
+  for (let i = 0; i < LONG_SCREENSHOT_MAX_TOP_SCROLLS; i++) {
+    if (!isStillController() || Date.now() > deadline) break;
+    const x = Math.round(current.width / 2);
+    // Reverse of the capture loop's swipe: drag from near-top to near-bottom (finger
+    // moves down => content moves down => reveals content that was above, scrolling UP).
+    const fromY = Math.round(current.height * 0.15);
+    const toY = Math.round(current.height * 0.85);
+    await adbShell(adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
     await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
+    sendLongScreenshotProgress(peerId, serial, grantId, `Scrolling to top (${i + 1})...`);
+    const next = await pngToCanvas(await adbScreencap(adb, 15000));
+    const reachedTop = framesUnchanged(current, next);
+    current = next;
+    if (reachedTop) {
+      debugLogPush(`remote (host): long screenshot — reached top after ${i + 1} scroll-up swipe(s)`, 'evt');
+      break;
+    }
   }
-  current = await scrollUpUntilStable(await pngToCanvas(await adbScreencap(adb, 15000)));
   return current;
 }
 
@@ -3027,18 +2974,7 @@ async function handleLongScreenshotRequest(data, peerId) {
     sendLongScreenshotProgress(peerId, serial, grantId, 'Scrolling to top...');
     debugLogPush('remote (host): long screenshot — scrolling to top...', 'evt');
     const isStillController = () => isController(serial, peerId, grantId);
-    await scrollToTop(info.adb, peerId, serial, grantId, isStillController, startTime + LONG_SCREENSHOT_TOTAL_TIMEOUT_MS);
-    // v1.27.6: re-capture instead of reusing scrollToTop()'s own last frame, after a real
-    // repro (a huge, wrong jump on specifically the FIRST forward transition, every later
-    // one fine) traced to the frame scrollToTop() returns. Hitting the top boundary can
-    // leave the list mid overscroll-bounce; that frame was captured right after
-    // scrollToTop()'s own confirmation swipe with only the standard settle time, which is
-    // enough to confirm "stopped moving" via framesUnchanged() but not necessarily enough
-    // for any bounce-back animation to fully finish. An extra settle + fresh capture here
-    // costs one settle delay, once, and ensures the reference frame every later alignment
-    // is measured against is genuinely stable.
-    await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
-    let rawFirstFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
+    let rawFirstFrame = await scrollToTop(info.adb, peerId, serial, grantId, isStillController, startTime + LONG_SCREENSHOT_TOTAL_TIMEOUT_MS);
     debugLogPush(`remote (host): long screenshot — starting from top, ${rawFirstFrame.width}x${rawFirstFrame.height}`, 'evt');
     sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
     let stitched = null;
@@ -3145,34 +3081,10 @@ async function handleLongScreenshotRequest(data, peerId) {
       if (!chromeBounds) {
         // Establishing chrome bounds from a single frame pair is unreliable — see
         // detectChromeBounds()'s v1.27.0 comment — so hold off on cropping or stitching
-        // ANYTHING until at least 4 raw frames are in hand.
-        //
-        // v1.27.7: rawFirstFrame (captured AT the very top) is deliberately EXCLUDED from
-        // the frames passed to detectChromeBounds — real repro (chrome bounds detected as
-        // top=25, when it should be ~360, swallowing 11+ real items as "content" once the
-        // mismatch corrupted the alignment math). This app's title bar collapses once
-        // scrolling begins, so rawFirstFrame (title fully expanded, only frame ever in that
-        // state) is genuinely a DIFFERENT, taller height of chrome than every later frame
-        // (already collapsed, and never re-expands since the capture loop only scrolls
-        // forward) — comparing it against post-collapse frames can only ever agree on the
-        // post-collapse frames' much shorter boundary, not rawFirstFrame's true, taller one.
-        // Detecting from frames[1:] alone (3 post-collapse frames, 2 pairs — same rigor as
-        // before) finds the correct steady-state boundary; applying it to rawFirstFrame too
-        // costs at most a sliver of leftover expanded-title text at the very top of the
-        // final image, not a large content misalignment.
+        // ANYTHING until at least 3 raw frames (2 independent pairs) are in hand.
         rawFrameBuffer.push(newFrameRaw);
-        if (rawFrameBuffer.length < 4) continue;
-        // v1.27.10: v1.27.8/9's post-hoc "detect and trim leftover expanded-title space"
-        // approach reverted — real repro made things WORSE, not better: when
-        // detectChromeBounds() below happened to already capture the full expanded height
-        // correctly (chromeBounds.top=374, a real run), findContentStartInTopFrame() still
-        // fired and found an unrelated but confident-looking SECOND match further down,
-        // trimming away genuine content on top of an already-correct crop. There's no
-        // reliable way to tell "chromeBounds under-detected this" apart from "chromeBounds
-        // already got it, this match is spurious" after the fact. See scrollToTop()'s
-        // v1.27.10 comment for the fix actually used instead (make the collapse state
-        // consistent BEFORE capturing, not detect-and-compensate after).
-        chromeBounds = detectChromeBounds(...rawFrameBuffer.slice(1));
+        if (rawFrameBuffer.length < 3) continue;
+        chromeBounds = detectChromeBounds(...rawFrameBuffer);
         debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
         lastFrame = cropToContent(rawFrameBuffer[0]);
         pendingStart = 0;
