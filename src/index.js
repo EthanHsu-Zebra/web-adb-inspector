@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.0';
+const APP_VERSION = '1.27.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2535,9 +2535,9 @@ async function handleScreenshotRequest(data, peerId) {
 // new content (treated as "reached the bottom") or after LONG_SCREENSHOT_MAX_FRAMES.
 // Best-effort by nature: sticky headers/footers, ads, video, or other content that
 // changes on its own between frames can produce a misaligned or duplicated seam.
-const LONG_SCREENSHOT_MAX_FRAMES = 15;
+const LONG_SCREENSHOT_MAX_FRAMES = 30; // v1.27.1: doubled after shrinking the swipe distance (more overlap, more frames needed per page)
 const LONG_SCREENSHOT_SETTLE_MS = 600;
-const LONG_SCREENSHOT_TOTAL_TIMEOUT_MS = 100000;
+const LONG_SCREENSHOT_TOTAL_TIMEOUT_MS = 180000; // v1.27.1: raised alongside LONG_SCREENSHOT_MAX_FRAMES
 // Deliberately slow — a fast swipe (the original 300ms) reliably triggers Android's
 // fling/momentum scrolling, which continues well past the raw finger-drag distance and
 // makes the actual scroll amount unpredictable. This duration is slow enough to avoid
@@ -2552,7 +2552,7 @@ const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 15;
 // for the very first frame transition (before any page-specific measurement exists) —
 // derived from the swipe geometry (85%->15% = 70% raw drag => ~30% leftover overlap).
 // Every later transition calibrates to the actual measured value instead; see v1.26.3.
-const CALIBRATION_DEFAULT_FRACTION = 0.30;
+const CALIBRATION_DEFAULT_FRACTION = 0.75; // v1.27.1: raised alongside the smaller (~25%-of-screen) swipe distance — the overlap between frames is now much larger, so the pre-calibration fallback guess needs to match
 
 async function pngToCanvas(png) {
   const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
@@ -3053,8 +3053,15 @@ async function handleLongScreenshotRequest(data, peerId) {
       if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
       if (Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) { debugLogPush('remote (host): long screenshot — overall timeout reached, stopping early', 'warn'); break; }
       const x = Math.round(rawFirstFrame.width / 2);
-      const fromY = Math.round(rawFirstFrame.height * 0.85);
-      const toY = Math.round(rawFirstFrame.height * 0.15);
+      // v1.27.1: shrunk from 85%->15% (a ~70%-of-screen swipe) after yet another live repro
+      // (items missing) survived v1.27.0's alignment/stitch rewrite. Rather than keep chasing
+      // individual edge cases in the match/cut heuristics, cut the risk at its source: a much
+      // smaller swipe means far more overlap between consecutive frames, so any single item
+      // has much more redundant coverage and is far less likely to land exactly on whatever
+      // the next edge case turns out to be. Costs more frames per page (LONG_SCREENSHOT_MAX_FRAMES
+      // has headroom) in exchange for much wider safety margins everywhere else.
+      const fromY = Math.round(rawFirstFrame.height * 0.70);
+      const toY = Math.round(rawFirstFrame.height * 0.45);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: swiping (${x},${fromY}) -> (${x},${toY})`, 'evt');
       await adbShell(info.adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
       await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
