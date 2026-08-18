@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.2';
+const APP_VERSION = '1.27.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -3027,17 +3027,13 @@ async function handleLongScreenshotRequest(data, peerId) {
       // lastFrame/pendingStart (from the previous, still-uncommitted transition) get
       // closed out once, below, after the loop exits — this frame contributes nothing.
       //
-      // v1.27.2: OR'd in a lenient whole-frame similarity check, from a real repro
-      // (duplicated content in the last 2-3 frames) — right at the true end of a page,
-      // bestStripMatch()'s small adaptive reference strip can occasionally lock onto an
-      // unreliable, too-small sliceY instead of the true near-full-height one, understating
-      // how much of the frame is actually old content. A page that's stopped scrolling looks
-      // near-IDENTICAL as a whole even when one specific small strip match goes wrong, so
-      // this catches exactly the cases the strip match misses without needing to be as
-      // strict as framesUnchanged()'s normal (much tighter) threshold.
-      const roughlyUnchanged = framesUnchanged(lastFrame, newFrame, 40);
-      if (newHeightFull < Math.round(newFrame.height * 0.03) || roughlyUnchanged) {
-        debugLogPush(`remote (host): long screenshot — frame ${frameCount} added no new content (roughlyUnchanged=${roughlyUnchanged}), treating as end of page`, 'evt');
+      // v1.27.2 tried OR'ing in a lenient whole-frame similarity check here (for a
+      // near-end duplicate-content repro) and reverted it in v1.27.3 — it falsely
+      // triggered on ordinary mid-page transitions on the live device, truncating the
+      // capture early and losing real content, which is worse than the duplicate it
+      // was meant to fix. Back to the newHeightFull signal alone.
+      if (newHeightFull < Math.round(newFrame.height * 0.03)) {
+        debugLogPush(`remote (host): long screenshot — frame ${frameCount} added no new content, treating as end of page`, 'evt');
         reachedEnd = true;
         return;
       }
