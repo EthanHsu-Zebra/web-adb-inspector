@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.26.0';
+const APP_VERSION = '1.26.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2538,6 +2538,12 @@ async function handleScreenshotRequest(data, peerId) {
 const LONG_SCREENSHOT_MAX_FRAMES = 15;
 const LONG_SCREENSHOT_SETTLE_MS = 600;
 const LONG_SCREENSHOT_TOTAL_TIMEOUT_MS = 100000;
+// Deliberately slow — a fast swipe (the original 300ms) reliably triggers Android's
+// fling/momentum scrolling, which continues well past the raw finger-drag distance and
+// makes the actual scroll amount unpredictable. This duration is slow enough to avoid
+// triggering a fling on most ScrollViews/RecyclerViews, so findScrollOverlap() can search
+// a narrow, targeted window around the expected overlap instead of a wide blind one.
+const LONG_SCREENSHOT_SWIPE_DURATION_MS = 1000;
 
 async function pngToCanvas(png) {
   const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
@@ -2576,6 +2582,21 @@ async function pngToCanvas(png) {
 //    Fixed by preferring the SMALLEST offset among all near-tied candidates, not
 //    strictly the single lowest-scoring one — the true per-swipe scroll distance is
 //    always the closest plausible match, never a distant coincidental one.
+//
+// v1.26.1 fix, after directly instrumenting a real device: the aperture problem in #2
+// wasn't fully solved by "prefer the smallest offset" alone, because the search window
+// itself (0-60% of height) was far wider than it needed to be. That width was a hedge
+// against Android's fling/momentum making the actual scroll distance unpredictable — the
+// swipe used a fast 300ms gesture, which reliably triggers a fling that continues well
+// past the raw finger-drag distance. Looked at how existing scrolling-screenshot tools
+// (e.g. ericleong/scrollshot) solve this: they use a deliberate, KNOWN scroll distance
+// and search only a NARROW window around the resulting expected overlap, never a blind
+// wide one. Adopted the same idea: slowed the swipe (see LONG_SCREENSHOT_SWIPE_DURATION_MS)
+// enough to avoid triggering a fling, so the actual scroll now tracks the raw drag
+// distance closely and predictably, and narrowed the search window to a band around that
+// expected position instead of blindly scanning from 0%. A narrow, targeted search can't
+// accidentally lock onto a repeated block or a sticky header far outside that band, which
+// is what was letting the sticky app-title bar get stitched into the middle of a page.
 function findScrollOverlap(prevCanvas, nextCanvas) {
   const THUMB_WIDTH = 150;
   const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
@@ -2609,9 +2630,16 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
 
   const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
   const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
-  const searchTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
-  const bandHeight = Math.max(1, searchTo + stripHeight);
-  const dataB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, bandHeight).data;
+  // Narrow, targeted search band instead of a blind 0%-60% scan — see the fix comment
+  // above. The swipe drags from 85% to 15% of screen height (a 70% raw distance), and at
+  // the slowed, non-fling duration below that tracks closely, so the expected overlap
+  // (leftover height = 100% - 70% = 30%) is known ahead of time; search only around it.
+  const EXPECTED_OVERLAP_FRACTION = 0.30;
+  const SEARCH_MARGIN_FRACTION = 0.16;
+  const searchFrom = Math.max(0, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION - SEARCH_MARGIN_FRACTION)));
+  const searchTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION + SEARCH_MARGIN_FRACTION)));
+  const bandHeight = Math.max(1, searchTo - searchFrom + stripHeight);
+  const dataB = thumbB.getContext('2d').getImageData(0, searchFrom, THUMB_WIDTH, bandHeight).data;
 
   const scores = [];
   let bestScore = Infinity;
@@ -2633,12 +2661,12 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
   }
 
   const tolerance = 8;
-  let bestOffset = Math.round(thumbB.height * 0.15);
+  let bestOffset = Math.round(thumbB.height * EXPECTED_OVERLAP_FRACTION) - searchFrom;
   for (let y = 0; y < scores.length; y++) {
     if (scores[y] <= bestScore + tolerance) { bestOffset = y; break; }
   }
   const matched = bestScore < 40; // empirical threshold on a 0-765 (3-channel) difference scale
-  const sliceYThumb = matched ? (bestOffset + stripHeight) : Math.round(thumbB.height * 0.15);
+  const sliceYThumb = matched ? (searchFrom + bestOffset + stripHeight) : Math.round(thumbB.height * EXPECTED_OVERLAP_FRACTION);
   return Math.round(sliceYThumb / scale); // back to nextCanvas's real (full-res) coordinates
 }
 
@@ -2778,7 +2806,7 @@ async function handleLongScreenshotRequest(data, peerId) {
       const fromY = Math.round(rawFirstFrame.height * 0.85);
       const toY = Math.round(rawFirstFrame.height * 0.15);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: swiping (${x},${fromY}) -> (${x},${toY})`, 'evt');
-      await adbShell(info.adb, `input swipe ${x} ${fromY} ${x} ${toY} 300`);
+      await adbShell(info.adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
       await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
       sendLongScreenshotProgress(peerId, serial, grantId, `Capturing frame ${i + 1}...`);
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: capturing...`, 'evt');
