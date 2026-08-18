@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.9';
+const APP_VERSION = '1.26.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2868,12 +2868,14 @@ function showShareModal() {
     '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
     '<div style="font-size:12px;color:var(--muted);margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
+    '<button class="btn btn-sm" id="share-selftest-btn" title="Opens the viewer link in a new tab on this same machine — no second device or person needed to test Remote Control / Long Screenshot.">Open Viewer Tab (self-test)</button>' +
     '<button class="btn btn-sm" id="share-regen-btn">Regenerate Link</button>' +
     '<button class="btn btn-sm" id="share-stop-btn" style="color:var(--red);">Stop Sharing</button>' +
     '<button class="btn" id="share-close-btn">Done</button></div>';
   overlay.appendChild(box);
   document.body.appendChild(overlay);
 
+  document.getElementById('share-selftest-btn').onclick = () => { window.open(link, '_blank'); };
   document.getElementById('share-copy-btn').onclick = () => {
     navigator.clipboard.writeText(link).then(() => setStatus('Link copied', 'ok')).catch(() => {});
   };

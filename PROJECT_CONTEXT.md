@@ -204,6 +204,9 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.26.0 — Share modal: "Open Viewer Tab (self-test)" button
+Requested to speed up debugging Remote Control / Long Screenshot: testing previously required a second person or device, since Remote Control's UI is deliberately viewer-only (see section 12). Added a button in the Share modal (`showShareModal()`) that does a plain `window.open(link, '_blank')` on the same share link shown for copying — opens the viewer session in a second tab on the *same* machine, so one person can hold control and drive Remote Control against their own already-connected device without any second party. No new capability, no security-boundary change — it's the exact same link a real remote viewer would use, just opened locally for convenience.
+
 ### v1.25.9 — long screenshot: v1.25.8's withhold-margin design skipped content at every frame boundary
 Real repro: v1.25.8 fixed the nav bar (confirmed gone), but introduced visibly cropped/overlapping text at every frame transition — worse than before in a different way. Root cause, found by working the coordinate math through algebraically: v1.25.8 deferred each frame's withheld bottom margin *forward*, to be appended only once the loop ended. But the next frame's overlap point (`sliceY`) is measured against the *previous frame's true bottom edge* — not its shortened, margin-withheld one — so gluing the next frame's `[sliceY, ...)` content directly onto the shortened stitched image silently skipped exactly one margin's worth (~12% of a frame) of real content at every single transition. That's the missing/overlapping text.
 
