@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.7';
+const APP_VERSION = '1.27.8';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2796,6 +2796,82 @@ function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
   return { sliceY: Math.round(thumbB.height * expectedFraction / scale), measuredFraction: null };
 }
 
+// v1.27.8: the top frame (captured genuinely at scroll position 0) can have a collapsing
+// toolbar/title still fully EXPANDED, occupying real extra vertical space above the first
+// list item that no later (already-scrolled, collapsed) frame shares — see
+// detectChromeBounds()'s v1.27.7 comment. That extra space isn't uniform chrome (it's not
+// identical across frames, so detectChromeBounds() correctly excludes it), but it also
+// isn't list content — cropping the top frame with the same boundary as every other frame
+// leaves it sitting at the very top of the final image, silently pushing every real item
+// beneath it down by that same amount and corrupting the append math built on the
+// assumption that "row 0 of the top frame's content = the first list item".
+//
+// Fixed the same way overlap between two ordinary frames is found — bestStripMatch() a
+// reference strip against a search band — just mirrored: anchor the reference to the
+// SECOND frame's top (already past its own collapse, genuinely starting at real content)
+// and search for it within the top frame's FULL height, instead of anchoring to a
+// frame's bottom and searching the next frame's beginning. Wherever that reference
+// reappears in the top frame IS where its real content starts, however much expanded-title
+// space precedes it. Returns the row (top frame's full-resolution coordinates) where real
+// content begins, or 0 if no confident match is found (nothing to trim).
+function findContentStartInTopFrame(topCanvas, referenceCanvas) {
+  const THUMB_WIDTH = 540;
+  const scale = THUMB_WIDTH / topCanvas.width;
+  const toThumb = (canvas) => {
+    const h = Math.max(1, Math.round(canvas.height * scale));
+    const c = new OffscreenCanvas(THUMB_WIDTH, h);
+    c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
+    return c;
+  };
+  const thumbTop = toThumb(topCanvas);
+  const thumbRef = toThumb(referenceCanvas);
+
+  const rowHasContent = (data, y) => {
+    const off = y * THUMB_WIDTH * 4;
+    for (let col = 0; col < THUMB_WIDTH; col += 2) {
+      const idx = off + col * 4;
+      if (data[idx] > 70 || data[idx + 1] > 70 || data[idx + 2] > 70) return true;
+    }
+    return false;
+  };
+
+  const defaultStripHeight = Math.max(6, Math.round(thumbRef.height * 0.12));
+  const dataRefFull = thumbRef.getContext('2d').getImageData(0, 0, THUMB_WIDTH, thumbRef.height).data;
+  let refTop = 0;
+  while (refTop < thumbRef.height - 1 && !rowHasContent(dataRefFull, refTop)) refTop++;
+  const MIN_STRIP = Math.max(6, Math.round(thumbRef.height * 0.08));
+  const BLANK_RUN_STOP = Math.max(4, Math.round(thumbRef.height * 0.015));
+  let contentBottom = refTop;
+  let blankRun = 0;
+  while (contentBottom < thumbRef.height - 1 && contentBottom - refTop < defaultStripHeight) {
+    const y = contentBottom + 1;
+    if (rowHasContent(dataRefFull, y)) {
+      blankRun = 0;
+    } else {
+      blankRun++;
+      if (blankRun >= BLANK_RUN_STOP && contentBottom - refTop >= MIN_STRIP) break;
+    }
+    contentBottom++;
+  }
+  const stripHeight = Math.max(MIN_STRIP, contentBottom - refTop);
+  const dataRef = thumbRef.getContext('2d').getImageData(0, refTop, THUMB_WIDTH, stripHeight).data;
+  const MATCH_THRESHOLD = 0.18;
+
+  const bandHeight = thumbTop.height;
+  const bandData = thumbTop.getContext('2d').getImageData(0, 0, THUMB_WIDTH, bandHeight).data;
+  const full = bestStripMatch(dataRef, bandData, THUMB_WIDTH, stripHeight, bandHeight);
+
+  if (full.bestScore < MATCH_THRESHOLD) {
+    // full.bestOffset is where the reference strip (which itself starts refTop rows into
+    // referenceCanvas's own content) was found in topCanvas — subtract refTop back out to
+    // recover "where topCanvas's content truly starts", matching referenceCanvas's own
+    // (untrimmed) beginning.
+    const startThumb = Math.max(0, full.bestOffset - refTop);
+    return Math.round(startThumb / scale);
+  }
+  return 0;
+}
+
 // Detects the device's fixed chrome (status bar/title at the top, on-screen navigation bar
 // at the bottom) by comparing frames that genuinely have different scrolled content —
 // whatever rows stay pixel-identical across them can only be system chrome, since real app
@@ -3133,7 +3209,22 @@ async function handleLongScreenshotRequest(data, peerId) {
         if (rawFrameBuffer.length < 4) continue;
         chromeBounds = detectChromeBounds(...rawFrameBuffer.slice(1));
         debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
-        lastFrame = cropToContent(rawFrameBuffer[0]);
+        const topFrameRaw = cropToContent(rawFrameBuffer[0]);
+        const firstScrolledFrame = cropToContent(rawFrameBuffer[1]);
+        // v1.27.8: trim any leftover expanded-title space unique to the top frame — see
+        // findContentStartInTopFrame()'s comment. Skip the check (assume 0) if the two
+        // frames are already framesUnchanged() — happens when the swipe distance was small
+        // enough that frame1 itself is still effectively at the top, so there's no
+        // meaningfully-scrolled reference to search with yet.
+        const contentStart = framesUnchanged(topFrameRaw, firstScrolledFrame) ? 0 : findContentStartInTopFrame(topFrameRaw, firstScrolledFrame);
+        if (contentStart > 0) {
+          debugLogPush(`remote (host): long screenshot — top frame has ${contentStart}px of leftover expanded-title space, trimming`, 'evt');
+          const trimmed = new OffscreenCanvas(topFrameRaw.width, topFrameRaw.height - contentStart);
+          trimmed.getContext('2d').drawImage(topFrameRaw, 0, contentStart, topFrameRaw.width, trimmed.height, 0, 0, topFrameRaw.width, trimmed.height);
+          lastFrame = trimmed;
+        } else {
+          lastFrame = topFrameRaw;
+        }
         pendingStart = 0;
         for (let j = 1; j < rawFrameBuffer.length && !reachedEnd; j++) applyTransition(cropToContent(rawFrameBuffer[j]));
         if (reachedEnd) break;
