@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.9';
+const APP_VERSION = '1.27.10';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2796,83 +2796,6 @@ function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
   return { sliceY: Math.round(thumbB.height * expectedFraction / scale), measuredFraction: null };
 }
 
-// v1.27.8: the top frame (captured genuinely at scroll position 0) can have a collapsing
-// toolbar/title still fully EXPANDED, occupying real extra vertical space above the first
-// list item that no later (already-scrolled, collapsed) frame shares — see
-// detectChromeBounds()'s v1.27.7 comment. That extra space isn't uniform chrome (it's not
-// identical across frames, so detectChromeBounds() correctly excludes it), but it also
-// isn't list content — cropping the top frame with the same boundary as every other frame
-// leaves it sitting at the very top of the final image, silently pushing every real item
-// beneath it down by that same amount and corrupting the append math built on the
-// assumption that "row 0 of the top frame's content = the first list item".
-//
-// Fixed the same way overlap between two ordinary frames is found — bestStripMatch() a
-// reference strip against a search band — just mirrored: anchor the reference to the
-// SECOND frame's top (already past its own collapse, genuinely starting at real content)
-// and search for it within the top frame's FULL height, instead of anchoring to a
-// frame's bottom and searching the next frame's beginning. Wherever that reference
-// reappears in the top frame IS where its real content starts, however much expanded-title
-// space precedes it. Returns the row (top frame's full-resolution coordinates) where real
-// content begins, or 0 if no confident match is found (nothing to trim).
-function findContentStartInTopFrame(topCanvas, referenceCanvas) {
-  const THUMB_WIDTH = 540;
-  const scale = THUMB_WIDTH / topCanvas.width;
-  const toThumb = (canvas) => {
-    const h = Math.max(1, Math.round(canvas.height * scale));
-    const c = new OffscreenCanvas(THUMB_WIDTH, h);
-    c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
-    return c;
-  };
-  const thumbTop = toThumb(topCanvas);
-  const thumbRef = toThumb(referenceCanvas);
-
-  const rowHasContent = (data, y) => {
-    const off = y * THUMB_WIDTH * 4;
-    for (let col = 0; col < THUMB_WIDTH; col += 2) {
-      const idx = off + col * 4;
-      if (data[idx] > 70 || data[idx + 1] > 70 || data[idx + 2] > 70) return true;
-    }
-    return false;
-  };
-
-  const defaultStripHeight = Math.max(6, Math.round(thumbRef.height * 0.12));
-  const dataRefFull = thumbRef.getContext('2d').getImageData(0, 0, THUMB_WIDTH, thumbRef.height).data;
-  let refTop = 0;
-  while (refTop < thumbRef.height - 1 && !rowHasContent(dataRefFull, refTop)) refTop++;
-  const MIN_STRIP = Math.max(6, Math.round(thumbRef.height * 0.08));
-  const BLANK_RUN_STOP = Math.max(4, Math.round(thumbRef.height * 0.015));
-  let contentBottom = refTop;
-  let blankRun = 0;
-  while (contentBottom < thumbRef.height - 1 && contentBottom - refTop < defaultStripHeight) {
-    const y = contentBottom + 1;
-    if (rowHasContent(dataRefFull, y)) {
-      blankRun = 0;
-    } else {
-      blankRun++;
-      if (blankRun >= BLANK_RUN_STOP && contentBottom - refTop >= MIN_STRIP) break;
-    }
-    contentBottom++;
-  }
-  const stripHeight = Math.max(MIN_STRIP, contentBottom - refTop);
-  const dataRef = thumbRef.getContext('2d').getImageData(0, refTop, THUMB_WIDTH, stripHeight).data;
-  const MATCH_THRESHOLD = 0.18;
-
-  const bandHeight = thumbTop.height;
-  const bandData = thumbTop.getContext('2d').getImageData(0, 0, THUMB_WIDTH, bandHeight).data;
-  const full = bestStripMatch(dataRef, bandData, THUMB_WIDTH, stripHeight, bandHeight);
-  debugLogPush(`remote (host): long screenshot — findContentStartInTopFrame: refTop=${refTop} stripHeight=${stripHeight} bestScore=${full.bestScore.toFixed(4)} bestOffset=${full.bestOffset} (thumb rows, threshold=${MATCH_THRESHOLD})`, 'evt');
-
-  if (full.bestScore < MATCH_THRESHOLD) {
-    // full.bestOffset is where the reference strip (which itself starts refTop rows into
-    // referenceCanvas's own content) was found in topCanvas — subtract refTop back out to
-    // recover "where topCanvas's content truly starts", matching referenceCanvas's own
-    // (untrimmed) beginning.
-    const startThumb = Math.max(0, full.bestOffset - refTop);
-    return Math.round(startThumb / scale);
-  }
-  return 0;
-}
-
 // Detects the device's fixed chrome (status bar/title at the top, on-screen navigation bar
 // at the bottom) by comparing frames that genuinely have different scrolled content —
 // whatever rows stay pixel-identical across them can only be system chrome, since real app
@@ -2964,7 +2887,6 @@ function sendLongScreenshotProgress(peerId, serial, grantId, message) {
 // Returns the final (topmost) frame, decoded, so the caller can reuse it as frame 1
 // without an extra redundant capture.
 async function scrollToTop(adb, peerId, serial, grantId, isStillController, deadline) {
-  let current = await pngToCanvas(await adbScreencap(adb, 15000));
   // v1.27.4: require TWO consecutive "unchanged" readings before declaring the top
   // reached, not just one — real repro (worked perfectly when already at the top, but
   // starting scrolled deep into the list stopped short of the real top). framesUnchanged()
@@ -2976,26 +2898,58 @@ async function scrollToTop(adb, peerId, serial, grantId, isStillController, dead
   // cycles, each one a fresh chance for a coincidental false positive to stop early. One
   // extra confirmation swipe (only paid once, right at the end) is a small cost for
   // actually reaching the top instead of silently stopping partway.
-  let unchangedStreak = 0;
-  for (let i = 0; i < LONG_SCREENSHOT_MAX_TOP_SCROLLS; i++) {
-    if (!isStillController() || Date.now() > deadline) break;
-    const x = Math.round(current.width / 2);
-    // Reverse of the capture loop's swipe: drag from near-top to near-bottom (finger
-    // moves down => content moves down => reveals content that was above, scrolling UP).
-    const fromY = Math.round(current.height * 0.15);
-    const toY = Math.round(current.height * 0.85);
-    await adbShell(adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
-    await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
-    sendLongScreenshotProgress(peerId, serial, grantId, `Scrolling to top (${i + 1})...`);
-    const next = await pngToCanvas(await adbScreencap(adb, 15000));
-    const unchanged = framesUnchanged(current, next);
-    current = next;
-    unchangedStreak = unchanged ? unchangedStreak + 1 : 0;
-    if (unchangedStreak >= 2) {
-      debugLogPush(`remote (host): long screenshot — reached top after ${i + 1} scroll-up swipe(s)`, 'evt');
-      break;
+  const scrollUpUntilStable = async (startFrame) => {
+    let current = startFrame;
+    let unchangedStreak = 0;
+    for (let i = 0; i < LONG_SCREENSHOT_MAX_TOP_SCROLLS; i++) {
+      if (!isStillController() || Date.now() > deadline) break;
+      const x = Math.round(current.width / 2);
+      // Reverse of the capture loop's swipe: drag from near-top to near-bottom (finger
+      // moves down => content moves down => reveals content that was above, scrolling UP).
+      const fromY = Math.round(current.height * 0.15);
+      const toY = Math.round(current.height * 0.85);
+      await adbShell(adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
+      await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
+      sendLongScreenshotProgress(peerId, serial, grantId, `Scrolling to top (${i + 1})...`);
+      const next = await pngToCanvas(await adbScreencap(adb, 15000));
+      const unchanged = framesUnchanged(current, next);
+      current = next;
+      unchangedStreak = unchanged ? unchangedStreak + 1 : 0;
+      if (unchangedStreak >= 2) {
+        debugLogPush(`remote (host): long screenshot — reached top after ${i + 1} scroll-up swipe(s)`, 'evt');
+        break;
+      }
     }
+    return current;
+  };
+
+  let current = await scrollUpUntilStable(await pngToCanvas(await adbScreencap(adb, 15000)));
+
+  // v1.27.10: real repro (chrome-bounds detection wildly inconsistent run-to-run — 22px in
+  // one run, 374px in another, for the SAME device/page) traced to a collapsing
+  // toolbar/title: the frame captured here, genuinely at list position 0, has the title
+  // fully EXPANDED — the only frame ever in that state, since every later frame has already
+  // scrolled past the point where it collapses. Whatever chrome-bounds value gets detected
+  // from LATER (collapsed) frames doesn't apply to this one, corrupting the content-height
+  // parity every alignment measurement depends on (see detectChromeBounds()'s v1.27.7
+  // comment and the reverted v1.27.8/9 attempt to detect-and-compensate after the fact,
+  // which couldn't reliably tell a genuine mismatch apart from a spurious match).
+  //
+  // Fixed at the source instead: force the toolbar to collapse BEFORE settling at the top,
+  // by swiping forward (same distance as the real capture loop's swipes, so the collapse
+  // threshold is definitely crossed) and back up again. Most CollapsingToolbar-style
+  // implementations only RE-expand on a positive overscroll pull-down past the top
+  // boundary, not from an ordinary scroll-up that stops exactly at position 0 — so the
+  // toolbar should stay collapsed once returned here, giving every later chrome-bounds
+  // measurement a frame that's actually representative of the top frame's real geometry.
+  const x = Math.round(current.width / 2);
+  const primeFromY = Math.round(current.height * 0.70);
+  const primeToY = Math.round(current.height * 0.45);
+  for (let k = 0; k < 2; k++) {
+    await adbShell(adb, `input swipe ${x} ${primeFromY} ${x} ${primeToY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
+    await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
   }
+  current = await scrollUpUntilStable(await pngToCanvas(await adbScreencap(adb, 15000)));
   return current;
 }
 
@@ -3208,25 +3162,19 @@ async function handleLongScreenshotRequest(data, peerId) {
         // final image, not a large content misalignment.
         rawFrameBuffer.push(newFrameRaw);
         if (rawFrameBuffer.length < 4) continue;
+        // v1.27.10: v1.27.8/9's post-hoc "detect and trim leftover expanded-title space"
+        // approach reverted — real repro made things WORSE, not better: when
+        // detectChromeBounds() below happened to already capture the full expanded height
+        // correctly (chromeBounds.top=374, a real run), findContentStartInTopFrame() still
+        // fired and found an unrelated but confident-looking SECOND match further down,
+        // trimming away genuine content on top of an already-correct crop. There's no
+        // reliable way to tell "chromeBounds under-detected this" apart from "chromeBounds
+        // already got it, this match is spurious" after the fact. See scrollToTop()'s
+        // v1.27.10 comment for the fix actually used instead (make the collapse state
+        // consistent BEFORE capturing, not detect-and-compensate after).
         chromeBounds = detectChromeBounds(...rawFrameBuffer.slice(1));
         debugLogPush(`remote (host): long screenshot — detected chrome bounds: top=${chromeBounds.top} bottom=${chromeBounds.bottom} (of ${rawFirstFrame.height})`, 'evt');
-        const topFrameRaw = cropToContent(rawFrameBuffer[0]);
-        const firstScrolledFrame = cropToContent(rawFrameBuffer[1]);
-        // v1.27.8: trim any leftover expanded-title space unique to the top frame — see
-        // findContentStartInTopFrame()'s comment. Skip the check (assume 0) if the two
-        // frames are already framesUnchanged() — happens when the swipe distance was small
-        // enough that frame1 itself is still effectively at the top, so there's no
-        // meaningfully-scrolled reference to search with yet.
-        const topUnchanged = framesUnchanged(topFrameRaw, firstScrolledFrame);
-        const contentStart = topUnchanged ? 0 : findContentStartInTopFrame(topFrameRaw, firstScrolledFrame);
-        debugLogPush(`remote (host): long screenshot — top-frame trim check: topUnchanged=${topUnchanged} contentStart=${contentStart} (topFrame ${topFrameRaw.width}x${topFrameRaw.height})`, 'evt');
-        if (contentStart > 0) {
-          const trimmed = new OffscreenCanvas(topFrameRaw.width, topFrameRaw.height - contentStart);
-          trimmed.getContext('2d').drawImage(topFrameRaw, 0, contentStart, topFrameRaw.width, trimmed.height, 0, 0, topFrameRaw.width, trimmed.height);
-          lastFrame = trimmed;
-        } else {
-          lastFrame = topFrameRaw;
-        }
+        lastFrame = cropToContent(rawFrameBuffer[0]);
         pendingStart = 0;
         for (let j = 1; j < rawFrameBuffer.length && !reachedEnd; j++) applyTransition(cropToContent(rawFrameBuffer[j]));
         if (reachedEnd) break;
