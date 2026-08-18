@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.1';
+const APP_VERSION = '1.27.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2613,7 +2613,7 @@ async function pngToCanvas(png) {
 // clock/battery icon, which affects too few pixels to matter here). Shared by
 // findScrollOverlap()'s "reached the bottom" check and scrollToTop()'s "reached the top"
 // check below — same signal, opposite direction.
-function framesUnchanged(canvasA, canvasB) {
+function framesUnchanged(canvasA, canvasB, threshold = 12) {
   const THUMB_WIDTH = 150;
   const scale = THUMB_WIDTH / canvasA.width;
   const toThumb = (canvas) => {
@@ -2636,7 +2636,7 @@ function framesUnchanged(canvasA, canvasB) {
       globalN++;
     }
   }
-  return globalN === 0 || globalDiff / globalN < 12;
+  return globalN === 0 || globalDiff / globalN < threshold;
 }
 
 // Slides `dataA` (prev frame's bottom strip) through `dataB` (a pre-cropped vertical
@@ -3026,8 +3026,18 @@ async function handleLongScreenshotRequest(data, peerId) {
       // Scrolling produced essentially no new content — reached the bottom of the page.
       // lastFrame/pendingStart (from the previous, still-uncommitted transition) get
       // closed out once, below, after the loop exits — this frame contributes nothing.
-      if (newHeightFull < Math.round(newFrame.height * 0.03)) {
-        debugLogPush(`remote (host): long screenshot — frame ${frameCount} added no new content, treating as end of page`, 'evt');
+      //
+      // v1.27.2: OR'd in a lenient whole-frame similarity check, from a real repro
+      // (duplicated content in the last 2-3 frames) — right at the true end of a page,
+      // bestStripMatch()'s small adaptive reference strip can occasionally lock onto an
+      // unreliable, too-small sliceY instead of the true near-full-height one, understating
+      // how much of the frame is actually old content. A page that's stopped scrolling looks
+      // near-IDENTICAL as a whole even when one specific small strip match goes wrong, so
+      // this catches exactly the cases the strip match misses without needing to be as
+      // strict as framesUnchanged()'s normal (much tighter) threshold.
+      const roughlyUnchanged = framesUnchanged(lastFrame, newFrame, 40);
+      if (newHeightFull < Math.round(newFrame.height * 0.03) || roughlyUnchanged) {
+        debugLogPush(`remote (host): long screenshot — frame ${frameCount} added no new content (roughlyUnchanged=${roughlyUnchanged}), treating as end of page`, 'evt');
         reachedEnd = true;
         return;
       }
