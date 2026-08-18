@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.25.8';
+const APP_VERSION = '1.25.9';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2748,20 +2748,28 @@ async function handleLongScreenshotRequest(data, peerId) {
       c.getContext('2d').drawImage(canvas, 0, chromeBounds.top, canvas.width, h, 0, 0, canvas.width, h);
       return c;
     };
-    // Withhold-and-defer margin: chrome detection (pixel-based above; hiding system bars
-    // outright was tried in v1.25.7 and confirmed NOT to work on this device — likely
-    // Android ignoring the legacy policy_control global setting) still couldn't reliably
-    // tell where the on-screen nav bar starts on this app's theme. Rather than trust that
-    // detection, NEVER permanently commit the bottom ~12% of any frame while still
-    // mid-capture — it's simply deferred to reappear in the next frame instead (which it
-    // always will: a single swipe from 85%->15% of height overlaps far more than 12%
-    // between consecutive frames), and the true final state (nav bar and all, exactly
-    // like a normal single screenshot) is appended exactly once at the very end, from
-    // whichever frame turns out to be last. This can't lose content — everything is
-    // committed either mid-loop or in that final append — and can't show chrome mid-page,
-    // since nothing is ever committed from a frame's tail while still actively scrolling.
+    // Never permanently commit the bottom ~12% of a frame while it's still possible a
+    // later frame will need to reach back into that space (chrome detection above still
+    // isn't reliable on this app's theme, and hiding the bars outright — v1.25.7 — was
+    // confirmed not to work on this device). v1.25.8's version deferred that margin
+    // forward to "whenever the loop ends," which was WRONG: the next frame's overlap
+    // point is measured against the PREVIOUS frame's true bottom edge, not its shortened
+    // (withheld) one, so gluing the next frame's new content directly onto the shortened
+    // stitched image skipped exactly one margin's worth of real content at every single
+    // frame transition — the missing/overlapping text in the v1.25.8 report.
+    //
+    // Fixed by reaching BACKWARD instead of deferring FORWARD: each new frame's append
+    // starts `tailPx` rows before its measured overlap point, recovering the previous
+    // frame's withheld margin from this fresh, still-uncommitted capture instead of ever
+    // needing to commit the previous frame's own (possibly chrome-containing) tail. That
+    // recovered region lines up with zero gap and zero duplication (worked out
+    // algebraically: if frame N's overlap sits at S_next+sliceY = S_prev+H_prev, then
+    // S_next+(sliceY-tailPx) = S_prev+(H_prev-tailPx), exactly where the previous append
+    // stopped). Only the FINAL frame — the one with no successor to recover from — has
+    // its own true tail committed once, at the very end, closing the image out normally
+    // (nav bar and all, same as a plain screenshot).
     const TAIL_MARGIN_FRACTION = 0.12;
-    let pendingTail = null; // {canvas, y, h} — most recently withheld bottom slice, appended once at the end
+    let withheldFrame = null; // {canvas, from} — most recent frame's not-yet-committed tail
     let frameCount = 1;
     for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
       if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
@@ -2785,7 +2793,7 @@ async function handleLongScreenshotRequest(data, peerId) {
         const safeHeight = Math.max(0, firstContent.height - tailPx);
         stitched = new OffscreenCanvas(firstContent.width, safeHeight);
         stitched.getContext('2d').drawImage(firstContent, 0, 0, firstContent.width, safeHeight, 0, 0, firstContent.width, safeHeight);
-        pendingTail = { canvas: firstContent, y: safeHeight, h: firstContent.height - safeHeight };
+        withheldFrame = { canvas: firstContent, from: safeHeight };
         lastFrame = firstContent;
       }
       const newFrame = cropToContent(newFrameRaw);
@@ -2796,36 +2804,39 @@ async function handleLongScreenshotRequest(data, peerId) {
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: sliceY=${sliceY} newHeight=${newHeightFull} (frame height=${newFrame.height})`, 'evt');
       lastFrame = newFrame;
       // Scrolling produced essentially no new content — reached the bottom of the page.
-      // pendingTail is left as-is (from whichever frame was last committed) and gets
-      // appended below once the loop exits — nothing from THIS near-duplicate frame
-      // needs committing.
+      // withheldFrame (from the previous frame, which has no successor to recover from
+      // anymore) gets committed once, below, after the loop exits.
       if (newHeightFull < Math.round(newFrame.height * 0.03)) {
         debugLogPush(`remote (host): long screenshot — frame ${i + 1} added no new content, treating as end of page`, 'evt');
         frameCount++;
         break;
       }
       const tailPx = Math.round(newFrame.height * TAIL_MARGIN_FRACTION);
-      const appendEnd = Math.max(sliceY, newFrame.height - tailPx);
-      const appendHeight = appendEnd - sliceY;
+      const recoverStart = Math.max(0, sliceY - tailPx); // reach back to recover the PREVIOUS frame's withheld margin
+      const appendEnd = Math.max(recoverStart, newFrame.height - tailPx); // withhold THIS frame's own margin in turn
+      const appendHeight = appendEnd - recoverStart;
       if (appendHeight > 0) {
         const grown = new OffscreenCanvas(stitched.width, stitched.height + appendHeight);
         const gctx = grown.getContext('2d');
         gctx.drawImage(stitched, 0, 0);
-        gctx.drawImage(newFrame, 0, sliceY, newFrame.width, appendHeight, 0, stitched.height, newFrame.width, appendHeight);
+        gctx.drawImage(newFrame, 0, recoverStart, newFrame.width, appendHeight, 0, stitched.height, newFrame.width, appendHeight);
         stitched = grown;
       }
-      pendingTail = { canvas: newFrame, y: appendEnd, h: newFrame.height - appendEnd };
+      withheldFrame = { canvas: newFrame, from: appendEnd };
       frameCount++;
       debugLogPush(`remote (host): long screenshot — stitched now ${stitched.width}x${stitched.height} (${frameCount} frames)`, 'evt');
     }
     if (!stitched) stitched = lastFrame; // extreme edge case: loop never ran (shouldn't happen, LONG_SCREENSHOT_MAX_FRAMES >= 2)
-    if (pendingTail && pendingTail.h > 0) {
-      debugLogPush(`remote (host): long screenshot — closing out with final ${pendingTail.h}px tail`, 'evt');
-      const grown = new OffscreenCanvas(stitched.width, stitched.height + pendingTail.h);
-      const gctx = grown.getContext('2d');
-      gctx.drawImage(stitched, 0, 0);
-      gctx.drawImage(pendingTail.canvas, 0, pendingTail.y, pendingTail.canvas.width, pendingTail.h, 0, stitched.height, pendingTail.canvas.width, pendingTail.h);
-      stitched = grown;
+    if (withheldFrame) {
+      const tailH = withheldFrame.canvas.height - withheldFrame.from;
+      if (tailH > 0) {
+        debugLogPush(`remote (host): long screenshot — closing out with final ${tailH}px tail`, 'evt');
+        const grown = new OffscreenCanvas(stitched.width, stitched.height + tailH);
+        const gctx = grown.getContext('2d');
+        gctx.drawImage(stitched, 0, 0);
+        gctx.drawImage(withheldFrame.canvas, 0, withheldFrame.from, withheldFrame.canvas.width, tailH, 0, stitched.height, withheldFrame.canvas.width, tailH);
+        stitched = grown;
+      }
     }
     sendLongScreenshotProgress(peerId, serial, grantId, 'Finalizing...');
     debugLogPush('remote (host): long screenshot — encoding final PNG...', 'evt');

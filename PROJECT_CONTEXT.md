@@ -204,6 +204,11 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.25.9 — long screenshot: v1.25.8's withhold-margin design skipped content at every frame boundary
+Real repro: v1.25.8 fixed the nav bar (confirmed gone), but introduced visibly cropped/overlapping text at every frame transition — worse than before in a different way. Root cause, found by working the coordinate math through algebraically: v1.25.8 deferred each frame's withheld bottom margin *forward*, to be appended only once the loop ended. But the next frame's overlap point (`sliceY`) is measured against the *previous frame's true bottom edge* — not its shortened, margin-withheld one — so gluing the next frame's `[sliceY, ...)` content directly onto the shortened stitched image silently skipped exactly one margin's worth (~12% of a frame) of real content at every single transition. That's the missing/overlapping text.
+
+Fixed by reaching *backward* instead of deferring forward, exactly as suggested: each frame's append now starts `tailPx` rows *before* its measured overlap point (`recoverStart = sliceY - tailPx`), recovering the previous frame's withheld margin from this fresh, still-uncommitted capture — which is guaranteed to show that same content again, since it was never scrolled past — instead of ever needing to commit the previous frame's own (possibly chrome-containing) tail pixels. Worked out algebraically to line up with exactly zero gap and zero duplication: if `S_next + sliceY = S_prev + H_prev` (the definition of "this is where the overlap was found"), then `S_next + (sliceY - tailPx) = S_prev + (H_prev - tailPx)`, which is precisely where the previous append stopped. Only the true final frame (no successor to recover from) has its own tail committed once, at the very end.
+
 ### v1.25.8 — long screenshot: v1.25.7's hide-the-bars trick confirmed not working — withhold-and-defer instead
 Real repro: v1.25.7's `policy_control immersive.full=*` hide had zero visible effect — nav bar still appeared mid-page. Confirms the legacy hidden setting is ignored on this device/Android version (likely Android 10+, where SystemUI has increasingly stopped honoring it) — not something worth chasing further with device-specific settings tricks.
 
