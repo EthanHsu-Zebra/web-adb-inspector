@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.8';
+const APP_VERSION = '1.27.9';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2860,6 +2860,7 @@ function findContentStartInTopFrame(topCanvas, referenceCanvas) {
   const bandHeight = thumbTop.height;
   const bandData = thumbTop.getContext('2d').getImageData(0, 0, THUMB_WIDTH, bandHeight).data;
   const full = bestStripMatch(dataRef, bandData, THUMB_WIDTH, stripHeight, bandHeight);
+  debugLogPush(`remote (host): long screenshot — findContentStartInTopFrame: refTop=${refTop} stripHeight=${stripHeight} bestScore=${full.bestScore.toFixed(4)} bestOffset=${full.bestOffset} (thumb rows, threshold=${MATCH_THRESHOLD})`, 'evt');
 
   if (full.bestScore < MATCH_THRESHOLD) {
     // full.bestOffset is where the reference strip (which itself starts refTop rows into
@@ -3216,9 +3217,10 @@ async function handleLongScreenshotRequest(data, peerId) {
         // frames are already framesUnchanged() — happens when the swipe distance was small
         // enough that frame1 itself is still effectively at the top, so there's no
         // meaningfully-scrolled reference to search with yet.
-        const contentStart = framesUnchanged(topFrameRaw, firstScrolledFrame) ? 0 : findContentStartInTopFrame(topFrameRaw, firstScrolledFrame);
+        const topUnchanged = framesUnchanged(topFrameRaw, firstScrolledFrame);
+        const contentStart = topUnchanged ? 0 : findContentStartInTopFrame(topFrameRaw, firstScrolledFrame);
+        debugLogPush(`remote (host): long screenshot — top-frame trim check: topUnchanged=${topUnchanged} contentStart=${contentStart} (topFrame ${topFrameRaw.width}x${topFrameRaw.height})`, 'evt');
         if (contentStart > 0) {
-          debugLogPush(`remote (host): long screenshot — top frame has ${contentStart}px of leftover expanded-title space, trimming`, 'evt');
           const trimmed = new OffscreenCanvas(topFrameRaw.width, topFrameRaw.height - contentStart);
           trimmed.getContext('2d').drawImage(topFrameRaw, 0, contentStart, topFrameRaw.width, trimmed.height, 0, 0, topFrameRaw.width, trimmed.height);
           lastFrame = trimmed;
