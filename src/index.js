@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.26.2';
+const APP_VERSION = '1.26.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2548,6 +2548,11 @@ const LONG_SCREENSHOT_SWIPE_DURATION_MS = 1000;
 // just starting from wherever it's landed — mirrors LONG_SCREENSHOT_MAX_FRAMES's role for
 // the downward capture.
 const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 15;
+// Generic starting guess for findScrollOverlap()'s expected-overlap fraction, used only
+// for the very first frame transition (before any page-specific measurement exists) —
+// derived from the swipe geometry (85%->15% = 70% raw drag => ~30% leftover overlap).
+// Every later transition calibrates to the actual measured value instead; see v1.26.3.
+const CALIBRATION_DEFAULT_FRACTION = 0.30;
 
 async function pngToCanvas(png) {
   const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
@@ -2666,7 +2671,13 @@ function bestStripMatch(dataA, dataB, width, stripHeight, bandHeight) {
   return { bestScore, bestOffset };
 }
 
-function findScrollOverlap(prevCanvas, nextCanvas) {
+// `expectedFraction`: the caller's best current estimate of where the overlap should
+// land, as a fraction of nextCanvas's height (0.30 — a generic guess from the swipe
+// geometry — until calibrated from a real measurement; see v1.26.3 below). Returns
+// {sliceY, measuredFraction}: sliceY in nextCanvas's FULL-RESOLUTION coordinates,
+// measuredFraction the ACTUAL measured overlap (only meaningful when a confident match
+// was found) so the caller can calibrate its estimate for the next call.
+function findScrollOverlap(prevCanvas, nextCanvas, expectedFraction) {
   const THUMB_WIDTH = 150;
   const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
   const toThumb = (canvas) => {
@@ -2678,46 +2689,55 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
   const thumbA = toThumb(prevCanvas);
   const thumbB = toThumb(nextCanvas);
 
-  if (framesUnchanged(prevCanvas, nextCanvas)) return nextCanvas.height; // unchanged — caller reads this as "no new content"
+  if (framesUnchanged(prevCanvas, nextCanvas)) return { sliceY: nextCanvas.height, measuredFraction: null }; // unchanged — caller reads sliceY as "no new content"
 
   const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
   const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
   const MATCH_THRESHOLD = 40; // empirical threshold on a 0-765 (3-channel) difference scale
 
-  // Narrow, targeted search band first instead of a blind 0%-60% scan — see the v1.26.1
-  // fix comment above findScrollOverlap. The swipe drags from 85% to 15% of screen
-  // height (a 70% raw distance), and at the slowed, non-fling duration below that tracks
-  // closely, so the expected overlap (leftover height = 100% - 70% = 30%) is known ahead
-  // of time; search only around it.
-  const EXPECTED_OVERLAP_FRACTION = 0.30;
-  const SEARCH_MARGIN_FRACTION = 0.16;
-  const narrowFrom = Math.max(0, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION - SEARCH_MARGIN_FRACTION)));
-  const narrowTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION + SEARCH_MARGIN_FRACTION)));
+  // v1.26.3 fix, from a real repro (item skipped mid-page, different content duplicated
+  // near the end): a GENERIC ±16% margin around a one-size-fits-all 30% guess was still
+  // wide enough, on this page's specific scroll behavior, to occasionally lock onto the
+  // wrong candidate. Once the first transition gives a real, page-specific measurement
+  // of how far this exact page/gesture combination actually scrolls, every later
+  // transition searches a much TIGHTER band around that measured value instead of the
+  // generic guess — far less room for the aperture problem (v1.25.4/v1.26.1) to bite.
+  const margin = expectedFraction === CALIBRATION_DEFAULT_FRACTION ? 0.16 : 0.08;
+  const narrowFrom = Math.max(0, Math.round(thumbB.height * (expectedFraction - margin)));
+  const narrowTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * (expectedFraction + margin)));
   const narrowBandHeight = Math.max(1, narrowTo - narrowFrom + stripHeight);
   const narrowData = thumbB.getContext('2d').getImageData(0, narrowFrom, THUMB_WIDTH, narrowBandHeight).data;
   const narrow = bestStripMatch(dataA, narrowData, THUMB_WIDTH, stripHeight, narrowBandHeight);
 
   if (narrow.bestScore < MATCH_THRESHOLD) {
-    return Math.round((narrowFrom + narrow.bestOffset + stripHeight) / scale);
+    const sliceYThumb = narrowFrom + narrow.bestOffset + stripHeight;
+    return { sliceY: Math.round(sliceYThumb / scale), measuredFraction: sliceYThumb / thumbB.height };
   }
 
-  // v1.26.2 fix, from a real repro: near the true end of a page, a swipe often can't
-  // reach its full expected distance — there's less remaining content for the list to
-  // reveal, so it "rubber-bands" short. When that happens the real overlap sits outside
-  // the narrow band above, and — before this fix — findScrollOverlap silently fell back
-  // to just ASSUMING the standard 30% overlap anyway, understating how much of the frame
-  // was actually old content and duplicating it into the stitched output (visible as
-  // repeated content in the last couple of frames). Falling back to the original wide
-  // 0%-60% scan here, only when the narrow search found no confident match, recovers the
-  // true (larger) overlap for this one irregular transition without giving up the narrow
-  // search's aperture-problem protection for every normal mid-page transition.
+  // Near the true end of a page, a swipe often can't reach its full expected distance —
+  // there's less remaining content for the list to reveal, so it "rubber-bands" short.
+  // When that happens the real overlap sits outside the narrow band above, and — before
+  // this fix — findScrollOverlap silently fell back to just ASSUMING the estimated
+  // overlap anyway, understating how much of the frame was actually old content and
+  // duplicating it into the stitched output (v1.26.2 report: repeated content in the
+  // last couple of frames). Falling back to the original wide 0%-60% scan here, only
+  // when the narrow search found no confident match, recovers the true (larger) overlap
+  // for this one irregular transition without giving up the narrow search's
+  // aperture-problem protection for every normal mid-page transition.
   const wideTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
   const wideBandHeight = Math.max(1, wideTo + stripHeight);
   const wideData = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, wideBandHeight).data;
   const wide = bestStripMatch(dataA, wideData, THUMB_WIDTH, stripHeight, wideBandHeight);
 
-  const sliceYThumb = wide.bestScore < MATCH_THRESHOLD ? (wide.bestOffset + stripHeight) : Math.round(thumbB.height * EXPECTED_OVERLAP_FRACTION);
-  return Math.round(sliceYThumb / scale); // back to nextCanvas's real (full-res) coordinates
+  if (wide.bestScore < MATCH_THRESHOLD) {
+    // Deliberately measuredFraction: null even though this IS a confident match — a
+    // wide-search hit means this transition was irregular (see comment above), and the
+    // caller should not let one irregular transition recalibrate its expectation for
+    // whatever regular transitions might still follow it.
+    const sliceYThumb = wide.bestOffset + stripHeight;
+    return { sliceY: Math.round(sliceYThumb / scale), measuredFraction: null };
+  }
+  return { sliceY: Math.round(thumbB.height * expectedFraction / scale), measuredFraction: null };
 }
 
 // Detects the device's fixed chrome (status bar at the top, on-screen navigation bar at
@@ -2880,6 +2900,12 @@ async function handleLongScreenshotRequest(data, peerId) {
     const TAIL_MARGIN_FRACTION = 0.12;
     let withheldFrame = null; // {canvas, from} — most recent frame's not-yet-committed tail
     let frameCount = 1;
+    // Calibrated per-page from the first real measurement, then reused (with a much
+    // tighter search margin) for every later transition — see v1.26.3's comment on
+    // findScrollOverlap(). Deliberately NOT updated from a wide-search-fallback or
+    // no-confident-match result, so one irregular (e.g. near-the-end) transition can't
+    // throw off the calibration used for whatever frames come after it.
+    let calibratedFraction = CALIBRATION_DEFAULT_FRACTION;
     for (let i = 1; i < LONG_SCREENSHOT_MAX_FRAMES; i++) {
       if (!isController(serial, peerId, grantId)) { debugLogPush('remote (host): long screenshot — control lost, stopping early', 'warn'); break; }
       if (Date.now() - startTime > LONG_SCREENSHOT_TOTAL_TIMEOUT_MS) { debugLogPush('remote (host): long screenshot — overall timeout reached, stopping early', 'warn'); break; }
@@ -2906,8 +2932,12 @@ async function handleLongScreenshotRequest(data, peerId) {
         lastFrame = firstContent;
       }
       const newFrame = cropToContent(newFrameRaw);
-      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: finding overlap (content region ${newFrame.width}x${newFrame.height})...`, 'evt');
-      const sliceY = findScrollOverlap(lastFrame, newFrame);
+      debugLogPush(`remote (host): long screenshot — frame ${i + 1}: finding overlap (content region ${newFrame.width}x${newFrame.height}, expected fraction=${calibratedFraction.toFixed(3)})...`, 'evt');
+      const { sliceY, measuredFraction } = findScrollOverlap(lastFrame, newFrame, calibratedFraction);
+      if (measuredFraction !== null) {
+        debugLogPush(`remote (host): long screenshot — frame ${i + 1}: calibrating expected fraction ${calibratedFraction.toFixed(3)} -> ${measuredFraction.toFixed(3)}`, 'evt');
+        calibratedFraction = measuredFraction;
+      }
       await new Promise((r) => setTimeout(r, 0)); // yield before the next synchronous canvas draw
       const newHeightFull = newFrame.height - sliceY;
       debugLogPush(`remote (host): long screenshot — frame ${i + 1}: sliceY=${sliceY} newHeight=${newHeightFull} (frame height=${newFrame.height})`, 'evt');

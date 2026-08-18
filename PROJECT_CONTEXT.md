@@ -204,6 +204,11 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.26.3 — long screenshot: calibrate the expected overlap per-page instead of guessing a fixed 30%
+Real repro after v1.26.2 (a different, deeply-nested attestation properties screen): one field ("item 7") was skipped mid-page, and a different block of fields was duplicated near the end. The user's own diagnosis was exactly right: rather than re-guess the expected scroll amount from generic swipe geometry every time, measure it once from how this specific page actually scrolls, then use that measurement — not a one-size-fits-all constant — for every later transition. A fixed ±16% margin around a generic 30% guess (v1.26.1) was still wide enough, on this page's particular scroll behavior, to occasionally lock onto the wrong candidate.
+
+`findScrollOverlap()` now takes an `expectedFraction` parameter and returns `{sliceY, measuredFraction}`. The first frame transition still uses the generic `CALIBRATION_DEFAULT_FRACTION` (0.30) guess with the original wider ±16% margin (nothing to calibrate from yet); every transition after that searches a much tighter ±8% band around the ACTUAL fraction measured from the previous transition, carried forward in `handleLongScreenshotRequest()`'s new `calibratedFraction` variable. The wide 0-60% fallback from v1.26.2 (for the true end-of-page, swipe-rubber-banded-short case) is unchanged, but deliberately does **not** feed back into calibration — an irregular transition's measurement isn't trusted for whatever regular transitions might still follow it, only for that one irregular frame itself.
+
 ### v1.26.2 — long screenshot: always start from the top; fixed duplicate content in the last 1-2 frames
 Two requests/fixes together:
 
