@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.3';
+const APP_VERSION = '1.27.4';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2879,6 +2879,18 @@ function sendLongScreenshotProgress(peerId, serial, grantId, message) {
 // without an extra redundant capture.
 async function scrollToTop(adb, peerId, serial, grantId, isStillController, deadline) {
   let current = await pngToCanvas(await adbScreencap(adb, 15000));
+  // v1.27.4: require TWO consecutive "unchanged" readings before declaring the top
+  // reached, not just one — real repro (worked perfectly when already at the top, but
+  // starting scrolled deep into the list stopped short of the real top). framesUnchanged()
+  // is a blunt global-average check, and this app's theme (sparse light text on a mostly
+  // uniform dark background — the same characteristic behind several other fixes in this
+  // file) means two DIFFERENT scroll positions can occasionally still average out as
+  // "unchanged". Starting already at the top only ever needs one comparison to succeed, so
+  // that case was never at risk; starting deep in a long list means many more swipe/compare
+  // cycles, each one a fresh chance for a coincidental false positive to stop early. One
+  // extra confirmation swipe (only paid once, right at the end) is a small cost for
+  // actually reaching the top instead of silently stopping partway.
+  let unchangedStreak = 0;
   for (let i = 0; i < LONG_SCREENSHOT_MAX_TOP_SCROLLS; i++) {
     if (!isStillController() || Date.now() > deadline) break;
     const x = Math.round(current.width / 2);
@@ -2890,9 +2902,10 @@ async function scrollToTop(adb, peerId, serial, grantId, isStillController, dead
     await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
     sendLongScreenshotProgress(peerId, serial, grantId, `Scrolling to top (${i + 1})...`);
     const next = await pngToCanvas(await adbScreencap(adb, 15000));
-    const reachedTop = framesUnchanged(current, next);
+    const unchanged = framesUnchanged(current, next);
     current = next;
-    if (reachedTop) {
+    unchangedStreak = unchanged ? unchangedStreak + 1 : 0;
+    if (unchangedStreak >= 2) {
       debugLogPush(`remote (host): long screenshot — reached top after ${i + 1} scroll-up swipe(s)`, 'evt');
       break;
     }
