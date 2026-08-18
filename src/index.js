@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.5';
+const APP_VERSION = '1.27.6';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2996,7 +2996,18 @@ async function handleLongScreenshotRequest(data, peerId) {
     sendLongScreenshotProgress(peerId, serial, grantId, 'Scrolling to top...');
     debugLogPush('remote (host): long screenshot — scrolling to top...', 'evt');
     const isStillController = () => isController(serial, peerId, grantId);
-    let rawFirstFrame = await scrollToTop(info.adb, peerId, serial, grantId, isStillController, startTime + LONG_SCREENSHOT_TOTAL_TIMEOUT_MS);
+    await scrollToTop(info.adb, peerId, serial, grantId, isStillController, startTime + LONG_SCREENSHOT_TOTAL_TIMEOUT_MS);
+    // v1.27.6: re-capture instead of reusing scrollToTop()'s own last frame, after a real
+    // repro (a huge, wrong jump on specifically the FIRST forward transition, every later
+    // one fine) traced to the frame scrollToTop() returns. Hitting the top boundary can
+    // leave the list mid overscroll-bounce; that frame was captured right after
+    // scrollToTop()'s own confirmation swipe with only the standard settle time, which is
+    // enough to confirm "stopped moving" via framesUnchanged() but not necessarily enough
+    // for any bounce-back animation to fully finish. An extra settle + fresh capture here
+    // costs one settle delay, once, and ensures the reference frame every later alignment
+    // is measured against is genuinely stable.
+    await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
+    let rawFirstFrame = await pngToCanvas(await adbScreencap(info.adb, 15000));
     debugLogPush(`remote (host): long screenshot — starting from top, ${rawFirstFrame.width}x${rawFirstFrame.height}`, 'evt');
     sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
     let stitched = null;
