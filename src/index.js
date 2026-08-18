@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.26.1';
+const APP_VERSION = '1.26.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -2544,6 +2544,10 @@ const LONG_SCREENSHOT_TOTAL_TIMEOUT_MS = 100000;
 // triggering a fling on most ScrollViews/RecyclerViews, so findScrollOverlap() can search
 // a narrow, targeted window around the expected overlap instead of a wide blind one.
 const LONG_SCREENSHOT_SWIPE_DURATION_MS = 1000;
+// Safety cap on how many "scroll up" swipes scrollToTop() will try before giving up and
+// just starting from wherever it's landed — mirrors LONG_SCREENSHOT_MAX_FRAMES's role for
+// the downward capture.
+const LONG_SCREENSHOT_MAX_TOP_SCROLLS = 15;
 
 async function pngToCanvas(png) {
   const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
@@ -2597,23 +2601,24 @@ async function pngToCanvas(png) {
 // expected position instead of blindly scanning from 0%. A narrow, targeted search can't
 // accidentally lock onto a repeated block or a sticky header far outside that band, which
 // is what was letting the sticky app-title bar get stitched into the middle of a page.
-function findScrollOverlap(prevCanvas, nextCanvas) {
+// Compares two frames directly (no offset) on a small downscaled proxy — a real scroll,
+// even a small one, misaligns most content pixel-for-pixel against an unshifted
+// comparison, so this stays reliably high whenever something actually moved, and
+// reliably near-zero only when the page genuinely stopped changing (modulo a ticking
+// clock/battery icon, which affects too few pixels to matter here). Shared by
+// findScrollOverlap()'s "reached the bottom" check and scrollToTop()'s "reached the top"
+// check below — same signal, opposite direction.
+function framesUnchanged(canvasA, canvasB) {
   const THUMB_WIDTH = 150;
-  const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
+  const scale = THUMB_WIDTH / canvasA.width;
   const toThumb = (canvas) => {
     const h = Math.max(1, Math.round(canvas.height * scale));
     const c = new OffscreenCanvas(THUMB_WIDTH, h);
     c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
     return c;
   };
-  const thumbA = toThumb(prevCanvas);
-  const thumbB = toThumb(nextCanvas);
-
-  // Global check first: compare the two (downscaled) frames directly, unshifted. A real
-  // scroll — even a small one — misaligns most content pixel-for-pixel against the
-  // un-scrolled comparison, so this stays reliably high whenever something actually
-  // moved, and reliably near-zero only when the page genuinely stopped changing (modulo
-  // a ticking clock/battery icon, which affects too few pixels to matter here).
+  const thumbA = toThumb(canvasA);
+  const thumbB = toThumb(canvasB);
   const minHeight = Math.min(thumbA.height, thumbB.height);
   const wholeA = thumbA.getContext('2d').getImageData(0, 0, THUMB_WIDTH, minHeight).data;
   const wholeB = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, minHeight).data;
@@ -2626,29 +2631,23 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
       globalN++;
     }
   }
-  if (globalN === 0 || globalDiff / globalN < 12) return nextCanvas.height; // unchanged — caller reads this as "no new content"
+  return globalN === 0 || globalDiff / globalN < 12;
+}
 
-  const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
-  const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
-  // Narrow, targeted search band instead of a blind 0%-60% scan — see the fix comment
-  // above. The swipe drags from 85% to 15% of screen height (a 70% raw distance), and at
-  // the slowed, non-fling duration below that tracks closely, so the expected overlap
-  // (leftover height = 100% - 70% = 30%) is known ahead of time; search only around it.
-  const EXPECTED_OVERLAP_FRACTION = 0.30;
-  const SEARCH_MARGIN_FRACTION = 0.16;
-  const searchFrom = Math.max(0, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION - SEARCH_MARGIN_FRACTION)));
-  const searchTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION + SEARCH_MARGIN_FRACTION)));
-  const bandHeight = Math.max(1, searchTo - searchFrom + stripHeight);
-  const dataB = thumbB.getContext('2d').getImageData(0, searchFrom, THUMB_WIDTH, bandHeight).data;
-
+// Slides `dataA` (prev frame's bottom strip) through `dataB` (a pre-cropped vertical
+// band of the next frame spanning [searchFrom, searchFrom+bandHeight)) and returns the
+// best (lowest-difference) match, preferring the SMALLEST offset among near-tied
+// candidates — see v1.25.4's aperture-problem comment on findScrollOverlap(). Offsets
+// are in `dataB`-local thumbnail rows (add back `searchFrom` for absolute position).
+function bestStripMatch(dataA, dataB, width, stripHeight, bandHeight) {
   const scores = [];
   let bestScore = Infinity;
   for (let y = 0; y + stripHeight <= bandHeight; y++) {
     let sum = 0, n = 0;
     for (let row = 0; row < stripHeight; row++) {
-      const rowA = row * THUMB_WIDTH * 4;
-      const rowB = (y + row) * THUMB_WIDTH * 4;
-      for (let col = 0; col < THUMB_WIDTH; col += 2) {
+      const rowA = row * width * 4;
+      const rowB = (y + row) * width * 4;
+      for (let col = 0; col < width; col += 2) {
         const idxA = rowA + col * 4;
         const idxB = rowB + col * 4;
         sum += Math.abs(dataA[idxA] - dataB[idxB]) + Math.abs(dataA[idxA + 1] - dataB[idxB + 1]) + Math.abs(dataA[idxA + 2] - dataB[idxB + 2]);
@@ -2659,14 +2658,65 @@ function findScrollOverlap(prevCanvas, nextCanvas) {
     scores.push(score);
     if (score < bestScore) bestScore = score;
   }
-
   const tolerance = 8;
-  let bestOffset = Math.round(thumbB.height * EXPECTED_OVERLAP_FRACTION) - searchFrom;
+  let bestOffset = 0;
   for (let y = 0; y < scores.length; y++) {
     if (scores[y] <= bestScore + tolerance) { bestOffset = y; break; }
   }
-  const matched = bestScore < 40; // empirical threshold on a 0-765 (3-channel) difference scale
-  const sliceYThumb = matched ? (searchFrom + bestOffset + stripHeight) : Math.round(thumbB.height * EXPECTED_OVERLAP_FRACTION);
+  return { bestScore, bestOffset };
+}
+
+function findScrollOverlap(prevCanvas, nextCanvas) {
+  const THUMB_WIDTH = 150;
+  const scale = THUMB_WIDTH / prevCanvas.width; // both frames share the same device width
+  const toThumb = (canvas) => {
+    const h = Math.max(1, Math.round(canvas.height * scale));
+    const c = new OffscreenCanvas(THUMB_WIDTH, h);
+    c.getContext('2d').drawImage(canvas, 0, 0, THUMB_WIDTH, h);
+    return c;
+  };
+  const thumbA = toThumb(prevCanvas);
+  const thumbB = toThumb(nextCanvas);
+
+  if (framesUnchanged(prevCanvas, nextCanvas)) return nextCanvas.height; // unchanged — caller reads this as "no new content"
+
+  const stripHeight = Math.max(6, Math.round(thumbA.height * 0.06));
+  const dataA = thumbA.getContext('2d').getImageData(0, thumbA.height - stripHeight, THUMB_WIDTH, stripHeight).data;
+  const MATCH_THRESHOLD = 40; // empirical threshold on a 0-765 (3-channel) difference scale
+
+  // Narrow, targeted search band first instead of a blind 0%-60% scan — see the v1.26.1
+  // fix comment above findScrollOverlap. The swipe drags from 85% to 15% of screen
+  // height (a 70% raw distance), and at the slowed, non-fling duration below that tracks
+  // closely, so the expected overlap (leftover height = 100% - 70% = 30%) is known ahead
+  // of time; search only around it.
+  const EXPECTED_OVERLAP_FRACTION = 0.30;
+  const SEARCH_MARGIN_FRACTION = 0.16;
+  const narrowFrom = Math.max(0, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION - SEARCH_MARGIN_FRACTION)));
+  const narrowTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * (EXPECTED_OVERLAP_FRACTION + SEARCH_MARGIN_FRACTION)));
+  const narrowBandHeight = Math.max(1, narrowTo - narrowFrom + stripHeight);
+  const narrowData = thumbB.getContext('2d').getImageData(0, narrowFrom, THUMB_WIDTH, narrowBandHeight).data;
+  const narrow = bestStripMatch(dataA, narrowData, THUMB_WIDTH, stripHeight, narrowBandHeight);
+
+  if (narrow.bestScore < MATCH_THRESHOLD) {
+    return Math.round((narrowFrom + narrow.bestOffset + stripHeight) / scale);
+  }
+
+  // v1.26.2 fix, from a real repro: near the true end of a page, a swipe often can't
+  // reach its full expected distance — there's less remaining content for the list to
+  // reveal, so it "rubber-bands" short. When that happens the real overlap sits outside
+  // the narrow band above, and — before this fix — findScrollOverlap silently fell back
+  // to just ASSUMING the standard 30% overlap anyway, understating how much of the frame
+  // was actually old content and duplicating it into the stitched output (visible as
+  // repeated content in the last couple of frames). Falling back to the original wide
+  // 0%-60% scan here, only when the narrow search found no confident match, recovers the
+  // true (larger) overlap for this one irregular transition without giving up the narrow
+  // search's aperture-problem protection for every normal mid-page transition.
+  const wideTo = Math.min(thumbB.height - stripHeight, Math.round(thumbB.height * 0.6));
+  const wideBandHeight = Math.max(1, wideTo + stripHeight);
+  const wideData = thumbB.getContext('2d').getImageData(0, 0, THUMB_WIDTH, wideBandHeight).data;
+  const wide = bestStripMatch(dataA, wideData, THUMB_WIDTH, stripHeight, wideBandHeight);
+
+  const sliceYThumb = wide.bestScore < MATCH_THRESHOLD ? (wide.bestOffset + stripHeight) : Math.round(thumbB.height * EXPECTED_OVERLAP_FRACTION);
   return Math.round(sliceYThumb / scale); // back to nextCanvas's real (full-res) coordinates
 }
 
@@ -2735,6 +2785,37 @@ function sendLongScreenshotProgress(peerId, serial, grantId, message) {
   try { remoteSession.actions.longScreenshotProgress.send({ serial, grantId, message }, { target: peerId }); } catch (_) {}
 }
 
+// Scrolls up (the reverse of the capture loop's own downward swipe) until two
+// consecutive frames come back unchanged — reusing framesUnchanged(), the exact same
+// signal the downward loop uses to recognize "reached the bottom," just checked in the
+// opposite direction. Requested so Long Screenshot always starts from a known, consistent
+// position instead of wherever the viewer happened to have scrolled to already (testing
+// from an arbitrary mid-page position was producing confusingly short/partial captures).
+// Returns the final (topmost) frame, decoded, so the caller can reuse it as frame 1
+// without an extra redundant capture.
+async function scrollToTop(adb, peerId, serial, grantId, isStillController, deadline) {
+  let current = await pngToCanvas(await adbScreencap(adb, 15000));
+  for (let i = 0; i < LONG_SCREENSHOT_MAX_TOP_SCROLLS; i++) {
+    if (!isStillController() || Date.now() > deadline) break;
+    const x = Math.round(current.width / 2);
+    // Reverse of the capture loop's swipe: drag from near-top to near-bottom (finger
+    // moves down => content moves down => reveals content that was above, scrolling UP).
+    const fromY = Math.round(current.height * 0.15);
+    const toY = Math.round(current.height * 0.85);
+    await adbShell(adb, `input swipe ${x} ${fromY} ${x} ${toY} ${LONG_SCREENSHOT_SWIPE_DURATION_MS}`);
+    await new Promise((r) => setTimeout(r, LONG_SCREENSHOT_SETTLE_MS));
+    sendLongScreenshotProgress(peerId, serial, grantId, `Scrolling to top (${i + 1})...`);
+    const next = await pngToCanvas(await adbScreencap(adb, 15000));
+    const reachedTop = framesUnchanged(current, next);
+    current = next;
+    if (reachedTop) {
+      debugLogPush(`remote (host): long screenshot — reached top after ${i + 1} scroll-up swipe(s)`, 'evt');
+      break;
+    }
+  }
+  return current;
+}
+
 async function handleLongScreenshotRequest(data, peerId) {
   debugLogPush(`remote (host): longScreenshotRequest received from peerId=${peerId}: ${JSON.stringify(data)}`, 'evt');
   if (!remoteSession || remoteSession.role !== 'host') {
@@ -2760,13 +2841,13 @@ async function handleLongScreenshotRequest(data, peerId) {
   const startTime = Date.now();
   try {
     debugLogPush(`remote (host): long screenshot starting for ${serial}`, 'evt');
-    sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
-    debugLogPush('remote (host): long screenshot — capturing frame 1 (adbScreencap)...', 'evt');
-    const firstPng = await adbScreencap(info.adb, 15000);
-    debugLogPush(`remote (host): long screenshot — frame 1 captured, ${firstPng.length} bytes, decoding...`, 'evt');
-    let rawFirstFrame = await pngToCanvas(firstPng);
+    sendLongScreenshotProgress(peerId, serial, grantId, 'Scrolling to top...');
+    debugLogPush('remote (host): long screenshot — scrolling to top...', 'evt');
+    const isStillController = () => isController(serial, peerId, grantId);
+    let rawFirstFrame = await scrollToTop(info.adb, peerId, serial, grantId, isStillController, startTime + LONG_SCREENSHOT_TOTAL_TIMEOUT_MS);
     let lastFrame = rawFirstFrame; // re-cropped to content-only once chromeBounds is known below
-    debugLogPush(`remote (host): long screenshot — frame 1 decoded, ${lastFrame.width}x${lastFrame.height}`, 'evt');
+    debugLogPush(`remote (host): long screenshot — starting from top, ${lastFrame.width}x${lastFrame.height}`, 'evt');
+    sendLongScreenshotProgress(peerId, serial, grantId, 'Capturing frame 1...');
     let stitched = null;
     let chromeBounds = null;
     const cropToContent = (canvas) => {
@@ -2896,14 +2977,12 @@ function showShareModal() {
     '<button class="btn btn-sm" id="share-copy-btn">Copy</button></div>' +
     '<div style="font-size:12px;color:var(--muted);margin-bottom:16px;">Connected viewers: <span id="share-viewer-count">0</span></div>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
-    '<button class="btn btn-sm" id="share-selftest-btn" title="Opens the viewer link in a new tab on this same machine — no second device or person needed to test Remote Control / Long Screenshot.">Open Viewer Tab (self-test)</button>' +
     '<button class="btn btn-sm" id="share-regen-btn">Regenerate Link</button>' +
     '<button class="btn btn-sm" id="share-stop-btn" style="color:var(--red);">Stop Sharing</button>' +
     '<button class="btn" id="share-close-btn">Done</button></div>';
   overlay.appendChild(box);
   document.body.appendChild(overlay);
 
-  document.getElementById('share-selftest-btn').onclick = () => { window.open(link, '_blank'); };
   document.getElementById('share-copy-btn').onclick = () => {
     navigator.clipboard.writeText(link).then(() => setStatus('Link copied', 'ok')).catch(() => {});
   };
