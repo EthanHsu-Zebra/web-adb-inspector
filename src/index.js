@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.3';
+const APP_VERSION = '1.27.11';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1626,12 +1626,37 @@ function makeRemoteActions(room, roomId, password, label) {
   // connection to this exact target already — falling back only for a target with no
   // such entry (unknown, or genuinely fallback-only/Zscaler-style). Gets both: full
   // speed when P2P works, full reliability when it doesn't.
-  const HIGH_FREQUENCY_ACTIONS = new Set(['screenFrame', 'inputEvent']);
+  //
+  // v1.27.11: the same adaptive skip extended to a second group of actions, after the
+  // self-hosted relay's free-tier bandwidth allowance was exhausted (in part, it turned
+  // out, by this very code always sending a full duplicate of every message through the
+  // relay even when a healthy direct P2P connection already delivered it). Every
+  // request/response action with no independent retry/timeout on the caller side
+  // (cmdRequest, apkTransfer*, controlRequest, longScreenshotRequest, etc.) is
+  // deliberately left OUT of this set and keeps unconditionally dual-sending: if the one
+  // fallback copy skipped here happened to be the only copy that would have arrived (P2P
+  // reported connected at send time, then dropped moments later), a lost one-shot
+  // command/response has no way to recover and would hang silently. The actions added
+  // here don't have that problem — each one is either periodicaly re-sent on its own
+  // (viewerHeartbeat, hello's own join-time retry loop) or self-heals on the next natural
+  // state change (devicePush, tabDataPush, orientationStatus, bye) — so an occasional
+  // skipped-and-then-lost copy is a brief staleness, not a stuck UI. Note this only
+  // actually changes behavior for TARGETED sends (a specific already-P2P-connected
+  // viewer, e.g. late-join catch-up) — broadcast sends (no `opts.target`) already always
+  // fall through to the fallback unconditionally, since `targetHasP2P` requires a target
+  // to check in the first place, and a broadcast can't cheaply verify EVERY current
+  // viewer (not just one) already has P2P. Broadcast tabDataPush — the single largest
+  // payload (packages-tab HTML) and the main bandwidth driver — is unaffected by this
+  // change; that would need checking all-viewers-have-P2P, a separate, larger change.
+  const SKIP_FALLBACK_WHEN_P2P = new Set([
+    'screenFrame', 'inputEvent',
+    'devicePush', 'tabDataPush', 'hello', 'bye', 'orientationStatus', 'viewerHeartbeat',
+  ]);
 
   function wrap(name) {
     const real = room.makeAction(name);
     real.onMessage = (data, ctx) => deliver(name, data, ctx);
-    const highFrequency = HIGH_FREQUENCY_ACTIONS.has(name);
+    const skippable = SKIP_FALLBACK_WHEN_P2P.has(name);
     return {
       send: (data, opts) => {
         // real.send() is async (trystero) — a plain try/catch around the call doesn't
@@ -1640,7 +1665,7 @@ function makeRemoteActions(room, roomId, password, label) {
         // unhandled-rejection console error.
         try { Promise.resolve(real.send(data, opts)).catch(() => {}); } catch (_) {}
         const targetHasP2P = opts?.target && !!room.getPeers()[opts.target];
-        if (!(highFrequency && targetHasP2P)) {
+        if (!(skippable && targetHasP2P)) {
           fallback.send({ action: name, from: sessionId, target: opts?.target, data });
         }
       },
