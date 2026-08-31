@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.28.0';
+const APP_VERSION = '1.28.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1151,10 +1151,19 @@ function isShareRolloutAllowed() {
   try { return localStorage.getItem(SHARE_SELF_ONLY_KEY) === '1'; } catch (_) { return false; }
 }
 
+let _lastShareButtonVisible = null; // null = not yet evaluated, so the first real state always logs
+
 function updateShareButtonVisibility() {
   const btn = document.getElementById('btn-share');
   if (!btn) return;
-  btn.classList.toggle('hidden', !(allConnectedDevicesAreZebra() && isShareRolloutAllowed()));
+  const zebraOk = allConnectedDevicesAreZebra();
+  const rolloutOk = isShareRolloutAllowed();
+  const visible = zebraOk && rolloutOk;
+  btn.classList.toggle('hidden', !visible);
+  if (visible !== _lastShareButtonVisible) {
+    _lastShareButtonVisible = visible;
+    debugLogPush(`Share button ${visible ? 'SHOWN' : 'HIDDEN'} (allDevicesZebra=${zebraOk}, rolloutAllowed=${rolloutOk}, connectedCount=${connectedDevices.size})`, visible ? 'ok' : 'warn');
+  }
 }
 
 function toggleDeviceSelection(kind, serial) {
