@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.28.2';
+const APP_VERSION = '1.28.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1065,6 +1065,7 @@ function renderDeviceList() {
     welcome.classList.remove('hidden');
     availSection.classList.add('hidden');
     updateBulkBars();
+    updateShareButtonVisibility();
     return;
   }
   welcome.classList.add('hidden');
