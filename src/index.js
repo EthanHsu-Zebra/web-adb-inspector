@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.28.1';
+const APP_VERSION = '1.28.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1017,7 +1017,13 @@ function shQuote(s) {
 
 function wrapWithCwdTracking(cwd, cmd) {
   const cdPrefix = cwd ? `cd ${shQuote(cwd)} 2>/dev/null\n` : '';
-  return `${cdPrefix}${cmd}\nprintf '\\n%s%s%s\\n' '${CWD_MARKER}' "$PWD" '${CWD_MARKER}'`;
+  // `2>&1` on the user's command (not the cwd-restore prefix, which stays silenced on
+  // purpose) merges stderr into stdout on the device side, in the device's own write
+  // order — same as what a real interactive `adb shell` session shows on its tty, e.g.
+  // "cd: /sys/zebra_battery/batt_extras: Permission denied". adbShell()/adbShellTimed()
+  // both only return the stdout stream, so without this, error text from the command
+  // itself was silently discarded and the UI showed nothing at all.
+  return `${cdPrefix}{\n${cmd}\n} 2>&1\nprintf '\\n%s%s%s\\n' '${CWD_MARKER}' "$PWD" '${CWD_MARKER}'`;
 }
 
 // Splits the marker (and the resolved cwd it carries) back out of raw shell
