@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.27.11';
+const APP_VERSION = '1.28.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -746,9 +746,11 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
       }).catch(() => {});
     }
     let displayName = usbDevice.name || 'Android Device';
+    let manufacturer = '';
     try {
       const model = await adb.getProp('ro.product.model');
       const brand = await adb.getProp('ro.product.brand');
+      manufacturer = await adb.getProp('ro.product.manufacturer');
       displayName = brand + ' ' + model;
     } catch (_) {}
 
@@ -801,7 +803,7 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
       productId: usbDevice.raw.productId,
     };
 
-    connectedDevices.set(adbSerial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId });
+    connectedDevices.set(adbSerial, { adb, usbDevice, transport, _displayName: displayName, _usbId: usbId, _manufacturer: manufacturer });
     // Defensive cleanup: if a "Ready to Connect" entry for this same physical device
     // still exists (a race the connectingUsbIds guard above didn't fully close, or one
     // that predates this connection), remove it now rather than showing the device twice.
@@ -1117,7 +1119,42 @@ function renderDeviceList() {
     }
   }
   updateBulkBars();
+  updateShareButtonVisibility();
   if (remoteSession && remoteSession.role === 'host') broadcastDeviceState();
+}
+
+// Share button gating — both conditions below must hold, or the button stays hidden:
+//  1. Every connected device must be a Zebra device. Remote sessions ride on the shared
+//     free-tier relay (see INFRASTRUCTURE_DEPENDENCIES.md) whose bandwidth is meant for
+//     Zebra device support, not general-purpose Android debugging.
+//  2. Rollout gate — until a backup/self-hosted relay replaces the current single point
+//     of failure, sharing is limited to this machine. Flip SHARE_ROLLOUT to 'everyone'
+//     (one line) once that backup is in place; no other code change is needed.
+const SHARE_ROLLOUT = 'self-only'; // 'self-only' | 'everyone'
+const SHARE_SELF_ONLY_KEY = 'wai_share_self_only_override';
+
+function isZebraDevice(info) {
+  const m = (info && info._manufacturer || '').toLowerCase();
+  return m.includes('zebra');
+}
+
+function allConnectedDevicesAreZebra() {
+  if (connectedDevices.size === 0) return false;
+  for (const info of connectedDevices.values()) {
+    if (!isZebraDevice(info)) return false;
+  }
+  return true;
+}
+
+function isShareRolloutAllowed() {
+  if (SHARE_ROLLOUT === 'everyone') return true;
+  try { return localStorage.getItem(SHARE_SELF_ONLY_KEY) === '1'; } catch (_) { return false; }
+}
+
+function updateShareButtonVisibility() {
+  const btn = document.getElementById('btn-share');
+  if (!btn) return;
+  btn.classList.toggle('hidden', !(allConnectedDevicesAreZebra() && isShareRolloutAllowed()));
 }
 
 function toggleDeviceSelection(kind, serial) {
