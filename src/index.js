@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.28.3';
+const APP_VERSION = '1.29.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -4823,16 +4823,25 @@ async function checkRkpProvisioning(adb) {
 }
 
 // RKP table: 5 columns with collapsible source/tooltip — also used by fetchAttestation()
-// now, so both tabs get the same hover-tooltip + Source column treatment.
+// now, so both tabs get the same hover-tooltip + Source column treatment. A 6th, optional
+// `needsInternet` element flags rows whose VALUE depends on live internet connectivity
+// (e.g. RKP Provisioned's `cmd remote_provisioning certify`, which round-trips to
+// Google's backend, and Attestation Capability's explicit TLS check) — these show a
+// visible 🌐 badge next to the check name, since a plain hover tooltip alone is too easy
+// to miss and the whole point is to explain why a stale-looking value might just need a
+// re-run of the Refresh button, not a real device problem.
 function renderRKPTable(rows) {
   return '<table class="status-table rkp-table"><thead><tr><th>Check</th><th>Value</th><th>Status</th><th>Source</th></tr></thead><tbody>' +
-    rows.map(([check, value, status, source, tip]) => {
+    rows.map(([check, value, status, source, tip, needsInternet]) => {
       const sc = 'status-' + status;
       const sl = status === 'ok' ? 'PASS' : status === 'warn' ? 'WARN' : status === 'fail' ? 'FAIL' : 'N/A';
       const tooltip = tip ? ' title="' + esc(tip) + '"' : '';
       const sourceStr = source ? esc(source) : '-';
+      const netBadge = needsInternet
+        ? ' <span class="rkp-net-badge" title="Requires live internet connectivity on the device. If the device reconnected to the internet after this was last checked, click Refresh to get the current status.">\u{1F310}</span>'
+        : '';
       return '<tr>' +
-        '<td>' + esc(check) + '</td>' +
+        '<td>' + esc(check) + netBadge + '</td>' +
         '<td' + tooltip + '>' + esc(value || 'N/A') + '</td>' +
         '<td class="' + sc + '">' + sl + '</td>' +
         '<td class="rkp-source"><code>' + sourceStr + '</code></td>' +
@@ -5270,6 +5279,7 @@ window.sendControlRotateTo = sendControlRotateTo;
 window.installApk = installApk;
 window.requestScreenshot = requestScreenshot;
 window.requestLongScreenshot = requestLongScreenshot;
+window.refreshRKP = refreshRKP;
 
 // --- RKP: Google-connectivity + Android 15 generic HAL-based checks ---
 // targetSerial/background — same purpose and contract as fetchAttestation()'s, see its
@@ -5392,7 +5402,8 @@ async function fetchRKP(targetSerial, background) {
         c.provisioned ? 'PROVISIONED — certificate chain present' : 'NOT CONFIRMED' + (c.note ? ': ' + c.note : ''),
         c.provisioned ? 'ok' : 'fail',
         'cmd remote_provisioning certify ' + c.name,
-        'The definitive evidence: a successful PEM certificate chain from `certify` proves provisioning material actually exists for this component. This is the only ADB-level check that confirms provisioning rather than mere support/configuration.'
+        'The definitive evidence: a successful PEM certificate chain from `certify` proves provisioning material actually exists for this component. This is the only ADB-level check that confirms provisioning rather than mere support/configuration.',
+        true
       ]);
     }
 
@@ -5404,6 +5415,7 @@ async function fetchRKP(targetSerial, background) {
         'unknown',
         'cmd -l (checked before cmd key_attestation) + nc play.googleapis.com:443',
         'This device does not expose a key_attestation shell service at all (confirmed via cmd -l) — the HAL-version check was skipped rather than risk misreading a "Can\'t find service" line as a real result. TLS reachability to Google was still checked independently.',
+        true,
       ]);
     } else {
       rows.push([
@@ -5412,7 +5424,8 @@ async function fetchRKP(targetSerial, background) {
                   : `Limited (HAL v${attest.attestationVersion}, TLS: ${attest.tlsReachable ? 'OK' : 'FAIL'})`,
         attest.ok ? 'ok' : 'warn',
         'cmd key_attestation + nc play.googleapis.com:443',
-        'Real attestation test: queries KeyMint HAL for attestation versions (proves HAL supports attestation) + TLS handshake to play.googleapis.com:443 (proves device can reach Google attestation servers). Network ping alone does NOT prove RKP — this combination verifies the prerequisite paths.'
+        'Real attestation test: queries KeyMint HAL for attestation versions (proves HAL supports attestation) + TLS handshake to play.googleapis.com:443 (proves device can reach Google attestation servers). Network ping alone does NOT prove RKP — this combination verifies the prerequisite paths.',
+        true
       ]);
     }
 
@@ -5506,6 +5519,19 @@ async function fetchRKP(targetSerial, background) {
     }
   }
   if (!background) showLoading('rkp', false);
+}
+
+// Manual re-run of all RKP checks, wired to the RKP tab's Refresh button. Several rows
+// (RKP Provisioned, Attestation Capability) depend on live internet connectivity that
+// can change after the initial page load/device connect — this app has no way to detect
+// "the device just got internet back," so a user-triggered refresh is the only way to
+// pick that up without either polling in the background (adds continuous ADB shell
+// traffic for checks that take several seconds each and rarely change) or reloading the
+// whole page.
+async function refreshRKP() {
+  if (!activeSerial) return;
+  await fetchRKP();
+  pushTabHtml('rkp', 'rkp-output');
 }
 
 function clearShell() {

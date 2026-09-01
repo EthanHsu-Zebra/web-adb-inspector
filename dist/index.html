@@ -541,6 +541,7 @@
     border-radius: 3px;
     color: var(--muted);
   }
+  .rkp-net-badge { cursor: help; font-size: calc(0.75rem * var(--font-scale)); opacity: 0.8; }
 
   /* Loading */
   .loading {
@@ -846,7 +847,10 @@
         <div class="panel">
           <div class="panel-header">
             <h3>Remote Key Provisioning Status</h3>
-            <div><span id="rkp-loading" class="loading hidden"></span></div>
+            <div class="panel-actions host-only">
+              <span id="rkp-loading" class="loading hidden"></span>
+              <button class="btn btn-sm" onclick="refreshRKP()" title="Re-run all checks &#8212; some rows (marked &#127760;) depend on live internet connectivity and won't update on their own if the device reconnects after the last check">&#8635; Refresh</button>
+            </div>
           </div>
           <div id="rkp-output"></div>
         </div>
@@ -957,6 +961,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026083104"></script>
+<script type="module" src="bundle.js?v=2026083105"></script>
 </body>
 </html>
