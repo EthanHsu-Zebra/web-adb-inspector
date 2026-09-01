@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.30.0';
+const APP_VERSION = '1.30.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -5241,9 +5241,12 @@ function exportJSON(type) {
 // Built from dataCache (re-rendered with an empty search query, since a live tab's DOM
 // may currently show a search-filtered subset) rather than by reading #props-output etc.
 // directly — the one exception is Attestation/RKP, which have no search box, so their
-// live innerHTML is already the complete result. Embeds the app's own single <style> tag
-// verbatim so the export looks like the live app with zero separate stylesheet to
-// maintain, and stays correct automatically as the app's CSS evolves.
+// live innerHTML is already the complete result. Real tabs, not one long scroll — reuses
+// the app's own .tab-bar/.tab/.tab-content(.active) classes (already in the embedded
+// stylesheet, see below) plus a tiny inline switcher script, since a standalone file has
+// no access to the app's own switchTab()/bundle.js. Nothing is stripped to get there —
+// every cell's hover title="..." tooltip and the Source column survive untouched, since
+// this reuses the exact same HTML strings the live tabs render, not a summarized rebuild.
 function exportAllTabsHtml() {
   const serial = activeSerial;
   const info = connectedDevices.get(serial);
@@ -5257,18 +5260,30 @@ function exportAllTabsHtml() {
     ['Attestation', document.getElementById('attestation-output')?.innerHTML || ''],
     ['RKP', document.getElementById('rkp-output')?.innerHTML || ''],
   ];
-  const body = sections.map(([title, html]) =>
-    '<section><h2>' + esc(title) + '</h2>' + (html || '<p class="empty-hint">No data</p>') + '</section>'
+  const tabBar = sections.map(([title], i) =>
+    '<div class="tab' + (i === 0 ? ' active' : '') + '" data-tab="exp-tab-' + i + '">' + esc(title) + '</div>'
+  ).join('');
+  const tabPanels = sections.map(([title, html], i) =>
+    '<div id="exp-tab-' + i + '" class="tab-content' + (i === 0 ? ' active' : '') + '">' +
+    (html || '<p class="empty-hint">No data</p>') + '</div>'
   ).join('\n');
 
   const styleTag = document.querySelector('style')?.outerHTML || '';
   const html = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
     '<title>' + esc(buildId) + ' ' + esc(serial) + '</title>' + styleTag +
-    '<style>body{padding:1.5rem;max-width:1000px;margin:0 auto;} section{margin-bottom:2rem;} section h2{border-bottom:1px solid var(--border);padding-bottom:0.5rem;} .pkg-detail{display:block;margin:0 0 0.75rem 0.5rem;}</style>' +
+    '<style>body{padding:1.5rem;max-width:1100px;margin:0 auto;} .pkg-detail{display:block;margin:0 0 0.75rem 0.5rem;}</style>' +
     '</head><body>' +
     '<h1>' + esc(buildId) + ' — ' + esc(serial) + '</h1>' +
     '<p style="color:var(--muted);font-size:0.85rem;">Exported ' + esc(new Date().toString()) + ' from web-adb-inspector v' + APP_VERSION + '</p>' +
-    body +
+    '<div class="tab-bar">' + tabBar + '</div>' +
+    tabPanels +
+    '<script>document.querySelectorAll(".tab-bar .tab").forEach(function(btn){' +
+    'btn.addEventListener("click",function(){' +
+    'document.querySelectorAll(".tab-bar .tab").forEach(function(t){t.classList.remove("active");});' +
+    'btn.classList.add("active");' +
+    'document.querySelectorAll(".tab-content").forEach(function(c){c.classList.remove("active");});' +
+    'document.getElementById(btn.dataset.tab).classList.add("active");' +
+    '});});</script>' +
     '</body></html>';
 
   const blob = new Blob([html], { type: 'text/html' });

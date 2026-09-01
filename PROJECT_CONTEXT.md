@@ -205,6 +205,9 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.30.1 — Export All (HTML): real tabs instead of one long scrolling page
+v1.30.0's first cut stacked all 5 sections vertically on one page — user feedback: unusable ("scroll all day"). Reworked to reuse the app's own `.tab-bar`/`.tab`/`.tab-content(.active)` CSS classes (already present verbatim via the embedded `<style>` tag) plus a small inline `<script>` tab-switcher, since the standalone exported file has no access to the app's `switchTab()` (that's inside the ES module bundle, not included in the export). No data was ever dropped going from v1.30.0 to v1.30.1 — every section still renders from the exact same HTML-building functions as before (`propsToHtml()`/`featuresToHtml()`/`packagesToExportHtml()` re-rendered with an empty search query, plus Attestation/RKP's live `innerHTML`), so every cell's hover `title="..."` tooltip and Source column are intact; this was purely a layout change.
+
 ### v1.30.0 — "Export All (HTML)" button: combined snapshot of every tab except Shell
 New `exportAllTabsHtml()` (`src/index.js`, near `exportJSON()`), button added to `.device-header-actions` next to Save/Disconnect (host-only, per-device — same as those). Builds one standalone `.html` from Properties/Features/Packages/Attestation/RKP; Shell is excluded (it's interactive command history, not device state, so doesn't belong in a device-info report). Filename is `<ro.build.id value>_<serial>.html`, read from `dataCache.props` (already limited to `ro.*` keys by `parseGetprop()`'s regex).
 
