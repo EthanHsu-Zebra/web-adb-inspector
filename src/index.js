@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.30.1';
+const APP_VERSION = '1.30.2';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -42,6 +42,10 @@ const connectingStatus = new Map();
 const pendingAutoReconnect = new Set();
 let activeSerial = null;
 let disconnectingSerial = null;  // serial currently being intentionally disconnected (suppress USB event)
+// Serial whose Properties/Features/Packages/Attestation/RKP initial fetch chain (see
+// selectDevice()) has fully settled — Export All (HTML) stays hidden until this matches
+// activeSerial, so it can never export a page with a still-loading (e.g. empty RKP) tab.
+let deviceTabsReadySerial = null;
 const dataCache = { props: [], features: [], packages: [] };
 // Host-side, keyed by serial -> {tab: html} — the most recently rendered tab HTML for
 // EVERY device the host has ever selected this session, not just whichever one is
@@ -1261,13 +1265,27 @@ function selectDevice(serial) {
     if (el) el.innerHTML = '';
   });
 
+  // Export All (HTML) stays hidden until every tab below has settled for THIS serial —
+  // see deviceTabsReadySerial's declaration comment.
+  deviceTabsReadySerial = null;
+  updateExportButtonVisibility();
+
   // Fetch all data for the new device (and mirror each tab's rendered result to any
   // connected viewers once it settles — see pushTabHtml()).
-  fetchProperties().then(() => pushTabHtml('props', 'props-output'));
-  fetchFeatures().then(() => pushTabHtml('features', 'features-output'));
-  fetchPackages().then(() => pushTabHtml('packages', 'packages-output'));
-  fetchAttestation().then(() => pushTabHtml('attestation', 'attestation-output'));
-  fetchRKP().then(() => pushTabHtml('rkp', 'rkp-output'));
+  const tabFetches = [
+    fetchProperties().then(() => pushTabHtml('props', 'props-output')),
+    fetchFeatures().then(() => pushTabHtml('features', 'features-output')),
+    fetchPackages().then(() => pushTabHtml('packages', 'packages-output')),
+    fetchAttestation().then(() => pushTabHtml('attestation', 'attestation-output')),
+    fetchRKP().then(() => pushTabHtml('rkp', 'rkp-output')),
+  ];
+  Promise.all(tabFetches).then(() => {
+    // The user may have switched to yet another device while these were in flight —
+    // only mark ready if we're still looking at the device these fetches were for.
+    if (activeSerial !== serial) return;
+    deviceTabsReadySerial = serial;
+    updateExportButtonVisibility();
+  });
 }
 
 // Re-fetches the manager's granted-device list fresh and finds the one matching usbId.
@@ -5234,6 +5252,12 @@ function exportJSON(type) {
   const a = document.createElement('a');
   a.href = url; a.download = fn; a.click();
   URL.revokeObjectURL(url);
+}
+
+function updateExportButtonVisibility() {
+  const btn = document.getElementById('btn-export-all');
+  if (!btn) return;
+  btn.classList.toggle('hidden', !(activeSerial && deviceTabsReadySerial === activeSerial));
 }
 
 // Combined snapshot of every data tab except Shell (interactive command history, not
