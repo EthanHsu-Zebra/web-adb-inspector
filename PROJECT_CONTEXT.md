@@ -205,6 +205,9 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.30.3 — Export All added to the Help modal
+`showHelpModal()` is titled "Device List Help" but already documented `Share` (a per-device header action, not a device-list concept) — so it's really the app's only general help reference at this point, not strictly scoped to the sidebar. Added an `Export All (HTML)` row alongside it, same treatment. Considered (and the user deferred for now) broadening this further — Export JSON, the RKP Refresh button, and the 🌐 internet-badge meaning are also currently undocumented anywhere in-app besides their own hover tooltips.
+
 ### v1.30.2 — Export All (HTML) could export an empty RKP tab if clicked before its fetch settled
 `selectDevice()` fires all 5 tab fetches concurrently (`fetchProperties`/`Features`/`Packages`/`Attestation`/`RKP`), not sequentially — RKP is usually the slowest (several HAL probes + `cmd remote_provisioning certify` per component + a TLS check), so clicking "Export All (HTML)" right after selecting a device could capture `#rkp-output` before its fetch had written anything into it. Fixed by hiding the button (`#btn-export-all`, defaults to `hidden` in the markup) until a new `deviceTabsReadySerial` module-level var — set only once `Promise.all()` over all 5 fetch promises resolves for the currently active serial — matches `activeSerial`. `selectDevice()` resets it to `null` (and re-hides the button) immediately on every device switch, before kicking off the new fetches, so switching devices while the button was visible correctly hides it again until the new device's own fetches settle. Deliberately does NOT gate on `refreshRKP()`'s manual re-fetch — a refresh-in-progress only risks exporting the *previous* (non-empty, if slightly stale) result until it completes, not an empty one, which is a materially smaller problem than the one being fixed here.
 

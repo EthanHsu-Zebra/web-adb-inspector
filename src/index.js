@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.30.2';
+const APP_VERSION = '1.30.3';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1465,6 +1465,7 @@ function showHelpModal() {
     row('+ Connect Device', 'Opens the browser\'s native USB device picker, to grant permission for a new device (or one whose permission needs refreshing).') +
     row('Checkboxes / Connect Selected / Disconnect Selected', 'Select multiple devices in either section to connect or disconnect them all in one action, instead of one at a time.') +
     row('Share', 'Starts a remote session — generates a link you can send to someone else so they can view this device\'s status and (with your approval) run shell commands on it, from anywhere.') +
+    row('Export All (HTML)', 'Exports Properties, Features, Packages, Attestation and RKP (not Shell) for the selected device as one standalone HTML file with its own tabs, named after the device\'s ro.build.id and serial. Stays hidden until all five tabs have finished loading, so it can\'t export an incomplete page.') +
     '<div style="display:flex;justify-content:flex-end;margin-top:8px;"><button class="btn" id="help-close-btn">Close</button></div>';
   overlay.appendChild(box);
   document.body.appendChild(overlay);
