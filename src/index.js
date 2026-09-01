@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.29.0';
+const APP_VERSION = '1.29.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -5504,7 +5504,22 @@ async function fetchRKP(targetSerial, background) {
       const val = (r[1] || '').toString().trim().toLowerCase();
       return val !== '' && val !== 'not set' && val !== 'not found' && val !== 'not installed' && val !== 'not reported';
     });
-    const html = renderRKPTable(validRows);
+    // Warning banner: on a device with no factory-provisioned fallback keys
+    // (remote_provisioning.tee.rkp_only=true), "Attestation Capability" and "Key
+    // Attestation" below only prove the HAL is present and Google's server is reachable —
+    // neither one actually attempts to sign with a real key, so they can show green even
+    // when this device has never successfully completed remote provisioning. Only the
+    // "RKP Provisioned" row(s) (a real `certify` round-trip) prove that. Surfacing this as
+    // a banner rather than hiding/graying the other rows — a technician debugging a
+    // failure still needs to see "HAL responds + network reachable" as a data point, even
+    // when RKP itself hasn't succeeded, to tell whether the failure is in the HAL, the
+    // network, or provisioning specifically.
+    const rkpOnlyUnconfirmed = rkp.teeRkpOnly === 'true' && rkp.certified.some(c => !c.provisioned);
+    const banner = rkpOnlyUnconfirmed
+      ? '<div class="rkp-warning-banner">⚠️ This device is <strong>RKP-only</strong> (no factory-provisioned fallback attestation keys), and provisioning is <strong>not confirmed</strong> for at least one component below. '
+        + '<strong>Attestation Capability</strong> and <strong>Key Attestation</strong> only prove the HAL responds and the device can reach Google’s servers &mdash; they do NOT prove a real attestation key exists, so they can still show green here. Treat those two as inconclusive until the <strong>RKP Provisioned</strong> row(s) above also pass.</div>'
+      : '';
+    const html = banner + renderRKPTable(validRows);
     if (background) {
       cacheAndBroadcastTabHtml(serial, 'rkp', html);
     } else {
