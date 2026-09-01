@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.29.1';
+const APP_VERSION = '1.30.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -4194,6 +4194,30 @@ function renderPackageDetail(p) {
   return h;
 }
 
+// Packages, rendered for exportAllTabsHtml() — a static snapshot, unlike packagesToHtml()'s
+// live app view, so details are always expanded (no onclick="togglePkgDetail(...)" — that
+// function, and the dataCache.packages global it indexes into, won't exist once this is
+// saved as a standalone .html file) and there's no search-filtered subset to worry about.
+function packagesToExportHtml(packages) {
+  const sys = packages.filter(p => p.system).length;
+  const priv = packages.filter(p => p.system_priv).length;
+  const user = packages.filter(p => !p.system).length;
+  let html = '<div class="prop-count">' + packages.length + ' total' +
+    (sys ? ' <span style="color:var(--muted)">' + sys + ' sys</span>' : '') +
+    (user ? ' <span style="color:var(--green)">' + user + ' user</span>' : '') +
+    (priv ? ' <span style="color:var(--orange)">' + priv + ' priv</span>' : '') +
+    '</div>';
+  html += packages.map(p => {
+    let badges = '';
+    if (p.system_priv) badges += '<span class="pkg-badge priv">priv</span> ';
+    else if (p.system) badges += '<span class="pkg-badge sys">sys</span> ';
+    const verStr = p.version_name ? ' ' + esc(p.version_name) : '';
+    return '<div class="pkg-item">' + esc(p.name) + ' <span class="pkg-ver">' + verStr + '</span> ' + badges + '</div>' +
+      '<div class="pkg-detail">' + renderPackageDetail(p) + '</div>';
+  }).join('');
+  return html;
+}
+
 window.togglePkgDetail = function(idx) {
   const el = document.getElementById('pkg-d-' + idx);
   if (!el) return;
@@ -5212,6 +5236,50 @@ function exportJSON(type) {
   URL.revokeObjectURL(url);
 }
 
+// Combined snapshot of every data tab except Shell (interactive command history, not
+// device state — doesn't belong in a device-info report) into one standalone .html file.
+// Built from dataCache (re-rendered with an empty search query, since a live tab's DOM
+// may currently show a search-filtered subset) rather than by reading #props-output etc.
+// directly — the one exception is Attestation/RKP, which have no search box, so their
+// live innerHTML is already the complete result. Embeds the app's own single <style> tag
+// verbatim so the export looks like the live app with zero separate stylesheet to
+// maintain, and stays correct automatically as the app's CSS evolves.
+function exportAllTabsHtml() {
+  const serial = activeSerial;
+  const info = connectedDevices.get(serial);
+  if (!info) return;
+  const buildId = (dataCache.props || []).find(p => p.name === 'ro.build.id')?.value || 'unknown-build';
+
+  const sections = [
+    ['Properties', propsToHtml(dataCache.props || [], '')],
+    ['Features', featuresToHtml(dataCache.features || [], '')],
+    ['Packages', packagesToExportHtml(dataCache.packages || [])],
+    ['Attestation', document.getElementById('attestation-output')?.innerHTML || ''],
+    ['RKP', document.getElementById('rkp-output')?.innerHTML || ''],
+  ];
+  const body = sections.map(([title, html]) =>
+    '<section><h2>' + esc(title) + '</h2>' + (html || '<p class="empty-hint">No data</p>') + '</section>'
+  ).join('\n');
+
+  const styleTag = document.querySelector('style')?.outerHTML || '';
+  const html = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    '<title>' + esc(buildId) + ' ' + esc(serial) + '</title>' + styleTag +
+    '<style>body{padding:1.5rem;max-width:1000px;margin:0 auto;} section{margin-bottom:2rem;} section h2{border-bottom:1px solid var(--border);padding-bottom:0.5rem;} .pkg-detail{display:block;margin:0 0 0.75rem 0.5rem;}</style>' +
+    '</head><body>' +
+    '<h1>' + esc(buildId) + ' — ' + esc(serial) + '</h1>' +
+    '<p style="color:var(--muted);font-size:0.85rem;">Exported ' + esc(new Date().toString()) + ' from web-adb-inspector v' + APP_VERSION + '</p>' +
+    body +
+    '</body></html>';
+
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = buildId + '_' + serial + '.html';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // --- Utilities ---
 function showLoading(id, show) {
   const el = document.getElementById(id + '-loading');
@@ -5245,6 +5313,7 @@ window.runShell = runShell;
 window.copyPanel = copyPanel;
 window.showADBReleaseDialog = showADBReleaseDialog;
 window.exportJSON = exportJSON;
+window.exportAllTabsHtml = exportAllTabsHtml;
 window.togglePkgDetail = togglePkgDetail;
 window.setNickname = setNickname;
 window.changeFontSize = changeFontSize;

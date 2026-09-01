@@ -199,10 +199,19 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 | RKP | `fetchRKP()` | Google server ping, KeyMint provider, HAL service checks |
 | Shell | `runShell()` | Custom ADB shell commands |
 | JSON Export | `exportJSON()` | CTS-compatible `DeviceInfo.deviceinfo.json` |
+| Combined HTML Export | `exportAllTabsHtml()` | Properties+Features+Packages+Attestation+RKP (not Shell) as one standalone `.html`, named `<ro.build.id>_<serial>.html` |
 | Nicknames | `setNickname()` | Persistent device nicknames (localStorage) |
 | Font Size | `changeFontSize()` | Text scaling (localStorage) |
 
 ## 7. Known Bugs and Fixes
+
+### v1.30.0 — "Export All (HTML)" button: combined snapshot of every tab except Shell
+New `exportAllTabsHtml()` (`src/index.js`, near `exportJSON()`), button added to `.device-header-actions` next to Save/Disconnect (host-only, per-device — same as those). Builds one standalone `.html` from Properties/Features/Packages/Attestation/RKP; Shell is excluded (it's interactive command history, not device state, so doesn't belong in a device-info report). Filename is `<ro.build.id value>_<serial>.html`, read from `dataCache.props` (already limited to `ro.*` keys by `parseGetprop()`'s regex).
+
+Two things worth knowing if this needs revisiting:
+- Properties/Features/Packages are rebuilt from `dataCache` via `propsToHtml()`/`featuresToHtml()`/a new `packagesToExportHtml()` with an **empty search query**, not read from the live `#*-output` DOM — those three tabs have a search box that filters the on-screen view, so reading `.innerHTML` directly could silently export a filtered subset if the user had text typed in when they clicked the button. Attestation/RKP have no search box, so their live `innerHTML` is already the complete result and is used as-is.
+- `packagesToExportHtml()` is a separate function from the live `packagesToHtml()`, not a shared code path — it renders every package's detail expanded, with no `onclick="togglePkgDetail(...)"` collapse toggle, since that function (and the `dataCache.packages` global it indexes into) won't exist once this is saved as a standalone file outside the app.
+- The exported file embeds the app's own single `<style>` tag (`document.querySelector('style').outerHTML`) verbatim rather than a hand-maintained duplicate stylesheet — there is exactly one `<style>` tag in `dist/index.html` (confirmed via grep before relying on this), so this stays correct automatically as the app's CSS evolves, at the cost of also freezing in whatever light/dark theme was active at export time.
 
 ### v1.29.1 — RKP tab: warning banner when RKP-only + provisioning unconfirmed
 Clarifies a real gap raised by the user: `Attestation Capability` and `Key Attestation` only check that the HAL responds and that the device can reach `play.googleapis.com` (see `checkAttestationCapability()`'s own comment: *"Actual cert-chain validation requires Java code on device (out of scope for adb shell)"*) — neither one attempts a real signature, so both can show green even on a device that has never successfully completed remote provisioning. Only `RKP Provisioned (<component>)` (a real `cmd remote_provisioning certify` round-trip) proves a key actually exists. When `remote_provisioning.tee.rkp_only=true` (no factory-provisioned fallback keys) **and** at least one `RKP Provisioned` component is unconfirmed, `fetchRKP()` now prepends a `.rkp-warning-banner` div above the table explaining this, so the two capability rows aren't misread as proof attestation actually works. Deliberately does NOT hide or gray out the capability rows themselves — a technician debugging a failure still needs to see "HAL responds + network reachable" as a data point to localize whether the failure is in the HAL, the network, or provisioning specifically.

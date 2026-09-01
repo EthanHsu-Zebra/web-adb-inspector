@@ -782,6 +782,7 @@
         <div class="device-header-actions host-only">
           <input id="nickname-input" class="nickname-input" type="text" placeholder="Device nickname..." onkeydown="if(event.key==='Enter')setNickname()">
           <button class="btn btn-sm" onclick="setNickname()">Save</button>
+          <button class="btn btn-sm" onclick="exportAllTabsHtml()" title="Export Properties, Features, Packages, Attestation and RKP (not Shell) as one HTML file">Export All (HTML)</button>
           <button class="btn btn-sm" onclick="disconnectDevice()">Disconnect</button>
         </div>
       </div>
@@ -971,6 +972,6 @@
   <div id="debug-output" class="debug-console-body"></div>
 </div>
 
-<script type="module" src="bundle.js?v=2026083106"></script>
+<script type="module" src="bundle.js?v=2026083107"></script>
 </body>
 </html>
