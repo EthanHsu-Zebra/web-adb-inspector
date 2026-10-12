@@ -1,5 +1,5 @@
 {
   "_comment": "Controls the Share button's rollout gate app-wide, read at page load (src/index.js's loadShareConfig()). No rebuild needed to change this -- edit shareRollout below and push. Takes a few minutes to propagate everywhere due to GitHub Pages' CDN cache and browsers that already loaded the page (they'd need a reload to re-fetch it).",
-  "shareRollout": "self-only",
+  "shareRollout": "everyone",
   "_values": "off = nobody, full stop | self-only = requires a manual localStorage override in that browser | everyone = on for all (still requires every connected device to be Zebra -- see isZebraDevice() in src/index.js)"
 }
