@@ -205,6 +205,15 @@ Applied the `apple-design` skill's visual/material principles (not its gesture/s
 
 ## 7. Known Bugs and Fixes
 
+### v1.31.0 — Share rollout gate moved to a static remote-config file (no rebuild to toggle)
+`SHARE_ROLLOUT` used to be a hardcoded constant in `src/index.js` — toggling it required editing source, `node build.mjs`, and a commit/push of the rebuilt `dist/bundle.js`. Replaced with `dist/share-config.json` (a plain static JSON file, sibling of `index.html` — NOT touched by `build.mjs`, which only ever writes `dist/bundle.js`/`dist/bundle.js.map`), fetched once at page load via a new `loadShareConfig()` (`fetch('share-config.json', {cache:'no-store'})`, skipped entirely in viewer mode). Toggling now is purely edit-the-JSON-and-push — no `node build.mjs`, no `src/index.js` change, no version bump needed. Also added a third rollout value, `'off'` (ignores the `localStorage` self-only override too, for a true kill-switch distinct from `'self-only'`, which still carves out an exception for whichever browser has the manual override set) — values are `'off' | 'self-only' | 'everyone'`.
+
+Two things worth knowing if this needs revisiting:
+- `SHARE_ROLLOUT_DEFAULT = 'self-only'` (not `'everyone'`) is what the module-level `shareRollout` variable starts as and stays at if the fetch fails for any reason (offline load, file missing, blocked) — deliberately the more restrictive default, so a fetch failure can never silently expose Share more broadly than intended.
+- `cache: 'no-store'` only prevents the *browser* from caching the file across loads — it does not bypass GitHub Pages' own CDN cache, so a toggle can take a few minutes to actually propagate to everyone, not instantly. Already-open tabs also won't pick up a change until reloaded (the fetch only runs once, at page load).
+
+Also fixed in the same push: `README.md`'s "Current: 1.1.34" version line and its embedded changelog had drifted ~130 versions stale (last touched long before this file, `PROJECT_CONTEXT.md`, became the actively-maintained one) and its Deployment section still described the old two-repo (`Ethanhsu/web-adb-inspector` → `Ethanhsu.github.io`) pipeline that no longer exists (see §4 above). README now points to this file for the full changelog instead of duplicating it, and its Deployment/Demo-URL sections match the real self-contained single-repo flow.
+
 ### v1.30.3 — Export All added to the Help modal
 `showHelpModal()` is titled "Device List Help" but already documented `Share` (a per-device header action, not a device-list concept) — so it's really the app's only general help reference at this point, not strictly scoped to the sidebar. Added an `Export All (HTML)` row alongside it, same treatment. Considered (and the user deferred for now) broadening this further — Export JSON, the RKP Refresh button, and the 🌐 internet-badge meaning are also currently undocumented anywhere in-app besides their own hover tooltips.
 

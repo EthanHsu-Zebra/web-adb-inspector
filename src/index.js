@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.30.3';
+const APP_VERSION = '1.31.0';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
@@ -1138,11 +1138,35 @@ function renderDeviceList() {
 //  1. Every connected device must be a Zebra device. Remote sessions ride on the shared
 //     free-tier relay (see INFRASTRUCTURE_DEPENDENCIES.md) whose bandwidth is meant for
 //     Zebra device support, not general-purpose Android debugging.
-//  2. Rollout gate — until a backup/self-hosted relay replaces the current single point
-//     of failure, sharing is limited to this machine. Flip SHARE_ROLLOUT to 'everyone'
-//     (one line) once that backup is in place; no other code change is needed.
-const SHARE_ROLLOUT = 'self-only'; // 'self-only' | 'everyone'
+//  2. Rollout gate, read from share-config.json (same directory as index.html) at page
+//     load — a plain static file, not part of the JS bundle, so toggling it is just
+//     edit-commit-push, no `node build.mjs` needed. 'off' = nobody, full stop (ignores
+//     the localStorage override below too); 'self-only' = requires the manual
+//     localStorage override; 'everyone' = on for all. SHARE_ROLLOUT_DEFAULT is used until
+//     (or if) the fetch resolves — deliberately the most restrictive value, not
+//     'everyone', so a fetch failure (offline load, file missing, blocked) can never
+//     accidentally expose Share more broadly than intended.
+const SHARE_ROLLOUT_DEFAULT = 'self-only'; // 'off' | 'self-only' | 'everyone'
+let shareRollout = SHARE_ROLLOUT_DEFAULT;
 const SHARE_SELF_ONLY_KEY = 'wai_share_self_only_override';
+
+async function loadShareConfig() {
+  try {
+    // cache: 'no-store' so a toggle takes effect on the next page load rather than
+    // waiting out whatever cache lifetime the browser would otherwise apply to a static
+    // file — GitHub Pages' own CDN cache is a separate, smaller delay this can't bypass.
+    const res = await fetch('share-config.json', { cache: 'no-store' });
+    if (!res.ok) return;
+    const cfg = await res.json();
+    if (cfg && ['off', 'self-only', 'everyone'].includes(cfg.shareRollout)) {
+      shareRollout = cfg.shareRollout;
+      updateShareButtonVisibility();
+    }
+  } catch (_) {
+    // Offline, blocked, or the file doesn't exist — stay on SHARE_ROLLOUT_DEFAULT.
+  }
+}
+if (!isViewerMode()) loadShareConfig();
 
 function isZebraDevice(info) {
   const m = (info && info._manufacturer || '').toLowerCase();
@@ -1158,7 +1182,8 @@ function allConnectedDevicesAreZebra() {
 }
 
 function isShareRolloutAllowed() {
-  if (SHARE_ROLLOUT === 'everyone') return true;
+  if (shareRollout === 'off') return false;
+  if (shareRollout === 'everyone') return true;
   try { return localStorage.getItem(SHARE_SELF_ONLY_KEY) === '1'; } catch (_) { return false; }
 }
 
