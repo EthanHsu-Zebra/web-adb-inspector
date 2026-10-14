@@ -754,7 +754,7 @@ async function connectDeviceExclusive(usbDevice, opts = {}) {
     try {
       const model = await adb.getProp('ro.product.model');
       const brand = await adb.getProp('ro.product.brand');
-      manufacturer = await adb.getProp('ro.product.manufacturer');
+      manufacturer = await adb.getProp('ro.product.odm.manufacturer');
       displayName = brand + ' ' + model;
     } catch (_) {}
 
