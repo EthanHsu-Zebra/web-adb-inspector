@@ -1,5 +1,5 @@
 ﻿// Web ADB Inspector - Pure WebUSB, runs entirely in browser
-const APP_VERSION = '1.31.0';
+const APP_VERSION = '1.31.1';
 import {
   Adb, AdbFeature,
   AdbDaemonTransport,
